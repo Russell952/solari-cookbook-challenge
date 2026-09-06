@@ -1,0 +1,21 @@
+{
+  "name": "probe",
+  "private": true,
+  "workspaces": [
+    "shared",
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "cd server && npm run dev",
+    "dev:server": "cd server && npm run dev",
+    "dev:client": "cd client && npm run dev",
+    "build": "cd client && npm run build",
+    "start": "cd server && npm start",
+    "typecheck": "cd shared && npx tsc --noEmit && cd ../server && npx tsc --noEmit && cd ../client && npx tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "server": "^1.0.42"
+  }
+}

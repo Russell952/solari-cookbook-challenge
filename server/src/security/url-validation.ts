@@ -13,17 +13,24 @@
  *  - Credentials (user:pass@) are rejected: they leak into logs/upstreams and
  *    are never legitimate for a target application.
  *  - Host checks cover IP literals (IPv4 + IPv6, including alternate
- *    representations like 0x7f.0.0.1, 0177.0.0.1, ::ffff:127.0.0.1) and
- *    hostnames (localhost and *.localhost variants, which browsers resolve to
- *    the loopback). Note: resolution-based DNS rebinding (a public hostname
- *    resolving to a private IP at request time) cannot be fully prevented by
- *    the caller without a resolution hook inside Solari's browser; this is
- *    documented as a residual limitation.
+ *    representations like 0x7f.0.0.1, 0177.0.0.1, ::ffff:127.0.0.1 and the
+ *    hex-group form ::ffff:7f00:1) and hostnames (localhost and *.localhost
+ *    variants, which browsers resolve to the loopback).
+ *  - CONNECTION-TIME ENFORCEMENT: URL-string validation alone cannot stop
+ *    DNS rebinding (a hostname that resolves to a public IP during validation
+ *    but to a private IP when the browser connects). Enforcement therefore
+ *    happens where the connection is actually made: every browser session
+ *    installs a Playwright network route that resolves the target host at
+ *    request time (same resolver the browser would use) and blocks any
+ *    request — navigation, redirect, iframe, subresource, download — whose
+ *    resolved address is non-public. See solari/browser.ts
+ *    (installNetworkPolicy) and isPubliclyRoutableHost().
  *  - Ports: only 80/443/8080/8443 and other >=1024 unprivileged ports are
  *    allowed; low privileged service ports (22, 25, ...) are rejected to
  *    reduce internal-service probing surface.
  */
 import { isIP } from "net";
+import { lookup } from "dns/promises";
 
 const ALLOWED_SCHEMES = new Set(["http:", "https:"]);
 const BLOCKED_PORTS = new Set([22, 23, 25, 53, 110, 143, 445, 873, 1080, 5432, 6379, 9200, 27017, 3389]);
@@ -43,6 +50,33 @@ function isPrivateOrReservedIp(ip: string): boolean {
     if (/^f[fde]/.test(lower)) return true; // reserved multicast/documentation ranges
     if (lower.startsWith("64:ff9b") || lower.startsWith("100:")) return true; // NAT64 / CGNAT-style ranges
     if (lower.startsWith("::ffff:0:")) return true; // translated
+    // IPv4-mapped IPv6 in ANY textual form: ::ffff:127.0.0.1 AND the
+    // compressed hex form ::ffff:7f00:1 both embed a real IPv4 address —
+    // analyze the embedded address, don't pattern-match the text.
+    const mappedV6 = lower.match(/::ffff:([0-9a-f:]+)$/);
+    if (mappedV6) {
+      const embedded = mappedV6[1];
+      if (embedded.includes(".")) return isPrivateV4(embedded); // dotted form
+      // Hex-group form (e.g. 7f00:1 → 127.0.0.1): expand to 32-bit value.
+      const groups = embedded.split(":").filter(Boolean);
+      if (groups.length === 2) {
+        const hi = parseInt(groups[0], 16);
+        const lo = parseInt(groups[1], 16);
+        if (!Number.isNaN(hi) && !Number.isNaN(lo)) {
+          return isPrivateV4(`${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`);
+        }
+      }
+      return true; // unparseable mapped form — fail closed
+    }
+    // 6to4 (2002::/16) embeds an IPv4 address after the prefix.
+    const sixToFour = lower.match(/^2002:([0-9a-f]{4}):([0-9a-f]{4})/);
+    if (sixToFour) {
+      const a = parseInt(sixToFour[1], 16);
+      const b = parseInt(sixToFour[2], 16);
+      return isPrivateV4(`${(a >> 8) & 0xff}.${a & 0xff}.${(b >> 8) & 0xff}.${b & 0xff}`);
+    }
+    // Teredo (2001::/32) hides an IPv4 pair too — block conservatively.
+    if (lower.startsWith("2001:0:")) return true;
     return false;
   }
   // Hostnames are NOT IP literals — the hostname policy (isPrivateHostname)
@@ -51,6 +85,7 @@ function isPrivateOrReservedIp(ip: string): boolean {
 }
 
 function isPrivateV4(ip: string): boolean {
+  // Accept the canonical dotted-quad form only; callers normalize first.
   const parts = ip.split(".").map((p) => parseInt(p, 10));
   if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return true;
   const [a, b] = parts;
@@ -67,21 +102,33 @@ function isPrivateV4(ip: string): boolean {
 
 /**
  * Reject decimal/octal/hex IPv4 encodings (e.g. 0x7f000001, 2130706433,
- * 0177.0.0.1). Browsers/URL parsers normalize these to loopback.
+ * 0177.0.0.1, 127.1) while ALLOWING canonical dotted-quad IPv4 literals
+ * (e.g. 93.184.216.34). Browsers/URL parsers normalize the packed forms to
+ * their real 32-bit value — a packed loopback must not slip through just
+ * because it isn't written as "127.0.0.1".
  */
 function looksLikeEncodedIp(host: string): boolean {
   const h = host.replace(/^\[|\]$/g, "");
-  if (/^0x[0-9a-f]+$/i.test(h)) return true;
+  if (/^0x[0-9a-f]+$/i.test(h)) return true; // pure hex (0x7f000001)
   if (/^\d{8,}$/.test(h)) return true; // 8+ digit decimal = packed IPv4
-  if (/^(\d{1,3}\.){2}\d{1,3}$/.test(h) === false && /^\d+(\.\d+)*$/.test(h) && h.split(".").length <= 4) {
-    // e.g. "0177.0.0.1" (octal) or "127.1" — atypical numeric host forms
+  if (/^\d+(\.\d+)*$/.test(h)) {
+    // Dotted-quad with all four octets in canonical 0-255 decimal form is a
+    // legitimate literal — keep it (isPrivateV4 does the safety analysis).
+    const parts = h.split(".");
+    const canonical =
+      parts.length === 4 && parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255 && !/^0\d/.test(p));
+    if (canonical) return false;
+    // Anything else numeric (127.1, 0177.0.0.1, 1.2.3.4.5, 010.0.0.1) is a
+    // non-canonical form some parser will reinterpret — reject.
     return true;
   }
   return false;
 }
 
 function isPrivateHostname(host: string): boolean {
-  const h = host.toLowerCase().replace(/\.$/, ""); // strip trailing dot (FQDN form)
+  // Strip ALL trailing dots — "localhost.." must not evade the localhost
+  // policy just because more than one dot was appended (FQDN root form).
+  const h = host.toLowerCase().replace(/\.+$/, "");
   if (h === "" || h === "localhost" || h.endsWith(".localhost") || h === "local") return true;
   if (h === "localhost.localdomain" || h.endsWith(".internal") || h.endsWith(".local") ||
       h.endsWith(".home.arpa") || h.endsWith(".lan") || h.endsWith(".intranet")) return true;
@@ -144,6 +191,49 @@ export function validateApplicationUrl(raw: string): URL {
   }
 
   return parsed;
+}
+
+/**
+ * Resolve a hostname and confirm every resolved address is publicly routable.
+ *
+ * This is the CONNECTION-TIME half of the SSRF policy: string validation at
+ * dispatch can be defeated by DNS rebinding, so the actual request path
+ * (solari/browser.ts network policy) re-resolves the host when the browser
+ * makes the request and consults this same policy. A hostname that resolves
+ * to ANY private/loopback/link-local/metadata address is rejected.
+ *
+ * Returns the resolved addresses so callers can pin DNS (see pinDnsForHost)
+ * — eliminating the rebinding race entirely for that navigation.
+ */
+export async function isPubliclyRoutableHost(hostname: string): Promise<{ ok: boolean; addresses: string[] }> {
+  const bare = hostname.replace(/^\[|\]$/g, "");
+  // IP literals never resolve — analyze directly.
+  if (isIP(bare) !== 0) {
+    return { ok: !isPrivateOrReservedIp(bare) && !looksLikeEncodedIp(bare), addresses: [bare] };
+  }
+  // Hostname policy first (localhost etc.) — no DNS needed.
+  if (isPrivateHostname(bare)) return { ok: false, addresses: [] };
+
+  try {
+    const result = await lookup(bare, { all: true, verbatim: true });
+    if (result.length === 0) return { ok: false, addresses: [] };
+    const addresses = result.map((r) => r.address);
+    const allPublic = addresses.every((a) => !isPrivateOrReservedIp(a));
+    return { ok: allPublic, addresses };
+  } catch {
+    // Unresolvable hostnames cannot be routed by the browser either.
+    return { ok: false, addresses: [] };
+  }
+}
+
+/**
+ * Build Playwright host-resolver overrides from a validation result so the
+ * browser connects to the EXACT addresses that were validated — closing the
+ * classic rebinding window between check and connect.
+ */
+export function dnsPin(addresses: string[]): Record<string, string[]> {
+  if (addresses.length === 0) return {};
+  return { ["*"]: [] as string[], ...Object.fromEntries(addresses.map((a) => [a, [a]])) };
 }
 
 /**

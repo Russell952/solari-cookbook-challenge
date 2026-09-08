@@ -37,6 +37,18 @@ export const config = {
   /** JSON body size limit — Probe payloads are small; 1 MB is generous. */
   bodyLimit: process.env.PROBE_BODY_LIMIT || "1mb",
 
+  /**
+   * Express `trust proxy` setting. MUST match the real deployment topology:
+   *   - "false"            → directly internet-facing (default; safest)
+   *   - a hop count ("1")  → behind exactly N trusted reverse proxies that
+   *                          OVERWRITE X-Forwarded-For
+   *   - a CIDR/IP list     → behind proxies at known addresses
+   * "true" is deliberately not documented and startup validation rejects it:
+   * trusting every proxy makes X-Forwarded-For attacker-controlled, which
+   * would let an attacker rotate rate-limit identities at will.
+   */
+  trustProxy: parseTrustProxy(process.env.PROBE_TRUST_PROXY || "false"),
+
   /** Input length caps for user-controlled strings. */
   limits: {
     maxUrlLength: parseInt(process.env.PROBE_MAX_URL_LENGTH || "2048", 10),
@@ -51,6 +63,17 @@ export const config = {
 } as const;
 
 export function validateConfig(): void {
+  // trust proxy "true" is never acceptable: it makes X-Forwarded-For
+  // attacker-controlled and lets one client rotate unlimited rate-limit IPs.
+  // Checked against the LIVE env value first — this is a pure misconfiguration
+  // guard, independent of the module-load config snapshot.
+  if (process.env.PROBE_TRUST_PROXY === "true") {
+    throw new Error(
+      'PROBE_TRUST_PROXY=true is not allowed — set "false" (direct exposure), ' +
+      'a hop count like "1", or a comma-separated list of trusted proxy IPs/CIDRs '
+      + 'that match the real deployment topology'
+    );
+  }
   if (!config.solariApiKey) {
     throw new Error("SOLARI_API_KEY is required");
   }
@@ -62,4 +85,17 @@ export function validateConfig(): void {
       "Probe refuses to host an unauthenticated, cost-incurring API"
     );
   }
+}
+
+/**
+ * Parse PROBE_TRUST_PROXY into an Express trust-proxy value.
+ * Accepts: "false" | hop count | comma-separated IPs/CIDRs. Never "true".
+ */
+function parseTrustProxy(raw: string): boolean | number | string[] {
+  const v = raw.trim().toLowerCase();
+  if (v === "false" || v === "") return false;
+  if (/^\d+$/.test(v)) return parseInt(v, 10);
+  // Address/CIDR list — preserved verbatim for Express to match against
+  // the socket's immediate peer (hop 0), not attacker headers.
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
 }

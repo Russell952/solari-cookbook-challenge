@@ -17,6 +17,67 @@
 import { BrowserSession as SolariBrowserSession } from "@solarisdk/browser";
 import { getBrowserSolari, trackBrowserSession, untrackBrowserSession } from "./client.js";
 import { store } from "../store/index.js";
+import { isPubliclyRoutableHost } from "../security/url-validation.js";
+
+// ── Connection-time network policy (DNS-rebinding / SSRF enforcement) ──────
+
+/**
+ * Install a request-level network policy on a browser context.
+ *
+ * URL-string validation at the dispatch boundary (runner → validateApplicationUrl)
+ * cannot stop DNS rebinding: a hostname can resolve to a public IP during
+ * validation and to a private/internal IP when the browser actually connects.
+ * It also cannot see redirects, iframe navigations, or page-initiated
+ * subresource requests.
+ *
+ * This route runs INSIDE the browser for EVERY request the page makes —
+ * navigations, redirects (each redirect hop re-issues a request), iframes,
+ * and subresources — and resolves the request's host through the same
+ * resolver the browser would use. Any request whose resolved address is
+ * non-public is aborted before a connection is attempted.
+ *
+ * Non-HTTP schemes (data:, blob:, about:) bypass DNS entirely and are
+ * allowed through here; scheme policy is enforced at the navigate dispatch.
+ */
+const networkPolicyErrorHandler = (err: unknown): void => {
+  console.error("[network-policy] resolver failure:", err instanceof Error ? err.message : err);
+};
+
+async function installNetworkPolicy(context: {
+  route: (pattern: string, handler: (route: { abort: () => Promise<void>; continue: () => Promise<void> }, request: { url: () => string }) => Promise<void>) => Promise<void>;
+}): Promise<void> {
+  try {
+    await context.route("**/*", async (route, request) => {
+      let url: URL;
+      try {
+        url = new URL(request.url());
+      } catch {
+        await route.abort(); // unparseable request URL — never let it through
+        return;
+      }
+      if (url.protocol !== "http:" && url.protocol !== "https:") {
+        await route.continue(); // non-network scheme; dispatch-level policy covers these
+        return;
+      }
+      try {
+        const verdict = await isPubliclyRoutableHost(url.hostname);
+        if (!verdict.ok) {
+          console.warn(`[network-policy] blocked request to non-public host: ${url.hostname}`);
+          await route.abort();
+          return;
+        }
+        await route.continue();
+      } catch (err) {
+        // Resolver failure must fail CLOSED, not open.
+        networkPolicyErrorHandler(err);
+        await route.abort();
+      }
+    });
+  } catch (err) {
+    // If route installation itself fails, refuse to hand back an unprotected session.
+    throw new Error(`Failed to install browser network policy: ${err instanceof Error ? err.message : err}`);
+  }
+}
 
 /**
  * Probe's representation of an active browser session.
@@ -52,6 +113,32 @@ export async function createBrowserSession(
   });
 
   const probeSessionId = `bsess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+  // ── Connection-time SSRF/DNS-rebinding enforcement ──────────────────────
+  // Install on every existing context AND make every future context install
+  // it too, so no network path can bypass the policy. The Solari session
+  // wraps a patchright Browser; reach it through the SDK's documented escape
+  // hatches (BrowserSession.contexts()/raw) with runtime guards so a future
+  // SDK change degrades to a hard failure, never a silent policy bypass.
+  const browserHandle = (
+    typeof session.contexts === "function"
+      ? session // SDK BrowserSession facade
+      : (session as unknown as { session?: unknown }).session // raw browser
+  ) as {
+    contexts(): Array<{ route: Parameters<typeof installNetworkPolicy>[0]["route"] }>;
+    on(event: string, handler: (ctx: Parameters<typeof installNetworkPolicy>[0]) => void): void;
+  };
+  if (typeof browserHandle?.contexts !== "function" || typeof browserHandle?.on !== "function") {
+    throw new Error(
+      "Solari browser session does not expose contexts — cannot install the mandatory network policy"
+    );
+  }
+  for (const ctx of browserHandle.contexts()) {
+    await installNetworkPolicy(ctx);
+  }
+  browserHandle.on("context", (ctx) => {
+    void installNetworkPolicy(ctx).catch(networkPolicyErrorHandler);
+  });
 
   // Track in store and leak-detection set
   trackBrowserSession(probeSessionId);

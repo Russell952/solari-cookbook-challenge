@@ -44,10 +44,17 @@ const mockPage = {
 
 const mockContext = {
   pages: vi.fn().mockReturnValue([mockPage]),
+  route: vi.fn(async () => {}),
+};
+
+const mockBrowserHandle = {
+  contexts: vi.fn().mockReturnValue([mockContext]),
+  on: vi.fn(),
 };
 
 const mockBrowserSession = {
   id: "solari-session-123",
+  ...mockBrowserHandle,
   contexts: vi.fn().mockReturnValue([mockContext]),
   newPage: vi.fn().mockResolvedValue(mockPage),
   close: vi.fn().mockImplementation(async () => {
@@ -281,6 +288,113 @@ describe("Browser Adapter", () => {
         vi.useRealTimers();
         mockLocator.count.mockResolvedValue(1);
         (mockPage.waitForSelector as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      }
+    });
+  });
+
+  // ── Connection-time network policy (DNS-rebinding enforcement) ────────────
+  describe("connection-time network policy", () => {
+    it("installs a route handler on every existing context at session creation", async () => {
+      mockContext.route.mockClear();
+      mockBrowserHandle.on.mockClear();
+      await browser.createBrowserSession("inv_policy");
+      expect(mockContext.route).toHaveBeenCalledTimes(1);
+      expect(mockContext.route).toHaveBeenCalledWith("**/*", expect.any(Function));
+    });
+
+    it("subscribes to future contexts so new pages cannot bypass the policy", async () => {
+      mockBrowserHandle.on.mockClear();
+      await browser.createBrowserSession("inv_policy2");
+      expect(mockBrowserHandle.on).toHaveBeenCalledWith("context", expect.any(Function));
+    });
+
+    it("aborts requests whose host resolves to a private address (rebinding)", async () => {
+      let routeHandler: ((route: unknown, request: unknown) => Promise<void>) | null = null;
+      mockContext.route.mockImplementation((async (_pattern: string, handler: unknown) => {
+        routeHandler = handler as typeof routeHandler;
+      }) as () => Promise<void>);
+      try {
+        await browser.createBrowserSession("inv_policy3");
+        expect(routeHandler).not.toBeNull();
+
+        // Simulate a page request to a hostname that (re)resolves to loopback.
+        const abort = vi.fn(async () => {});
+        const cont = vi.fn(async () => {});
+        const realIsPubliclyRoutable = await import("../security/url-validation.js");
+        // Point the policy at a hostname we control the verdict for by testing
+        // against localhost (always resolves to loopback in every environment).
+        await (routeHandler as unknown as (r: unknown, q: unknown) => Promise<void>)(
+          { abort, continue: cont },
+          { url: () => "http://localhost/steal" }
+        );
+        expect(abort).toHaveBeenCalled();
+        expect(cont).not.toHaveBeenCalled();
+        void realIsPubliclyRoutable;
+      } finally {
+        mockContext.route.mockImplementation(async () => {});
+      }
+    });
+
+    it("allows requests to genuinely public hosts through the policy", async () => {
+      let routeHandler2: ((route: unknown, request: unknown) => Promise<void>) | null = null;
+      mockContext.route.mockImplementation((async (_pattern: string, handler: unknown) => {
+        routeHandler2 = handler as typeof routeHandler2;
+      }) as () => Promise<void>);
+      try {
+        await browser.createBrowserSession("inv_policy4");
+        const abort2 = vi.fn(async () => {});
+        const cont2 = vi.fn(async () => {});
+        // example.com is a real public host; the policy must let it continue.
+        await (routeHandler2 as unknown as (r: unknown, q: unknown) => Promise<void>)(
+          { abort: abort2, continue: cont2 },
+          { url: () => "https://example.com/" }
+        );
+        expect(cont2).toHaveBeenCalled();
+        expect(abort2).not.toHaveBeenCalled();
+      } finally {
+        mockContext.route.mockImplementation(async () => {});
+      }
+    });
+
+    it("fails closed for unresolvable hosts inside the policy handler", async () => {
+      // isPubliclyRoutableHost converts resolver failures into a fail-closed
+      // verdict, so an unresolvable hostname must abort — never continue.
+      let handler3: ((route: unknown, request: unknown) => Promise<void>) | null = null;
+      mockContext.route.mockImplementation((async (_pattern: string, handler: unknown) => {
+        handler3 = handler as typeof handler3;
+      }) as () => Promise<void>);
+      try {
+        await browser.createBrowserSession("inv_policy5");
+        const abort3 = vi.fn(async () => {});
+        const cont3 = vi.fn(async () => {});
+        await (handler3 as unknown as (r: unknown, q: unknown) => Promise<void>)(
+          { abort: abort3, continue: cont3 },
+          { url: () => "https://no-such-host-probe-test.invalid/" }
+        );
+        expect(abort3).toHaveBeenCalled(); // fail closed, never fail open
+        expect(cont3).not.toHaveBeenCalled();
+      } finally {
+        mockContext.route.mockImplementation(async () => {});
+      }
+    });
+
+    it("passes non-http(s) scheme requests through untouched (scheme policy lives at dispatch)", async () => {
+      let handler4: ((route: unknown, request: unknown) => Promise<void>) | null = null;
+      mockContext.route.mockImplementation((async (_pattern: string, handler: unknown) => {
+        handler4 = handler as typeof handler4;
+      }) as () => Promise<void>);
+      try {
+        await browser.createBrowserSession("inv_policy6");
+        const abort4 = vi.fn(async () => {});
+        const cont4 = vi.fn(async () => {});
+        await (handler4 as unknown as (r: unknown, q: unknown) => Promise<void>)(
+          { abort: abort4, continue: cont4 },
+          { url: () => "data:text/html,hi" }
+        );
+        expect(cont4).toHaveBeenCalled();
+        expect(abort4).not.toHaveBeenCalled();
+      } finally {
+        mockContext.route.mockImplementation(async () => {});
       }
     });
   });

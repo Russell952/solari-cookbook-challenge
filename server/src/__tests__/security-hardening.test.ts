@@ -27,12 +27,19 @@ const { navigateSpy } = vi.hoisted(() => ({
 }));
 
 vi.mock("../solari/browser.js", () => ({
-  createBrowserSession: vi.fn(async () => ({
-    probeSessionId: "bsess_t",
-    session: { close: vi.fn(async () => {}) },
-    solariSessionId: "s-1",
-    recordingEnabled: false,
-  })),
+  createBrowserSession: vi.fn(async () => {
+    // The production adapter installs a context-level network policy right
+    // after launch; the mock must present the same surface (contexts + on).
+    const fakeContext = { route: vi.fn(async () => {}) };
+    return {
+      probeSessionId: "bsess_t",
+      session: { close: vi.fn(async () => {}) },
+      contexts: vi.fn(() => [fakeContext]),
+      on: vi.fn(),
+      solariSessionId: "s-1",
+      recordingEnabled: false,
+    };
+  }),
   closeBrowserSession: vi.fn(async () => {}),
   navigate: navigateSpy,
   screenshot: vi.fn(async () => Buffer.from("png")),
@@ -498,5 +505,125 @@ describe("concurrency protection", () => {
     }
     // Every cycle should be able to acquire again after a balanced release.
     expect(acquires.every(Boolean)).toBe(true);
+  });
+});
+
+// ── Fresh SSRF bypass audit (encodings, normalization, edge forms) ─────────
+
+describe("SSRF bypass audit (parser/encoding edge cases)", () => {
+  const bypassAttempts: Array<[string, string]> = [
+    ["http://[::ffff:7f00:1]/", "ipv4-mapped ipv6 in hex-group form"],
+    ["http://[::ffff:a00:1]/", "ipv4-mapped ipv6 hex 10.0.0.1"],
+    ["http://[::ffff:0:127.0.0.1]/", "translated mapped loopback"],
+    ["http://[2002:7f00:1::]/", "6to4 embedding loopback"],
+    ["http://[2002:a00:1::]/", "6to4 embedding 10.0.0.1"],
+    ["http://localhost../", "double-trailing-dot localhost"],
+    ["http://LOCALHOST./", "uppercase trailing-dot localhost"],
+    ["http://127.0.0.1./", "trailing-dot loopback literal"],
+    ["http://0177.00.00.01/", "zero-padded octal loopback"],
+    ["http://1.2.3.4.5/", "five-octet packed form"],
+    ["http://a9fe:a9fe/", "hex-packed link-local (numeric host)"],
+    ["http://example.com.:22/", "blocked port behind trailing dot"],
+    ["http://example.com%2f@127.0.0.1/", "encoded credential slip"],
+    ["http://169.254.169.254:80/", "metadata endpoint explicit port"],
+    ["http://metadata/", "bare metadata hostname"],
+    ["http://instance-data.ec2.internal/", "EC2 instance-data hostname"],
+    ["http://[fe80::1%25eth0]/", "ipv6 link-local with zone id"],
+  ];
+
+  for (const [url, label] of bypassAttempts) {
+    it(`rejects ${label}`, () => {
+      // Malformed-vs-rejected doesn't matter: neither may reach the browser.
+      expect(() => validateApplicationUrl(url)).toThrow();
+    });
+  }
+
+  // The prior validator wrongly blocked every dotted-quad literal. Canonical
+  // PUBLIC IPv4 literals must remain usable investigation targets.
+  it("still allows canonical public IPv4 literals (over-blocking regression)", () => {
+    expect(() => validateApplicationUrl("http://93.184.216.34/")).not.toThrow();
+    expect(() => validateApplicationUrl("http://1.1.1.1/")).not.toThrow();
+  });
+
+  it("allows FQDNs with trailing dots (public, canonical form)", () => {
+    expect(() => validateApplicationUrl("https://example.com./")).not.toThrow();
+  });
+});
+
+// ── Connection-time DNS/IP enforcement (DNS-rebinding) ────────────────────
+
+describe("connection-time network policy (DNS rebinding)", () => {
+  it("isPubliclyRoutableHost rejects hostnames that resolve to private addresses", async () => {
+    const { isPubliclyRoutableHost } = await import("../security/url-validation.js");
+    // This test depends on real DNS: localhost always resolves to loopback.
+    const verdict = await isPubliclyRoutableHost("localhost");
+    expect(verdict.ok).toBe(false);
+  });
+
+  it("isPubliclyRoutableHost accepts real public hostnames and returns addresses", async () => {
+    const { isPubliclyRoutableHost } = await import("../security/url-validation.js");
+    const verdict = await isPubliclyRoutableHost("example.com");
+    // If DNS is unavailable in the test environment, verdict.ok is false with
+    // no addresses — that is fail-closed behavior, not a test failure.
+    if (verdict.addresses.length > 0) {
+      expect(verdict.ok).toBe(true);
+      expect(verdict.addresses.every((a) => !a.startsWith("127.") && !a.startsWith("10.") && !a.startsWith("169.254."))).toBe(true);
+    }
+  });
+
+  it("isPubliclyRoutableHost fails closed for unresolvable hostnames", async () => {
+    const { isPubliclyRoutableHost } = await import("../security/url-validation.js");
+    const verdict = await isPubliclyRoutableHost("this-domain-does-not-exist-probe-test.invalid");
+    expect(verdict.ok).toBe(false);
+    expect(verdict.addresses).toEqual([]);
+  });
+
+  // Policy installation on real session objects is verified in browser.test.ts
+  // (which loads the real adapter); see "connection-time network policy".
+});
+
+// ── Trust proxy / client-IP spoofing ────────────────────────────────────────
+
+describe("trust proxy and client-IP integrity", () => {
+  it("defaults to trust proxy disabled (direct exposure)", async () => {
+    const app = buildApp();
+    expect(app.get("trust proxy")).toBe(false);
+  });
+
+  it("req.ip reflects the socket peer, ignoring X-Forwarded-For, when trust proxy is off", async () => {
+    let server2: Server | null = null;
+    try {
+      const app2 = buildApp();
+      app2.get("/whoami", (req, res) => {
+        res.json({ ip: req.ip });
+      });
+      server2 = app2.listen(0, "127.0.0.1");
+      await new Promise<void>((r) => server2!.once("listening", () => r()));
+      const port = (server2.address() as AddressInfo).port;
+      const res = await fetch(`http://127.0.0.1:${port}/whoami`, {
+        headers: { "X-Forwarded-For": "8.8.8.8" },
+      });
+      const body = (await res.json()) as { ip: string };
+      expect(body.ip).toBe("127.0.0.1"); // spoofed header ignored
+    } finally {
+      await new Promise<void>((r) => (server2 ? server2.close(() => r()) : r()));
+    }
+  });
+
+  it("rejects PROBE_TRUST_PROXY=true at startup validation", async () => {
+    const cfgMod = await import("../config/index.js");
+    // Directly exercise the validation rule with the env vars set.
+    const prevProxy = process.env.PROBE_TRUST_PROXY;
+    const prevKey = process.env.SOLARI_API_KEY;
+    process.env.PROBE_TRUST_PROXY = "true";
+    process.env.SOLARI_API_KEY = "test-key-for-validation";
+    try {
+      expect(() => cfgMod.validateConfig()).toThrow(/PROBE_TRUST_PROXY=true is not allowed/);
+    } finally {
+      if (prevProxy === undefined) delete process.env.PROBE_TRUST_PROXY;
+      else process.env.PROBE_TRUST_PROXY = prevProxy;
+      if (prevKey === undefined) delete process.env.SOLARI_API_KEY;
+      else process.env.SOLARI_API_KEY = prevKey;
+    }
   });
 });

@@ -20,6 +20,13 @@ import { safeUrlError } from "./security/url-validation.js";
 export function buildApp(): express.Express {
   const app = express();
 
+  // ── Proxy topology (rate-limit correctness) ────────────────────────────
+  // Explicitly configured via PROBE_TRUST_PROXY (validated at startup; the
+  // unsafe "true" value is rejected). Default false = direct internet
+  // exposure: req.ip is the socket address and X-Forwarded-For is ignored,
+  // so an attacker cannot spoof identities to evade rate limits.
+  app.set("trust proxy", config.trustProxy);
+
   // Identity: never advertise the framework.
   app.disable("x-powered-by");
 

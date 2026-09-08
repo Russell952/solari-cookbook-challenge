@@ -11,7 +11,7 @@
  * finding→evidence validation, report construction, and the summary endpoint.
  */
 /** @vitest-environment node */
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import { createHash } from "crypto";
 import { mkdtemp, rm, readFile } from "fs/promises";
 import { tmpdir } from "os";
@@ -147,6 +147,12 @@ vi.mock("../ai/index.js", () => ({
 
 // Import production modules AFTER mocks are registered
 import { store } from "../store/index.js";
+import { registerTokenForTesting } from "../security/auth.js";
+
+const TEST_TOKEN = "runner-integration-token";
+beforeAll(() => {
+  registerTokenForTesting(TEST_TOKEN);
+});
 import { buildApp } from "../app.js";
 import * as browser from "../solari/browser.js";
 import * as evidenceStore from "../evidence/store.js";
@@ -180,6 +186,10 @@ afterEach(async () => {
   await rm(evidenceDir, { recursive: true, force: true });
 });
 
+function auth(): Record<string, string> {
+  return { "Content-Type": "application/json", Authorization: `Bearer ${TEST_TOKEN}` };
+}
+
 interface Investigation {
   id: string;
   status: string;
@@ -189,7 +199,7 @@ interface Investigation {
 async function createInvestigation(): Promise<string> {
   const res = await fetch(`${baseUrl}/api/investigations`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: auth(),
     body: JSON.stringify({
       applicationUrl: "https://example.com",
       objective: "Verify the login flow behaves as documented",
@@ -204,7 +214,7 @@ async function waitForTerminal(id: string, timeoutMs = 15_000): Promise<Investig
   const deadline = Date.now() + timeoutMs;
   let last: Investigation | undefined;
   while (Date.now() < deadline) {
-    const res = await fetch(`${baseUrl}/api/investigations/${id}`);
+    const res = await fetch(`${baseUrl}/api/investigations/${id}`, { headers: auth() });
     last = (await res.json()) as Investigation;
     if (["completed", "failed", "cancelled"].includes(last.status)) return last;
     await new Promise((r) => setTimeout(r, 25));
@@ -218,7 +228,7 @@ describe("runInvestigation end-to-end (real runner, real API)", () => {
   it("runs recon → plan → experiment → hypothesis → verification → report → completed with consistent evidence, findings, and summary", async () => {
     const id = await createInvestigation();
 
-    const startRes = await fetch(`${baseUrl}/api/investigations/${id}/start`, { method: "POST" });
+    const startRes = await fetch(`${baseUrl}/api/investigations/${id}/start`, { method: "POST", headers: auth() });
     expect(startRes.status).toBe(200);
 
     const final = await waitForTerminal(id);
@@ -226,7 +236,7 @@ describe("runInvestigation end-to-end (real runner, real API)", () => {
     expect(final.currentPhase).toBe("complete");
 
     // ── Real evidence was captured and persisted to disk ──────────────────
-    const evidenceRes = await fetch(`${baseUrl}/api/investigations/${id}/evidence`);
+    const evidenceRes = await fetch(`${baseUrl}/api/investigations/${id}/evidence`, { headers: auth() });
     const evidence = (await evidenceRes.json()) as Array<{
       id: string;
       type: string;
@@ -262,14 +272,14 @@ describe("runInvestigation end-to-end (real runner, real API)", () => {
     expect(browser.getReplay).toHaveBeenCalledWith("solari-session-1");
 
     // ── Content endpoint serves the real artifact with verified hash ──────
-    const contentRes = await fetch(`${baseUrl}/api/investigations/${id}/evidence/${shot.id}/content`);
+    const contentRes = await fetch(`${baseUrl}/api/investigations/${id}/evidence/${shot.id}/content`, { headers: auth() });
     expect(contentRes.status).toBe(200);
     expect(contentRes.headers.get("x-evidence-hash-verified")).toBe("true");
     const served = Buffer.from(await contentRes.arrayBuffer());
     expect(served.equals(PNG_BYTES)).toBe(true);
 
     // ── Hypothesis + verification actually ran ────────────────────────────
-    const hypRes = await fetch(`${baseUrl}/api/investigations/${id}/summary`);
+    const hypRes = await fetch(`${baseUrl}/api/investigations/${id}/summary`, { headers: auth() });
     expect(hypRes.status).toBe(200);
     const summary = (await hypRes.json()) as {
       investigation: Investigation;
@@ -325,11 +335,11 @@ describe("runInvestigation end-to-end (real runner, real API)", () => {
 
   it("cancellation during an active run ends as cancelled — never completed — and stops before expensive phases", async () => {
     const id = await createInvestigation();
-    await fetch(`${baseUrl}/api/investigations/${id}/start`, { method: "POST" });
+    await fetch(`${baseUrl}/api/investigations/${id}/start`, { method: "POST", headers: auth() });
 
     // Cancel while the runner is active (runner set status=running synchronously
     // before its first await; this cancel lands during recon/plan).
-    const cancelRes = await fetch(`${baseUrl}/api/investigations/${id}/cancel`, { method: "POST" });
+    const cancelRes = await fetch(`${baseUrl}/api/investigations/${id}/cancel`, { method: "POST", headers: auth() });
     expect(cancelRes.status).toBe(200);
 
     const final = await waitForTerminal(id);
@@ -337,13 +347,13 @@ describe("runInvestigation end-to-end (real runner, real API)", () => {
 
     // Give any in-flight continuation a chance to wrongly overwrite status
     await new Promise((r) => setTimeout(r, 150));
-    const after = await fetch(`${baseUrl}/api/investigations/${id}`);
+    const after = await fetch(`${baseUrl}/api/investigations/${id}`, { headers: auth() });
     const inv = (await after.json()) as Investigation;
     expect(inv.status).toBe("cancelled");
 
     // Cancelled runs must not proceed into hypothesis/verification/report:
     // no hypotheses, findings, or report may exist.
-    const summaryRes = await fetch(`${baseUrl}/api/investigations/${id}/summary`);
+    const summaryRes = await fetch(`${baseUrl}/api/investigations/${id}/summary`, { headers: auth() });
     const summary = (await summaryRes.json()) as {
       hypothesesCount: number;
       findingsCount: number;
@@ -358,11 +368,11 @@ describe("runInvestigation end-to-end (real runner, real API)", () => {
 
   it("evidence survives an in-memory wipe via the on-disk artifact index (restart-like)", async () => {
     const id = await createInvestigation();
-    await fetch(`${baseUrl}/api/investigations/${id}/start`, { method: "POST" });
+    await fetch(`${baseUrl}/api/investigations/${id}/start`, { method: "POST", headers: auth() });
     await waitForTerminal(id);
 
     const evidence = (await (
-      await fetch(`${baseUrl}/api/investigations/${id}/evidence`)
+      await fetch(`${baseUrl}/api/investigations/${id}/evidence`, { headers: auth() })
     ).json()) as Array<{ id: string; metadata: Record<string, unknown> }>;
     const shot = evidence.find((e) => (e.metadata.artifactAvailable as boolean) === true)!;
 

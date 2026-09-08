@@ -13,6 +13,11 @@ import { getBudget } from "../orchestrator/budget.js";
 
 export const summaryRouter = Router({ mergeParams: true });
 
+/** The authenticated caller's owner id (set by requireAuth). */
+function ownerIdOf(req: Request): string {
+  return (req as Request & { ownerId?: string }).ownerId ?? "";
+}
+
 interface SummaryResponse {
   investigation: {
     id: string;
@@ -110,7 +115,7 @@ summaryRouter.get("/", (req: Request, res: Response) => {
   const id = param(req, "id");
   const investigation = store.getInvestigation(id);
 
-  if (!investigation) {
+  if (!investigation || store.getOwner(id) !== ownerIdOf(req)) {
     res.status(404).json({ error: "Investigation not found" });
     return;
   }

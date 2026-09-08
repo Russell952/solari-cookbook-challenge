@@ -277,6 +277,37 @@ function getActiveSessions(investigationId: string): SolariSession[] {
   return listSessions(investigationId).filter((s) => s.status === "active");
 }
 
+// ── Ownership index (single-owner MVP model) ──────────────────────────────
+
+/** investigationId → ownerId. Set at creation, checked on every read. */
+const ownership = new Map<string, string>();
+
+function setOwner(investigationId: string, ownerId: string): void {
+  ownership.set(investigationId, ownerId);
+}
+
+function getOwner(investigationId: string): string | undefined {
+  return ownership.get(investigationId);
+}
+
+/** All investigation ids owned by a caller, newest first (matches listInvestigations order). */
+function listInvestigationIdsForOwner(ownerId: string): string[] {
+  return listInvestigations()
+    .filter((inv) => ownership.get(inv.id) === ownerId)
+    .map((inv) => inv.id);
+}
+
+/** True when the resource id belongs to the given investigation+owner. */
+function resourceBelongsTo(
+  ownerId: string,
+  investigationId: string | null,
+  resource: { investigationId: string } | undefined | null
+): boolean {
+  if (!resource) return false;
+  if (resource.investigationId !== investigationId) return false;
+  return ownership.get(investigationId) === ownerId;
+}
+
 // ── Cleanup ────────────────────────────────────────────────────────────────
 
 function clearAll(): void {
@@ -289,6 +320,7 @@ function clearAll(): void {
   findings.clear();
   reports.clear();
   sessions.clear();
+  ownership.clear();
 }
 
 // ── Export ─────────────────────────────────────────────────────────────────
@@ -335,6 +367,11 @@ export const store = {
   updateSession,
   listSessions,
   getActiveSessions,
+  // Ownership (security: every read is scoped to the authenticated owner)
+  setOwner,
+  getOwner,
+  listInvestigationIdsForOwner,
+  resourceBelongsTo,
   // Cleanup
   clearAll,
 };

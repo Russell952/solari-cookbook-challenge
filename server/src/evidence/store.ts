@@ -15,6 +15,27 @@
 import { createHash, randomUUID } from "crypto";
 import { mkdir, readFile, writeFile, unlink, rm } from "fs/promises";
 import { join } from "path";
+import { config } from "../config/index.js";
+
+/**
+ * Guard against unlimited disk growth: reject artifacts beyond the per-artifact
+ * cap and investigations whose cumulative artifact bytes exceed the cap.
+ * The SHA-256 integrity model is unchanged — these caps apply before write.
+ */
+async function assertWithinStorageCaps(investigationId: string, buffer: Buffer): Promise<void> {
+  if (buffer.length > config.maxArtifactBytes) {
+    throw new Error(
+      `Artifact exceeds maximum size (${buffer.length} > ${config.maxArtifactBytes} bytes)`
+    );
+  }
+  const entries = await readArtifactIndex(investigationId);
+  const total = entries.reduce((sum, e) => sum + (e.byteSize || 0), 0);
+  if (total + buffer.length > config.maxInvestigationArtifactBytes) {
+    throw new Error(
+      `Investigation evidence storage cap exceeded (${total + buffer.length} > ${config.maxInvestigationArtifactBytes} bytes)`
+    );
+  }
+}
 
 export interface EvidenceArtifact {
   evidenceId: string;
@@ -85,6 +106,8 @@ export async function saveArtifact(opts: {
 
   const buffer = Buffer.isBuffer(opts.content) ? opts.content : Buffer.from(opts.content, "utf-8");
   const { ext, mime } = EXT_BY_TYPE[opts.evidenceType] ?? DEFAULT_EXT;
+
+  await assertWithinStorageCaps(opts.investigationId, buffer);
 
   const dir = join(evidenceRoot(), opts.investigationId);
   await mkdir(dir, { recursive: true });

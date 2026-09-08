@@ -19,7 +19,7 @@
  * and executes everything itself.
  */
 /** @vitest-environment node */
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm, readFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -188,7 +188,13 @@ vi.mock("../ai/index.js", () => ({
 // Import production modules after mocks
 import { store } from "../store/index.js";
 import { buildApp } from "../app.js";
+import { registerTokenForTesting } from "../security/auth.js";
 import * as browser from "../solari/browser.js";
+
+const TEST_TOKEN = "lifecycle-test-token";
+beforeAll(() => {
+  registerTokenForTesting(TEST_TOKEN);
+});
 
 let server: Server;
 let baseUrl: string;
@@ -212,12 +218,16 @@ afterEach(async () => {
   await rm(evidenceDir, { recursive: true, force: true });
 });
 
+function auth(): Record<string, string> {
+  return { "Content-Type": "application/json", Authorization: `Bearer ${TEST_TOKEN}` };
+}
+
 async function post(path: string): Promise<Response> {
-  return fetch(`${baseUrl}/api${path}`, { method: "POST" });
+  return fetch(`${baseUrl}/api${path}`, { method: "POST", headers: auth() });
 }
 
 async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(`${baseUrl}/api${path}`);
+  const res = await fetch(`${baseUrl}/api${path}`, { headers: auth() });
   if (!res.ok) throw new Error(`GET ${path} → ${res.status}`);
   return res.json() as Promise<T>;
 }
@@ -247,7 +257,7 @@ interface Summary {
 async function runToCompletion(objective: string): Promise<string> {
   const createRes = await fetch(`${baseUrl}/api/investigations`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: auth(),
     body: JSON.stringify({
       repositoryUrl: "https://github.com/demo/demo-app",
       applicationUrl: "https://app.test/login",
@@ -382,7 +392,7 @@ describe("login-form investigation lifecycle (real orchestrator + API)", () => {
 
     const createRes = await fetch(`${baseUrl}/api/investigations`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: auth(),
       body: JSON.stringify({
         repositoryUrl: "https://github.com/demo/demo-app",
         applicationUrl: "https://app.test/login",
@@ -426,7 +436,7 @@ describe("login-form investigation: evidence integrity", () => {
 
     // Verification evidence bytes persist on disk and verify against SHA-256.
     // Metadata (artifactPath/sha256) comes from the full evidence endpoint.
-    const listRes = await fetch(`${baseUrl}/api/investigations/${id}/evidence`);
+    const listRes = await fetch(`${baseUrl}/api/investigations/${id}/evidence`, { headers: auth() });
     expect(listRes.status).toBe(200);
     const fullEvidence = (await listRes.json()) as Array<
       Evidence & { metadata: Record<string, unknown> }
@@ -445,7 +455,7 @@ describe("login-form investigation: evidence integrity", () => {
     }
 
     // Content endpoint serves verified bytes
-    const res = await fetch(`${baseUrl}/api/investigations/${id}/evidence/${artifacts[0].id}/content`);
+    const res = await fetch(`${baseUrl}/api/investigations/${id}/evidence/${artifacts[0].id}/content`, { headers: auth() });
     expect(res.status).toBe(200);
     expect(res.headers.get("x-evidence-hash-verified")).toBe("true");
   });

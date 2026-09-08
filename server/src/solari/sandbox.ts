@@ -34,6 +34,7 @@
 import { Sandbox } from "@solarisdk/sdk";
 import { getSdkClient } from "./client.js";
 import { store } from "../store/index.js";
+import { isSafeReadOnlyArg } from "../orchestrator/action-allowlist.js";
 
 // ── Security: valid URL patterns for repository cloning ────────────────────
 
@@ -222,6 +223,11 @@ export async function runReadOnlyCommand(
     for (const arg of args) {
       if (typeof arg !== "string" || arg.includes("\x00")) {
         throw new Error("Args must be an array of strings");
+      }
+      // Option-shaped args that enable execution/file-mutation are rejected
+      // even when the binary itself is allowlisted (e.g. find -exec).
+      if (!isSafeReadOnlyArg(arg)) {
+        throw new Error(`Security: argument '${arg.slice(0, 32)}' is not permitted for read-only sandbox commands`);
       }
     }
   }

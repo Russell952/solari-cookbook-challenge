@@ -44,7 +44,19 @@ export const VALID_BROWSER_ACTIONS = [
  */
 export const VALID_SANDBOX_ACTIONS = ["readFile", "listDirectory", "runReadOnlyCommand"] as const;
 
-/** Read-only commands the AI may execute in the sandbox, with arg validation. */
+/**
+ * Read-only commands the AI may execute in the sandbox, with arg validation.
+ *
+ * SECURITY: strictly observation-oriented binaries only. Interpreters and
+ * package managers (node, python3, npm, git) were REMOVED — each is an
+ * arbitrary-code-execution primitive inside the sandbox VM:
+ *   node -e "…"        → arbitrary JS (fs/net/child_process)
+ *   python3 -c "…"     → arbitrary code incl. HTTP to metadata endpoints
+ *   npm install …      → postinstall scripts = arbitrary code
+ *   git clone ext::…   → shell execution via git transports
+ * Repository cloning stays orchestrator-owned (solari/sandbox.ts
+ * cloneRepository), never AI-reachable.
+ */
 export const SANDBOX_READ_ONLY_COMMANDS = [
   "cat",
   "ls",
@@ -54,11 +66,28 @@ export const SANDBOX_READ_ONLY_COMMANDS = [
   "find",
   "wc",
   "file",
-  "node",
-  "python3",
-  "npm",
-  "git",
 ] as const;
+
+/**
+ * Arguments that must never appear in an AI-planned sandbox command — each
+ * would turn a read-only binary into code execution or file mutation:
+ *   find -exec/-execdir/-ok/-okdir → arbitrary binary execution
+ *   grep --include etc are safe, but -f/… load patterns from attacker paths;
+ *   --output files could overwrite VM state used by later actions.
+ */
+const FORBIDDEN_ARG_PATTERNS: RegExp[] = [
+  /^-(exec|execdir|ok|okdir)$/i,
+  /^--?f(exec|ile)=?/i,
+  /^--(include-from|exclude-from)=?/i,
+];
+
+/**
+ * Validate AI-planned arguments for a read-only sandbox command.
+ * Rejects option-shaped args that enable execution, not just binary names.
+ */
+export function isSafeReadOnlyArg(arg: string): boolean {
+  return !FORBIDDEN_ARG_PATTERNS.some((re) => re.test(arg));
+}
 
 export type ValidAction = ValidTool extends never
   ? never

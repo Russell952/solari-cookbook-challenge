@@ -26,6 +26,7 @@ import * as browser from "../solari/browser.js";
 import type { ReconContext } from "../solari/browser.js";
 import * as sandbox from "../solari/sandbox.js";
 import { resolveFindingEvidenceIds } from "./finding-evidence.js";
+import { releaseSlot } from "../security/rate-limit.js";
 import { VALID_ACTIONS_BY_TOOL as VALID_ACTIONS, looksLikeCssSelector } from "./action-allowlist.js";
 import {
   captureScreenshot,
@@ -37,6 +38,7 @@ import {
 import * as budget from "./budget.js";
 import { emit } from "../api/events.js";
 import { setAiRequestRecorder } from "../ai/openai.js";
+import { validateApplicationUrl } from "../security/url-validation.js";
 
 let ai: AIAdapter | null = null;
 
@@ -771,6 +773,17 @@ async function executeAction(
       }
       case "navigate": {
         if (!currentSession) throw new Error("No active browser session");
+        // ── SSRF boundary ──────────────────────────────────────────────────
+        // Every navigate target — including AI-planned ones generated during
+        // execution — is validated immediately before reaching the browser.
+        // This is the single choke point between AI planning and Solari.
+        try {
+          validateApplicationUrl(planned.target);
+        } catch (err) {
+          throw new Error(
+            `Blocked by URL security policy: ${err instanceof Error ? err.message : "invalid URL"}`
+          );
+        }
         const result = await browser.navigate(currentSession, planned.target);
         const screenshot = result.downloaded ? null : await browser.screenshot(currentSession);
         const data: Record<string, unknown> = {
@@ -1090,21 +1103,51 @@ async function runReport(
     };
   }
 
-  // Create confirmed findings from report
+  // Create confirmed findings from report.
+  //
+  // ── Confirmation integrity gate ─────────────────────────────────────────
+  // An AI response alone cannot manufacture a "confirmed" finding. A finding
+  // is only persisted as confirmed when the hypothesis it stems from was
+  // actually driven to `confirmed` by the verification phase (evaluateEvidence
+  // on independent verification evidence). AI-reported findings whose matched
+  // hypothesis is rejected/inconclusive/missing are demoted to that same
+  // status — the AI text is preserved, the authority is not.
   for (const findingData of reportResult.confirmedFindings) {
+    const hypothesis = hypothesisForFinding(findingData, hypotheses);
+    const verificationExperimentId = hypothesis
+      ? verificationByHypothesis.get(hypothesis.id)
+      : undefined;
+    const verifiedConfirmed = hypothesis?.status === "confirmed";
+
     const finding = store.createFinding({
       ...findingData,
+      status: verifiedConfirmed
+        ? findingData.status
+        : // Hypothesis was not verified-confirmed: demote the finding to the
+          // hypothesis's verdict (or inconclusive when there is no hypothesis
+          // at all). "investigating"/"proposed" map to "inconclusive" — the
+          // investigation never reached a verified conclusion.
+          (hypothesis?.status === "confirmed" ||
+          hypothesis?.status === "rejected" ||
+          hypothesis?.status === "inconclusive"
+            ? hypothesis.status
+            : "inconclusive"),
       investigationId: investigation.id,
       evidenceIds: resolveFindingEvidenceIds(findingData, {
         investigationId: investigation.id,
-        hypothesis: hypothesisForFinding(findingData, hypotheses),
-        verificationExperimentId: hypothesisForFinding(findingData, hypotheses)
-          ? verificationByHypothesis.get(hypothesisForFinding(findingData, hypotheses)!.id)
-          : undefined,
+        hypothesis,
+        verificationExperimentId,
         experiments,
         evidence,
       }),
     });
+
+    if (!verifiedConfirmed) {
+      console.warn(
+        `[${investigation.id}] Finding "${findingData.title.slice(0, 80)}" demoted from AI-claimed "confirmed" ` +
+        `to "${finding.status}" — supporting hypothesis was ${hypothesis ? hypothesis.status : "not found"}`
+      );
+    }
 
     emit("finding_created", investigation.id, { findingId: finding.id, title: finding.title });
   }
@@ -1129,9 +1172,16 @@ async function runReport(
 
 // ── Main Run Loop ──────────────────────────────────────────────────────────
 
-export async function runInvestigation(investigationId: string): Promise<void> {
+export async function runInvestigation(
+  investigationId: string,
+  opts?: { releaseSlotOnFinish?: boolean }
+): Promise<void> {
   let investigation = store.getInvestigation(investigationId);
-  if (!investigation) throw new Error(`Investigation ${investigationId} not found`);
+  if (!investigation) {
+    // Never leave a concurrency slot behind for an unknown investigation.
+    if (opts?.releaseSlotOnFinish) releaseSlot();
+    throw new Error(`Investigation ${investigationId} not found`);
+  }
 
   const startTime = Date.now();
   budget.initBudget(investigationId);
@@ -1380,6 +1430,11 @@ export async function runInvestigation(investigationId: string): Promise<void> {
   } finally {
     clearInterval(runtimeTimer);
     budget.recordRuntime(investigationId, Date.now() - startTime);
+
+    // Release the HTTP-layer concurrency slot in EVERY termination path —
+    // completion, failure, cancellation, runtime expiry, or unexpected
+    // throw — so a wedged run can never permanently consume capacity.
+    if (opts?.releaseSlotOnFinish) releaseSlot();
 
     // Cleanup any active Solari sessions
     const activeSessions = store.getActiveSessions(investigationId);

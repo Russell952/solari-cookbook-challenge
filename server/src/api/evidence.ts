@@ -12,10 +12,15 @@ import { param } from "./helpers.js";
 
 export const evidenceRouter = Router({ mergeParams: true });
 
+/** The authenticated caller's owner id (set by requireAuth). */
+function ownerIdOf(req: Request): string {
+  return (req as Request & { ownerId?: string }).ownerId ?? "";
+}
+
 evidenceRouter.get("/", (req: Request, res: Response) => {
   const id = param(req, "id");
   const investigation = store.getInvestigation(id);
-  if (!investigation) {
+  if (!investigation || store.getOwner(id) !== ownerIdOf(req)) {
     res.status(404).json({ error: "Investigation not found" });
     return;
   }
@@ -25,8 +30,12 @@ evidenceRouter.get("/", (req: Request, res: Response) => {
 });
 
 evidenceRouter.get("/:evId", (req: Request, res: Response) => {
+  const investigationId = param(req, "id");
   const evidence = store.getEvidence(param(req, "evId"));
-  if (!evidence) {
+  // Ownership: the evidence must belong to the investigation in the URL AND
+  // that investigation must belong to the caller. Missing and foreign ids are
+  // indistinguishable 404s — no enumeration signal.
+  if (!evidence || !store.resourceBelongsTo(ownerIdOf(req), investigationId, evidence)) {
     res.status(404).json({ error: "Evidence not found" });
     return;
   }
@@ -48,9 +57,15 @@ evidenceRouter.get("/:evId/content", async (req: Request, res: Response) => {
   const investigationId = param(req, "id");
   const evidence = store.getEvidence(param(req, "evId"));
 
-  // Missing evidence AND evidence from another investigation are
+  // Ownership boundary: evidence must exist, belong to the investigation in
+  // the URL, AND that investigation must belong to the authenticated caller.
+  // Missing evidence, foreign evidence, and another caller's evidence are
   // indistinguishable 404s — no information leak about foreign IDs.
-  if (!evidence || evidence.investigationId !== investigationId) {
+  if (
+    !evidence ||
+    evidence.investigationId !== investigationId ||
+    store.getOwner(investigationId) !== ownerIdOf(req)
+  ) {
     res.status(404).json({ error: "Evidence not found" });
     return;
   }

@@ -5,16 +5,62 @@
 
 const BASE = "/api";
 
+// ── Auth token ─────────────────────────────────────────────────────────────
+// The API requires a bearer token. Development convenience: read it from
+// Vite env (VITE_PROBE_API_TOKEN, set in .env.local / dev shell) or the
+// `probe_token` localStorage key. Production deployments should serve the
+// app behind the same origin and inject the token per deployment policy.
+interface ProbeViteEnv {
+  env?: Record<string, string | undefined>;
+}
+const viteEnv: ProbeViteEnv =
+  typeof import.meta !== "undefined" ? (import.meta as unknown as ProbeViteEnv) : { env: undefined };
+
+function getAuthToken(): string {
+  try {
+    return (
+      viteEnv.env?.VITE_PROBE_API_TOKEN ||
+      localStorage.getItem("probe_token") ||
+      ""
+    );
+  } catch {
+    return viteEnv.env?.VITE_PROBE_API_TOKEN || "";
+  }
+}
+
+export class ApiError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+function authHeaders(extra?: Record<string, string>): Record<string, string> {
+  const token = getAuthToken();
+  const headers: Record<string, string> = { "Content-Type": "application/json", ...extra };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return headers;
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders((options?.headers as Record<string, string>) || undefined),
     ...options,
   });
   if (!res.ok) {
+    if (res.status === 401) {
+      throw new ApiError(401, "Unauthorized — set your API token (probe_token in localStorage or VITE_PROBE_API_TOKEN)");
+    }
     const body = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(body.error || `HTTP ${res.status}`);
+    throw new ApiError(res.status, body.error || `HTTP ${res.status}`);
   }
   return res.json();
+}
+
+/** Authorized fetch for evidence artifacts (returns the raw Response). */
+export async function fetchEvidence(path: string): Promise<Response> {
+  const res = await fetch(`${BASE}${path}`, { headers: authHeaders() });
+  return res;
 }
 
 // ── Types (mirror shared/src/types.ts) ────────────────────────────────────
@@ -213,7 +259,11 @@ export function getSummary(investigationId: string): Promise<InvestigationSummar
   return request(`/investigations/${investigationId}/summary`);
 }
 
-/** URL of the persisted artifact bytes for an evidence item. */
+/**
+ * URL of the persisted artifact bytes for an evidence item.
+ * NOTE: an <img src> cannot carry Authorization headers — evidence viewers
+ * must fetch via fetchEvidence() and render blobs, not raw URLs.
+ */
 export function evidenceContentUrl(evidenceId: string): string {
   return `${BASE}/evidence/${evidenceId}/content`;
 }
@@ -231,29 +281,47 @@ export function listEvidence(investigationId: string): Promise<Evidence[]> {
 }
 
 /**
- * Subscribe to SSE events for an investigation.
- * Returns a cleanup function.
+ * Subscribe to SSE events for an investigation via fetch-streaming —
+ * EventSource cannot send an Authorization header, and the events endpoint
+ * is authenticated. Returns a cleanup function.
  */
 export function subscribeToEvents(
   investigationId: string,
   onEvent: (event: SSEEvent) => void
 ): () => void {
-  const es = new EventSource(`${BASE}/investigations/${investigationId}/events`);
-
-  es.onmessage = (msg) => {
+  const controller = new AbortController();
+  (async () => {
     try {
-      const event = JSON.parse(msg.data) as SSEEvent;
-      onEvent(event);
+      const res = await fetch(`${BASE}/investigations/${investigationId}/events`, {
+        headers: authHeaders(),
+        signal: controller.signal,
+      });
+      if (!res.ok || !res.body) return;
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const chunks = buffer.split("\n\n");
+        buffer = chunks.pop() ?? "";
+        for (const chunk of chunks) {
+          const line = chunk.split("\n").find((l) => l.startsWith("data: "));
+          if (!line) continue;
+          try {
+            onEvent(JSON.parse(line.slice(6)) as SSEEvent);
+          } catch {
+            // ignore malformed events
+          }
+        }
+      }
     } catch {
-      // ignore parse errors
+      // aborted or network failure — cleanup handles the rest
     }
-  };
+  })();
 
-  es.onerror = () => {
-    // SSE reconnects automatically; on permanent failure, close
-  };
-
-  return () => es.close();
+  return () => controller.abort();
 }
 
 // ── Phase display helpers ──────────────────────────────────────────────────

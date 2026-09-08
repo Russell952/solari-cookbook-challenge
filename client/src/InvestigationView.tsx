@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
   getSummary, subscribeToEvents, cancelInvestigation,
-  evidenceContentUrl,
+  evidenceContentUrl, fetchEvidence,
   type InvestigationSummary, type Finding, type Evidence,
   type SSEEvent, type InvestigationPhase, type ExperimentFailure,
   PHASE_ORDER, phaseIndex, phaseLabel, statusLabel,
@@ -560,6 +560,7 @@ function EvidenceSection({
 function EvidenceViewer({ evidence, onClose }: { evidence: Evidence; onClose: () => void }) {
   const url = evidenceContentUrl(evidence.id);
   const [text, setText] = useState<string | null>(null);
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const isImage = evidence.type === "screenshot";
   const isJson = evidence.type === "action_trace" || evidence.type === "repository_source";
@@ -568,18 +569,38 @@ function EvidenceViewer({ evidence, onClose }: { evidence: Evidence; onClose: ()
   const isReplay = evidence.type === "replay";
   const isNdjsonReplay = isReplay && evidence.metadata?.format === "rrweb";
 
+  // All artifact fetches go through fetchEvidence so the Authorization
+  // header is attached; screenshots render from a blob URL (an <img src>
+  // cannot authenticate).
   useEffect(() => {
-    if (!isJson) return;
     let mounted = true;
-    fetch(url)
-      .then((r) => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
-      })
-      .then((d) => { if (mounted) setText(JSON.stringify(d, null, 2)); })
-      .catch((e) => { if (mounted) setError(e.message); });
-    return () => { mounted = false; };
-  }, [url, isJson]);
+    let blobUrl: string | null = null;
+    if (isImage) {
+      fetchEvidence(`evidence/${evidence.id}/content`)
+        .then((r) => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.blob();
+        })
+        .then((b) => {
+          if (!mounted) return;
+          blobUrl = URL.createObjectURL(b);
+          setImageUrl(blobUrl);
+        })
+        .catch((e) => { if (mounted) setError(e.message); });
+    } else if (isJson) {
+      fetchEvidence(`evidence/${evidence.id}/content`)
+        .then(async (r) => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.json();
+        })
+        .then((d) => { if (mounted) setText(JSON.stringify(d, null, 2)); })
+        .catch((e) => { if (mounted) setError(e.message); });
+    }
+    return () => {
+      mounted = false;
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+    };
+  }, [evidence.id, isImage, isJson]);
 
   return (
     <div
@@ -610,9 +631,9 @@ function EvidenceViewer({ evidence, onClose }: { evidence: Evidence; onClose: ()
           SHA-256 {String(evidence.contentHash ?? "").slice(0, 16)}…
         </p>
 
-        {isImage && (
+        {isImage && imageUrl && (
           <img
-            src={url}
+            src={imageUrl}
             alt={`Evidence screenshot ${evidence.id}`}
             style={{ maxWidth: "100%", border: "1px solid var(--border)", borderRadius: 4 }}
           />
@@ -627,19 +648,14 @@ function EvidenceViewer({ evidence, onClose }: { evidence: Evidence; onClose: ()
           </pre>
         )}
 
-        {isReplay && !isNdjsonReplay && (
-          <video controls src={url} style={{ maxWidth: "100%", border: "1px solid var(--border)", borderRadius: 4 }}>
-            Replay playback is not supported in this browser.
-          </video>
-        )}
-
-        {isNdjsonReplay && (
+        {isReplay && (
           <div>
             <p style={{ fontSize: "0.75rem", color: "var(--text-muted)", margin: "0 0 0.5rem 0" }}>
-              rrweb session recording (NDJSON event stream — DOM-level, not video).
-              First events shown; download for the full recording.
+              {isNdjsonReplay
+                ? "rrweb session recording (NDJSON event stream — DOM-level, not video). First events shown; download for the full recording."
+                : "Session recording (NDJSON event stream). First events shown; download for the full recording."}
             </p>
-            <ReplayPreview url={url} />
+            <ReplayPreview url={url} authenticated />
           </div>
         )}
 
@@ -674,14 +690,19 @@ function EvidenceViewer({ evidence, onClose }: { evidence: Evidence; onClose: ()
  * Fetches an rrweb NDJSON replay and renders its first events as readable
  * JSON — DOM-level recordings are event streams, not playable video.
  */
-function ReplayPreview({ url }: { url: string }) {
+function ReplayPreview({ url, authenticated }: { url: string; authenticated?: boolean }) {
   const [preview, setPreview] = useState<string | null>(null);
   const [eventCount, setEventCount] = useState<number | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
-    fetch(url)
+    // Fetch with the auth header when requested through the authenticated
+    // evidence path; fall back to a plain fetch for preloaded blob URLs.
+    const req = authenticated
+      ? fetchEvidence(url.replace("/api", ""))
+      : fetch(url);
+    req
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.text();

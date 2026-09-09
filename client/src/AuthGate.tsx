@@ -11,9 +11,53 @@
  * no second login step.
  */
 import { useState } from "react";
-import { ApiError, login, signup } from "./api";
+import { ApiError, login, signup, type SessionUser } from "./api";
 
 const MIN_PASSWORD_LENGTH = 8;
+
+/**
+ * The authentication gate's distinct states. `checking` exists only between
+ * mount and the first /api/auth/me resolution — every probe outcome leaves
+ * it: 200 → authenticated, 401 → unauthenticated (AuthScreen), any other
+ * failure → server-error. No outcome maps back to `checking`.
+ */
+export type AuthState =
+  | { kind: "checking" }
+  | { kind: "authenticated"; user: SessionUser }
+  | { kind: "unauthenticated" }
+  | { kind: "server-error"; message: string };
+
+/**
+ * Map a resolved session probe: getSessionUser() returns the user on 200
+ * and null on 401 (backend reachable, no valid session) — the normal
+ * signed-out visitor path that must render the AuthScreen.
+ */
+export function authStateFromProbe(session: SessionUser | null): AuthState {
+  return session ? { kind: "authenticated", user: session } : { kind: "unauthenticated" };
+}
+
+/**
+ * Map a failed session probe by the structured ApiError status — never by
+ * string matching. A 401 (defensively thrown, though getSessionUser resolves
+ * it to null) is unauthenticated, not a server problem; network failures
+ * (status 0) and 5xx are server-error states the user can retry from.
+ */
+export function authStateFromError(err: unknown): AuthState {
+  if (err instanceof ApiError && err.status === 401) return { kind: "unauthenticated" };
+  if (err instanceof ApiError) {
+    return {
+      kind: "server-error",
+      message:
+        err.status === 0
+          ? "The Probe server could not be reached. Check your connection and try again."
+          : `The Probe server returned an error (HTTP ${err.status}).`,
+    };
+  }
+  return { kind: "server-error", message: "Something went wrong while checking your session." };
+}
+
+/** Test seam: construct an ApiError from outside the api module instance. */
+export const __testApiError = ApiError;
 
 type Mode = "login" | "signup";
 

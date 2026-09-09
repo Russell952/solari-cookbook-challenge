@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { NewInvestigation } from "./NewInvestigation";
 import { InvestigationView } from "./InvestigationView";
-import { AuthScreen } from "./AuthGate";
+import { AuthScreen, authStateFromProbe, authStateFromError, type AuthState } from "./AuthGate";
 import { getSessionUser, logout, healthUrl, listInvestigations, type Investigation, type SessionUser, phaseLabel } from "./api";
 import { SearchIcon } from "./icons";
 
@@ -21,8 +21,8 @@ export function App() {
   const [route, setRoute] = useState<Route>(parseRoute);
   const [health, setHealth] = useState<{ status: string } | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
-  // null = unchecked, undefined = unauthenticated, user = signed in
-  const [user, setUser] = useState<SessionUser | null | undefined>(null);
+  // Three render states + initial checking; every /me outcome leaves checking.
+  const [auth, setAuth] = useState<AuthState>({ kind: "checking" });
 
   useEffect(() => {
     const handler = () => setRoute(parseRoute());
@@ -43,11 +43,14 @@ export function App() {
 
   // Session check — the HttpOnly cookie is attached automatically by the
   // browser; no token material is ever read or stored by the frontend.
+  // 200 means authenticated; 401 means unauthenticated (AuthScreen);
+  // network failure / 5xx mean server-error (retryable). Nothing maps to checking.
   const refreshUser = useCallback(async () => {
+    setAuth({ kind: "checking" });
     try {
-      setUser(await getSessionUser());
-    } catch {
-      setUser(undefined); // server unreachable — treat as signed out with a notice
+      setAuth(authStateFromProbe(await getSessionUser()));
+    } catch (err) {
+      setAuth(authStateFromError(err));
     }
   }, []);
 
@@ -63,7 +66,7 @@ export function App() {
     try {
       await logout();
     } finally {
-      setUser(undefined);
+      setAuth({ kind: "unauthenticated" });
     }
   };
 
@@ -90,9 +93,9 @@ export function App() {
               Connected
             </span>
           )}
-          {user && (
+          {auth.kind === "authenticated" && (
             <>
-              <span className="conn-user-email" title={user.email}>{user.email}</span>
+              <span className="conn-user-email" title={auth.user.email}>{auth.user.email}</span>
               <button className="btn btn-secondary conn-token-btn" onClick={() => void handleSignOut()}>
                 Sign out
               </button>
@@ -101,12 +104,22 @@ export function App() {
         </div>
       </header>
       <main className="main">
-        {user === null ? (
+        {auth.kind === "checking" ? (
           <div className="card auth-gate-card">
             <div className="loading">Checking your session…</div>
           </div>
-        ) : user === undefined ? (
+        ) : auth.kind === "unauthenticated" ? (
           <AuthScreen onAuthenticated={() => void refreshUser()} offlineNotice={healthError} />
+        ) : auth.kind === "server-error" ? (
+          <div className="card auth-gate-card" role="alert">
+            <h2>Probe server unavailable</h2>
+            <p className="auth-gate-note">{auth.message}</p>
+            <div className="auth-token-actions">
+              <button className="btn btn-primary" onClick={() => void refreshUser()}>
+                Retry
+              </button>
+            </div>
+          </div>
         ) : (
           <>
             {route.page === "home" && (

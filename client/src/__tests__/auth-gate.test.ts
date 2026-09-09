@@ -33,6 +33,50 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 const user = { id: "usr_1", email: "me@example.com", createdAt: "2026-09-06T00:00:00.000Z" };
 
+describe("auth gate state machine (regression: stuck 'Checking session…')", () => {
+  it("200 maps to authenticated and never back to checking", async () => {
+    const { authStateFromProbe } = await import("../AuthGate.js");
+    const state = authStateFromProbe(user);
+    expect(state.kind).toBe("authenticated");
+    if (state.kind === "authenticated") expect(state.user).toEqual(user);
+  });
+
+  it("401 (resolved null session) maps to unauthenticated, NOT checking (the production bug)", async () => {
+    const { authStateFromProbe } = await import("../AuthGate.js");
+    // getSessionUser() resolves null on a 401 — that used to set the same
+    // state value that means 'still checking', wedging the UI forever.
+    const state = authStateFromProbe(null);
+    expect(state.kind).toBe("unauthenticated");
+    expect(state.kind).not.toBe("checking");
+  });
+
+  it("a 401 ApiError maps to unauthenticated, not a server error", async () => {
+    const { authStateFromError, __testApiError } = await import("../AuthGate.js");
+    const state = authStateFromError(new __testApiError(401, "Authentication required"));
+    expect(state.kind).toBe("unauthenticated");
+  });
+
+  it("a network failure (status 0) maps to server-error with a retryable message", async () => {
+    const { authStateFromError, __testApiError } = await import("../AuthGate.js");
+    const state = authStateFromError(new __testApiError(0, "The Probe server could not be reached"));
+    expect(state.kind).toBe("server-error");
+    if (state.kind === "server-error") expect(state.message).toMatch(/could not be reached/i);
+  });
+
+  it("a 5xx maps to server-error, never to unauthenticated", async () => {
+    const { authStateFromError, __testApiError } = await import("../AuthGate.js");
+    const state = authStateFromError(new __testApiError(503, "Service unavailable"));
+    expect(state.kind).toBe("server-error");
+    expect(state.kind).not.toBe("unauthenticated");
+  });
+
+  it("a non-ApiError exception maps to server-error (unexpected errors are not swallowed)", async () => {
+    const { authStateFromError } = await import("../AuthGate.js");
+    const state = authStateFromError(new TypeError("Cannot read properties of undefined"));
+    expect(state.kind).toBe("server-error");
+  });
+});
+
 describe("session state mapping (AuthScreen gate)", () => {
   it("a valid session cookie maps to the signed-in state", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ user }));

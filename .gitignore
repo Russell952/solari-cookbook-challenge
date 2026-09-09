@@ -1,5 +1,9 @@
 node_modules/
-package-lock.json
+# Root npm lockfile is intentionally ignored: the root is a script
+# orchestrator with no dependencies. Per-package lockfiles (client/, server/,
+# shared/) ARE committed — they make isolated `npm ci` installs reproducible
+# on Vercel/Render without any root-workspace installation.
+/package-lock.json
 .env
 .env.local
 __pycache__/

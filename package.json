@@ -1,21 +1,16 @@
 {
   "name": "probe",
   "private": true,
-  "workspaces": [
-    "shared",
-    "server",
-    "client"
-  ],
+  "version": "0.1.0",
   "scripts": {
+    "setup": "cd shared && npm install && cd ../client && npm install && cd ../server && npm install",
     "dev": "cd server && npm run dev",
     "dev:server": "cd server && npm run dev",
     "dev:client": "cd client && npm run dev",
     "build": "cd client && npm run build",
+    "build:server": "cd server && npm run build",
     "start": "cd server && npm start",
-    "typecheck": "cd shared && npx tsc --noEmit && cd ../server && npx tsc --noEmit && cd ../client && npx tsc --noEmit"
-  },
-  "dependencies": {
-    "dotenv": "^17.4.2",
-    "server": "^1.0.42"
+    "typecheck": "cd shared && npx tsc --noEmit && cd ../server && npx tsc --noEmit && cd ../client && npx tsc --noEmit",
+    "test": "cd shared && npm test && cd ../server && npm test && cd ../client && npm test"
   }
 }

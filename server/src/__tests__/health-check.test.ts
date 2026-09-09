@@ -2,7 +2,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import type { Server } from "http";
 import type { AddressInfo } from "net";
-import { buildApp } from "/home/daytona/codebase/server/src/app.js";
+import { buildApp } from "../app.js";
 
 let server: Server;
 afterEach(async () => {

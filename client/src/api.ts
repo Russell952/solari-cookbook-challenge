@@ -15,7 +15,19 @@
 // env object is referenced directly here.
 const viteEnv = import.meta.env;
 
-const rawBase = (viteEnv.VITE_API_URL as string | undefined)?.trim() || "";
+/**
+ * Production fail-safe: if a production build ships without VITE_API_URL
+ * (e.g. the deploy platform env var was not set), fall back to the known
+ * deployed backend instead of relative /api paths — a static host has no
+ * /api routes, so relative URLs would 404 there. VITE_API_URL always wins
+ * when set. Local development is unaffected: `vite` runs in development
+ * mode, where the relative base and the dev proxy apply.
+ */
+const PROD_DEFAULT_API_ORIGIN = "https://api-probe.onrender.com";
+
+const rawBase =
+  (viteEnv.VITE_API_URL as string | undefined)?.trim() ||
+  (viteEnv.PROD ? PROD_DEFAULT_API_ORIGIN : "");
 // Normalizes "https://host" to "https://host/" and strips a trailing /api so
 // path construction below can stay `${API_BASE}/api/...` regardless of how the
 // deploy platform variable was written.

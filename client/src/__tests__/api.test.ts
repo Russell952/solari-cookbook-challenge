@@ -163,6 +163,8 @@ describe("client data flow: API base URL resolution (production deployment)", ()
   afterEach(() => {
     Object.assign(import.meta.env, savedEnv);
     delete import.meta.env.VITE_API_URL;
+    // Vite's `PROD` is typed non-optional; restore rather than delete.
+    import.meta.env.PROD = savedEnv.PROD;
     vi.resetModules();
   });
 
@@ -186,13 +188,27 @@ describe("client data flow: API base URL resolution (production deployment)", ()
     expect(healthUrl).toBe("https://api-probe.onrender.com/api/health");
   });
 
-  it("falls back to the relative /api base (Vite dev proxy) when VITE_API_URL is unset", async () => {
+  it("falls back to the relative /api base (Vite dev proxy) in development when VITE_API_URL is unset", async () => {
     delete import.meta.env.VITE_API_URL;
+    import.meta.env.PROD = false;
     vi.resetModules();
 
     const { healthUrl, apiOrigin } = await import("../api.js");
     expect(apiOrigin).toBe("");
     expect(healthUrl).toBe("/api/health");
+  });
+
+  it("uses the fail-safe production backend when a production build ships without VITE_API_URL", async () => {
+    // Regression guard for the deployed-404 incident: a Vercel build that
+    // never received the env var must still reach the Render backend, never
+    // the static host's own (nonexistent) /api routes.
+    delete import.meta.env.VITE_API_URL;
+    import.meta.env.PROD = true;
+    vi.resetModules();
+
+    const { healthUrl, apiOrigin } = await import("../api.js");
+    expect(apiOrigin).toBe("https://api-probe.onrender.com");
+    expect(healthUrl).toBe("https://api-probe.onrender.com/api/health");
   });
 
   it("routes getSummary through the configured production base", async () => {

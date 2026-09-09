@@ -560,7 +560,7 @@ function EvidenceViewer({ evidence, onClose }: { evidence: Evidence; onClose: ()
                 ? "rrweb session recording (NDJSON event stream — DOM-level, not video). First events shown; download for the full recording."
                 : "Session recording (NDJSON event stream). First events shown; download for the full recording."}
             </p>
-            <ReplayPreview url={url} authenticated />
+            <ReplayPreview evidenceId={evidence.id} />
           </div>
         )}
 
@@ -594,19 +594,20 @@ function EvidenceViewer({ evidence, onClose }: { evidence: Evidence; onClose: ()
 /**
  * Fetches an rrweb NDJSON replay and renders its first events as readable
  * JSON — DOM-level recordings are event streams, not playable video.
+ *
+ * Takes the evidence id and fetches through the API layer's authenticated
+ * path — never by string-rewriting a URL (a `.replace("/api", …)` would
+ * corrupt an absolute production base like https://api-probe.onrender.com).
  */
-function ReplayPreview({ url, authenticated }: { url: string; authenticated?: boolean }) {
+function ReplayPreview({ evidenceId }: { evidenceId: string }) {
   const [preview, setPreview] = useState<string | null>(null);
   const [eventCount, setEventCount] = useState<number | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
-    // Fetch with the auth header when requested through the authenticated
-    // evidence path; fall back to a plain fetch for preloaded blob URLs.
-    const req = authenticated
-      ? fetchEvidence(url.replace("/api", ""))
-      : fetch(url);
+    // Authenticated fetch through the API layer (Authorization header attached).
+    const req = fetchEvidence(`evidence/${evidenceId}/content`);
     req
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -632,7 +633,7 @@ function ReplayPreview({ url, authenticated }: { url: string; authenticated?: bo
         if (alive) setErr(e instanceof Error ? e.message : String(e));
       });
     return () => { alive = false; };
-  }, [url]);
+  }, [evidenceId]);
 
   if (err) return <p style={{ fontSize: "0.85rem", color: "var(--danger)" }}>Replay could not be loaded: {err}</p>;
   if (preview === null) return <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>Loading replay…</p>;

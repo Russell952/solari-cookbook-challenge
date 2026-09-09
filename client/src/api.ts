@@ -40,10 +40,17 @@ export const apiOrigin = API_BASE;
 const BASE = `${API_BASE}/api`;
 
 // ── Auth token ─────────────────────────────────────────────────────────────
-// The API requires a bearer token. Development convenience: read it from
-// Vite env (VITE_PROBE_API_TOKEN, set in .env.local / dev shell) or the
-// `probe_token` localStorage key. Production deployments should serve the
-// app behind the same origin and inject the token per deployment policy.
+// The API requires a bearer token. The token reaches the client through the
+// existing mechanisms, in priority order:
+//   1. VITE_PROBE_API_TOKEN — baked in at build time for single-operator
+//      deployments where the operator controls the pipeline (never a secret
+//      from the server; it is a deployment-time decision).
+//   2. localStorage["probe_token"] — entered by the operator in the UI's
+//      token prompt (AuthGate) for production use; survives page reloads.
+//   3. localStorage["probe_token"] can be replaced at runtime via
+//      setProbeToken() — used by the auth gate's save/clear actions.
+// The token is a caller identity, not a server-side secret; it never grants
+// access to anything beyond that identity's own investigations.
 function getAuthToken(): string {
   try {
     return (
@@ -53,6 +60,26 @@ function getAuthToken(): string {
     );
   } catch {
     return (viteEnv.VITE_PROBE_API_TOKEN as string | undefined) || "";
+  }
+}
+
+/** Whether an API token is configured (build-time env or stored locally). */
+export function probeTokenSet(): boolean {
+  return getAuthToken().length > 0;
+}
+
+/**
+ * Store the API token entered in the UI (localStorage["probe_token"]).
+ * Call with an empty string to clear the stored token. Has no effect when
+ * VITE_PROBE_API_TOKEN was baked into the build — that identity wins.
+ */
+export function setProbeToken(token: string): void {
+  try {
+    const trimmed = token.trim();
+    if (trimmed) localStorage.setItem("probe_token", trimmed);
+    else localStorage.removeItem("probe_token");
+  } catch {
+    // localStorage unavailable (storage disabled) — auth will fail at the API.
   }
 }
 
@@ -80,7 +107,10 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     if (res.status === 401) {
-      throw new ApiError(401, "Unauthorized — set your API token (probe_token in localStorage or VITE_PROBE_API_TOKEN)");
+      throw new ApiError(
+        401,
+        "Authentication required — enter your Probe API token to use this deployment"
+      );
     }
     const body = await res.json().catch(() => ({ error: res.statusText }));
     throw new ApiError(res.status, body.error || `HTTP ${res.status}`);

@@ -785,3 +785,62 @@ body {
     grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
   }
 }
+
+/* ── Auth gate (API token) ─────────────────────────────────────────────── */
+.auth-gate-card {
+  max-width: 480px;
+  margin: 3rem auto 0 auto;
+}
+
+.auth-gate-card h2 {
+  margin-bottom: 0.5rem;
+}
+
+.auth-gate-note {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  margin: 0 0 1rem 0;
+}
+
+.auth-gate-note code {
+  background: var(--bg-hover);
+  padding: 0.1rem 0.35rem;
+  border-radius: 3px;
+  font-size: 0.8rem;
+}
+
+.auth-token-form .form-group {
+  margin-bottom: 0.75rem;
+}
+
+.auth-token-error {
+  color: var(--danger);
+  font-size: 0.8rem;
+  margin: 0.5rem 0;
+}
+
+.auth-token-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.auth-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.auth-modal {
+  width: min(480px, 92vw);
+}
+
+.conn-token-btn {
+  padding: 0.2rem 0.6rem;
+  font-size: 0.7rem;
+}

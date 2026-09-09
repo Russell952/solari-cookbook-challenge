@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { NewInvestigation } from "./NewInvestigation";
 import { InvestigationView } from "./InvestigationView";
+import { AuthGate, TokenManagerButton } from "./AuthGate";
 import { healthUrl, listInvestigations, type Investigation, phaseLabel } from "./api";
 import { SearchIcon } from "./icons";
 
@@ -66,21 +67,27 @@ export function App() {
               Connected
             </span>
           )}
+          <TokenManagerButton />
         </div>
       </header>
       <main className="main">
-        {route.page === "home" && (
-          <HomeView
-            onNewInvestigation={() => navigate("/")}
-            onSelectInvestigation={(id) => navigate(`/investigation/${id}`)}
-          />
-        )}
-        {route.page === "investigation" && (
-          <InvestigationView
-            investigationId={route.id}
-            onBack={() => navigate("/")}
-          />
-        )}
+        {/* Every API call is authenticated; AuthGate verifies the token before
+            data views mount so failures surface as a clear sign-in instead of
+            silent empty screens. */}
+        <AuthGate>
+          {route.page === "home" && (
+            <HomeView
+              onNewInvestigation={() => navigate("/")}
+              onSelectInvestigation={(id) => navigate(`/investigation/${id}`)}
+            />
+          )}
+          {route.page === "investigation" && (
+            <InvestigationView
+              investigationId={route.id}
+              onBack={() => navigate("/")}
+            />
+          )}
+        </AuthGate>
       </main>
     </div>
   );
@@ -96,11 +103,12 @@ function HomeView({
   const [investigations, setInvestigations] = useState<Investigation[]>([]);
   const [showNew, setShowNew] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     listInvestigations()
       .then(setInvestigations)
-      .catch(() => {})
+      .catch((e) => setLoadError(e instanceof Error ? e.message : "Failed to load investigations"))
       .finally(() => setLoading(false));
   }, []);
 
@@ -130,7 +138,12 @@ function HomeView({
         {!showNew && (
           <>
             {loading && <div className="loading">Loading...</div>}
-            {!loading && investigations.length === 0 && (
+            {!loading && loadError && (
+              <div className="empty-state">
+                <p style={{ color: "var(--danger)" }}>{loadError}</p>
+              </div>
+            )}
+            {!loading && !loadError && investigations.length === 0 && (
               <div className="empty-state">
                 <p>No investigations yet.</p>
                 <button className="btn btn-primary" onClick={() => setShowNew(true)}>

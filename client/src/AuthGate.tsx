@@ -85,9 +85,9 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
     <div className="card auth-gate-card">
       <h2>Authentication required</h2>
       <p className="auth-gate-note">
-        This Probe deployment requires an API token. Enter the token configured
-        for this deployment (the server&rsquo;s <code>PROBE_API_TOKEN</code>) to continue.
-        It is stored only in this browser and sent only to the Probe API.
+        This Probe deployment requires an API token. Enter the Probe API token
+        issued to you for this deployment. It is stored only in this browser
+        and sent only to the Probe API.
       </p>
       <TokenForm
         notice={state.notice}

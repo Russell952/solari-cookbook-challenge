@@ -47,16 +47,21 @@ const mockContext = {
   route: vi.fn(async () => {}),
 };
 
-const mockBrowserHandle = {
-  contexts: vi.fn().mockReturnValue([mockContext]),
-  on: vi.fn(),
+// Real SDK 0.1.x BrowserSession shape: the facade exposes contexts() but NOT
+// an event emitter; future contexts arrive via the documented escape hatch
+// session.raw (the underlying patchright Browser, which emits "context").
+const contextListeners: Array<(ctx: unknown) => void> = [];
+const mockRawBrowser = {
+  on: vi.fn((event: string, handler: (ctx: unknown) => void) => {
+    if (event === "context") contextListeners.push(handler);
+  }),
 };
 
 const mockBrowserSession = {
   id: "solari-session-123",
-  ...mockBrowserHandle,
   contexts: vi.fn().mockReturnValue([mockContext]),
   newPage: vi.fn().mockResolvedValue(mockPage),
+  raw: mockRawBrowser,
   close: vi.fn().mockImplementation(async () => {
     closeCalls.push("browserSession.close");
   }),
@@ -89,6 +94,7 @@ describe("Browser Adapter", () => {
     vi.clearAllMocks();
     closeCalls.length = 0;
     downloadListeners.length = 0;
+    contextListeners.length = 0;
     store.clearAll();
   });
 
@@ -120,6 +126,40 @@ describe("Browser Adapter", () => {
       expect(stored[0].id).toBe(session.probeSessionId);
       expect(stored[0].type).toBe("browser");
       expect(stored[0].status).toBe("active");
+    });
+
+    // ── Mandatory network policy (SSRF/DNS-rebinding enforcement) ──────────
+
+    it("installs the network policy on the session's existing contexts", async () => {
+      await browser.createBrowserSession("inv_1");
+      expect(mockContext.route).toHaveBeenCalledWith("**/*", expect.any(Function));
+    });
+
+    it("subscribes to future contexts through session.raw (SDK 0.1.x interface)", async () => {
+      await browser.createBrowserSession("inv_1");
+      expect(mockRawBrowser.on).toHaveBeenCalledWith("context", expect.any(Function));
+
+      // A context created after launch (e.g. by newPage()) must get the policy.
+      const futureContext = { route: vi.fn(async () => {}) };
+      for (const handler of contextListeners) handler(futureContext);
+      await new Promise((r) => setTimeout(r, 0));
+      expect(futureContext.route).toHaveBeenCalledWith("**/*", expect.any(Function));
+    });
+
+    it("FAILS CLOSED when the session exposes neither facade nor raw interfaces", async () => {
+      const previous = mockSolari.launch.getMockImplementation();
+      mockSolari.launch.mockImplementationOnce(async () => ({
+        id: "solari-unprotected",
+        newPage: vi.fn(),
+        close: vi.fn(),
+        // no contexts(), no raw, no session
+      }));
+      await expect(browser.createBrowserSession("inv_1")).rejects.toThrow(
+        /mandatory network policy/
+      );
+      // No unprotected session may be registered in the store.
+      expect(store.listSessions("inv_1")).toHaveLength(0);
+      if (previous) mockSolari.launch.mockImplementation(previous);
     });
   });
 
@@ -296,16 +336,16 @@ describe("Browser Adapter", () => {
   describe("connection-time network policy", () => {
     it("installs a route handler on every existing context at session creation", async () => {
       mockContext.route.mockClear();
-      mockBrowserHandle.on.mockClear();
+      mockRawBrowser.on.mockClear();
       await browser.createBrowserSession("inv_policy");
       expect(mockContext.route).toHaveBeenCalledTimes(1);
       expect(mockContext.route).toHaveBeenCalledWith("**/*", expect.any(Function));
     });
 
     it("subscribes to future contexts so new pages cannot bypass the policy", async () => {
-      mockBrowserHandle.on.mockClear();
+      mockRawBrowser.on.mockClear();
       await browser.createBrowserSession("inv_policy2");
-      expect(mockBrowserHandle.on).toHaveBeenCalledWith("context", expect.any(Function));
+      expect(mockRawBrowser.on).toHaveBeenCalledWith("context", expect.any(Function));
     });
 
     it("aborts requests whose host resolves to a private address (rebinding)", async () => {

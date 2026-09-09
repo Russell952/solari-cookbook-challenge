@@ -116,27 +116,64 @@ export async function createBrowserSession(
 
   // ── Connection-time SSRF/DNS-rebinding enforcement ──────────────────────
   // Install on every existing context AND make every future context install
-  // it too, so no network path can bypass the policy. The Solari session
-  // wraps a patchright Browser; reach it through the SDK's documented escape
-  // hatches (BrowserSession.contexts()/raw) with runtime guards so a future
-  // SDK change degrades to a hard failure, never a silent policy bypass.
-  const browserHandle = (
-    typeof session.contexts === "function"
-      ? session // SDK BrowserSession facade
-      : (session as unknown as { session?: unknown }).session // raw browser
-  ) as {
-    contexts(): Array<{ route: Parameters<typeof installNetworkPolicy>[0]["route"] }>;
-    on(event: string, handler: (ctx: Parameters<typeof installNetworkPolicy>[0]) => void): void;
+  // it too, so no network path can bypass the policy.
+  //
+  // SDK interface (verified against @solarisdk/browser 0.1.x .d.ts):
+  //   - BrowserSession facade exposes contexts(): BrowserContext[] — the
+  //     contexts that exist right now (sessions ship with a default context).
+  //   - The facade does NOT expose an event emitter. Future contexts (e.g.
+  //     from newPage(), which opens a fresh context) are covered through the
+  //     documented escape hatch session.raw — the underlying patchright
+  //     Browser, which emits "context" events.
+  //   - Older/raw sessions expose contexts()+on() on the session object
+  //     itself; that shape is still accepted for compatibility.
+  // Runtime guards keep this fail-closed: if neither interface is available,
+  // session creation FAILS — it never returns an unprotected browser.
+  type PolicyContext = { route: Parameters<typeof installNetworkPolicy>[0]["route"] };
+  type ContextEmitter = {
+    on(event: string, handler: (ctx: PolicyContext) => void): void;
   };
-  if (typeof browserHandle?.contexts !== "function" || typeof browserHandle?.on !== "function") {
+
+  const rawShape = session as unknown as {
+    raw?: unknown;
+    session?: unknown;
+  };
+
+  // Contexts collection: facade first, then legacy raw-session shape.
+  const contextsSource: (() => PolicyContext[]) | null =
+    typeof session.contexts === "function"
+      ? () => session.contexts() as unknown as PolicyContext[]
+      : rawShape.session !== null && typeof rawShape.session === "object" &&
+          typeof (rawShape.session as { contexts?: unknown }).contexts === "function"
+        ? () => (rawShape.session as { contexts(): PolicyContext[] }).contexts()
+        : null;
+
+  // Future-context emitter: prefer the documented raw browser; fall back to
+  // a legacy session object that emits context events itself.
+  const emitter: ContextEmitter | null =
+    rawShape.raw !== null && typeof rawShape.raw === "object" &&
+      typeof (rawShape.raw as { on?: unknown }).on === "function"
+      ? (rawShape.raw as ContextEmitter)
+      : rawShape.session !== null && typeof rawShape.session === "object" &&
+          typeof (rawShape.session as { on?: unknown }).on === "function"
+        ? (rawShape.session as ContextEmitter)
+        : null;
+
+  if (contextsSource === null || emitter === null) {
+    // Fail closed: refuse to hand back a browser the policy cannot cover —
+    // both for the contexts that exist now and for any created later.
     throw new Error(
-      "Solari browser session does not expose contexts — cannot install the mandatory network policy"
+      "Solari browser session does not expose the interfaces required to install the " +
+      "mandatory network policy (contexts()/raw context events). Refusing to run with " +
+      "an unprotected browser — check the @solarisdk/browser version against Probe's " +
+      "supported interface."
     );
   }
-  for (const ctx of browserHandle.contexts()) {
+
+  for (const ctx of contextsSource()) {
     await installNetworkPolicy(ctx);
   }
-  browserHandle.on("context", (ctx) => {
+  emitter.on("context", (ctx) => {
     void installNetworkPolicy(ctx).catch(networkPolicyErrorHandler);
   });
 

@@ -102,7 +102,7 @@ export function InvestigationView({ investigationId, onBack }: Props) {
       {/* Back + title */}
       <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginBottom: "1rem" }}>
         <button className="btn btn-secondary" onClick={onBack} style={{ padding: "0.4rem 0.75rem" }}>
-          ← Back
+          <ArrowLeftIcon aria-hidden="true" /> Back
         </button>
         <div style={{ minWidth: 0 }}>
           <h2 style={{ fontSize: "1.1rem", fontWeight: 600 }}>Investigation</h2>
@@ -216,7 +216,7 @@ export function InvestigationView({ investigationId, onBack }: Props) {
                   {new Date(evt.timestamp).toLocaleTimeString()}
                 </span>
                 <span style={{ fontWeight: 500 }}>{formatEventType(evt.type)}</span>
-                {evt.data.phase != null && <span style={{ color: "var(--info)" }}> → {String(evt.data.phase)}</span>}
+                {evt.data.phase != null && <span style={{ color: "var(--info)" }}>&rarr; {String(evt.data.phase)}</span>}
                 {evt.data.experimentId != null && <span> #{String(evt.data.experimentId).slice(0, 8)}</span>}
                 {evt.data.error != null && <span style={{ color: "var(--danger)" }}> Error: {String(evt.data.error)}</span>}
               </div>
@@ -288,8 +288,8 @@ function FindingsSection({
             </span>
             {f.title}
             {reportFindingIds.has(f.id) && (
-              <span style={{ fontSize: "0.7rem", color: "var(--success)", marginLeft: "0.5rem", fontWeight: 400 }}>
-                ✓ in report
+              <span style={{ display: "inline-flex", alignItems: "center", gap: "0.25rem", fontSize: "0.7rem", color: "var(--success)", marginLeft: "0.5rem", fontWeight: 400 }}>
+                <CheckIcon aria-hidden="true" /> in report
               </span>
             )}
           </h3>
@@ -314,7 +314,7 @@ function FindingsSection({
             </div>
           )}
 
-          {/* Evidence provenance: finding → evidence → experiment */}
+          {/* Evidence provenance: finding -> evidence -> experiment */}
           <div style={{ marginTop: "0.75rem", borderTop: "1px solid var(--border)", paddingTop: "0.75rem" }}>
             <p style={{ fontSize: "0.7rem", color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em", margin: "0 0 0.5rem 0" }}>
               Supporting evidence
@@ -778,4 +778,46 @@ function formatEventType(type: string): string {
     complete: "Complete",
   };
   return labels[type] || type;
+}
+
+/**
+ * Inline SVG icon primitives — no icon library dependency added.
+ */
+function ArrowLeftIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={{ display: "inline-block", verticalAlign: "-2px" }}
+    >
+      <path d="m12 19-7-7 7-7" />
+      <path d="M19 12H5" />
+    </svg>
+  );
+}
+
+function CheckIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={{ display: "inline-block", verticalAlign: "-1px" }}
+    >
+      <path d="M20 6 9 17l-5-5" />
+    </svg>
+  );
 }

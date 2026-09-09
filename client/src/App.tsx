@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { NewInvestigation } from "./NewInvestigation";
 import { InvestigationView } from "./InvestigationView";
-import { listInvestigations, type Investigation, phaseLabel } from "./api";
+import { healthUrl, listInvestigations, type Investigation, phaseLabel } from "./api";
 
 type Route =
   | { page: "home" }
@@ -27,9 +27,9 @@ export function App() {
     return () => window.removeEventListener("hashchange", handler);
   }, []);
 
-  // Health check — the server exposes /api/health (alias of /health)
+  // Health check — same base URL as every other API call (api.ts healthUrl)
   useEffect(() => {
-    fetch("/api/health")
+    fetch(healthUrl)
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
@@ -49,14 +49,21 @@ export function App() {
           style={{ cursor: "pointer" }}
           onClick={() => navigate("/")}
         >
-          🔍 Probe <span>Evidence-Driven Software Investigation</span>
+          <SearchIcon aria-hidden="true" /> Probe{" "}
+          <span>Evidence-Driven Software Investigation</span>
         </h1>
         <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
           {healthError && (
-            <span style={{ color: "var(--danger)", fontSize: "0.75rem" }}>Backend offline</span>
+            <span className="conn-badge conn-offline">
+              <span className="conn-dot conn-dot-danger" aria-hidden="true" />
+              Server offline
+            </span>
           )}
           {health && (
-            <span style={{ color: "var(--success)", fontSize: "0.75rem" }}>● Connected</span>
+            <span className="conn-badge conn-online">
+              <span className="conn-dot conn-dot-ok" aria-hidden="true" />
+              Connected
+            </span>
           )}
         </div>
       </header>
@@ -75,6 +82,27 @@ export function App() {
         )}
       </main>
     </div>
+  );
+}
+
+/** Inline SVG search icon — brand mark for the app header. */
+function SearchIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={{ flexShrink: 0 }}
+    >
+      <circle cx="11" cy="11" r="8" />
+      <path d="m21 21-4.35-4.35" />
+    </svg>
   );
 }
 

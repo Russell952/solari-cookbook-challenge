@@ -1,30 +1,46 @@
 /**
  * Probe API client.
- * All calls go through the Vite proxy to /api.
+ *
+ * Single source of truth for the API base URL:
+ *   - VITE_API_URL (e.g. https://api-probe.onrender.com) in production builds
+ *   - relative "/api" otherwise — the Vite dev proxy forwards to localhost:3001
+ *
+ * Every request (investigations, summary, evidence, SSE, health) goes through
+ * this module, so one constant drives all backend traffic.
  */
 
-const BASE = "/api";
+// Vite statically replaces `import.meta.env.VITE_*` at build time. Accessing
+// env through a cast alias (e.g. `(import.meta as X).env`) would defeat that
+// replacement and silently fall back to relative URLs in production, so the
+// env object is referenced directly here.
+const viteEnv = import.meta.env;
+
+const rawBase = (viteEnv.VITE_API_URL as string | undefined)?.trim() || "";
+// Normalizes "https://host" to "https://host/" and strips a trailing /api so
+// path construction below can stay `${API_BASE}/api/...` regardless of how the
+// deploy platform variable was written.
+const API_BASE = rawBase.replace(/\/+$/, "").replace(/\/api$/, "");
+
+/** Absolute API origin ("") for same-origin deployments. */
+export const apiOrigin = API_BASE;
+
+/** Base for all Probe API paths. */
+const BASE = `${API_BASE}/api`;
 
 // ── Auth token ─────────────────────────────────────────────────────────────
 // The API requires a bearer token. Development convenience: read it from
 // Vite env (VITE_PROBE_API_TOKEN, set in .env.local / dev shell) or the
 // `probe_token` localStorage key. Production deployments should serve the
 // app behind the same origin and inject the token per deployment policy.
-interface ProbeViteEnv {
-  env?: Record<string, string | undefined>;
-}
-const viteEnv: ProbeViteEnv =
-  typeof import.meta !== "undefined" ? (import.meta as unknown as ProbeViteEnv) : { env: undefined };
-
 function getAuthToken(): string {
   try {
     return (
-      viteEnv.env?.VITE_PROBE_API_TOKEN ||
+      (viteEnv.VITE_PROBE_API_TOKEN as string | undefined) ||
       localStorage.getItem("probe_token") ||
       ""
     );
   } catch {
-    return viteEnv.env?.VITE_PROBE_API_TOKEN || "";
+    return (viteEnv.VITE_PROBE_API_TOKEN as string | undefined) || "";
   }
 }
 
@@ -34,6 +50,9 @@ export class ApiError extends Error {
     this.name = "ApiError";
   }
 }
+
+/** Health endpoint of the configured backend (used by the header indicator). */
+export const healthUrl = `${BASE}/health`;
 
 function authHeaders(extra?: Record<string, string>): Record<string, string> {
   const token = getAuthToken();

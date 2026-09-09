@@ -206,6 +206,24 @@ body {
   background: #dc2626;
 }
 
+/* Connection status badge (header) */
+.conn-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.75rem;
+}
+
+.conn-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.conn-dot-ok { background: var(--success); }
+.conn-dot-danger { background: var(--danger); }
+
 /* Status badges */
 .status-created { color: var(--text-muted); }
 .status-running { color: var(--info); }

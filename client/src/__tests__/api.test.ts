@@ -156,3 +156,56 @@ describe("client data flow: evidence content URL", () => {
     expect(evidenceContentUrl("ev-with-uuid")).toBe("/api/evidence/ev-with-uuid/content");
   });
 });
+
+describe("client data flow: API base URL resolution (production deployment)", () => {
+  const savedEnv = { ...import.meta.env };
+
+  afterEach(() => {
+    Object.assign(import.meta.env, savedEnv);
+    delete import.meta.env.VITE_API_URL;
+    vi.resetModules();
+  });
+
+  it("prefixes every API path with VITE_API_URL when set (production backend)", async () => {
+    import.meta.env.VITE_API_URL = "https://api-probe.onrender.com";
+    vi.resetModules();
+
+    const { healthUrl, evidenceContentUrl, apiOrigin } = await import("../api.js");
+    expect(apiOrigin).toBe("https://api-probe.onrender.com");
+    expect(healthUrl).toBe("https://api-probe.onrender.com/api/health");
+    expect(evidenceContentUrl("ev_1")).toBe(
+      "https://api-probe.onrender.com/api/evidence/ev_1/content"
+    );
+  });
+
+  it("normalizes a trailing slash and redundant /api suffix in VITE_API_URL", async () => {
+    import.meta.env.VITE_API_URL = "https://api-probe.onrender.com/api/";
+    vi.resetModules();
+
+    const { healthUrl } = await import("../api.js");
+    expect(healthUrl).toBe("https://api-probe.onrender.com/api/health");
+  });
+
+  it("falls back to the relative /api base (Vite dev proxy) when VITE_API_URL is unset", async () => {
+    delete import.meta.env.VITE_API_URL;
+    vi.resetModules();
+
+    const { healthUrl, apiOrigin } = await import("../api.js");
+    expect(apiOrigin).toBe("");
+    expect(healthUrl).toBe("/api/health");
+  });
+
+  it("routes getSummary through the configured production base", async () => {
+    import.meta.env.VITE_API_URL = "https://api-probe.onrender.com";
+    vi.resetModules();
+    fetchMock.mockResolvedValueOnce(jsonResponse(summaryFixture));
+
+    const { getSummary } = await import("../api.js");
+    await getSummary("inv_1");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api-probe.onrender.com/api/investigations/inv_1/summary",
+      expect.anything()
+    );
+  });
+});

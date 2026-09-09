@@ -1,4 +1,19 @@
+import { randomBytes } from "crypto";
+
 export const isProduction = process.env.NODE_ENV === "production";
+
+/**
+ * Resolve the session signing secret. Production: required (validateConfig
+ * fails closed when absent). Dev: ephemeral random secret so local signup
+ * works out of the box — sessions reset on restart, mirroring the ephemeral
+ * dev API-token convention. Never the API token, never sent to the client.
+ */
+function resolveSessionSecret(): string {
+  const raw = process.env.PROBE_SESSION_SECRET || "";
+  if (raw) return raw;
+  if (isProduction) return "";
+  return randomBytes(32).toString("hex");
+}
 
 export const config = {
   port: parseInt(process.env.PORT || "3001", 10),
@@ -7,6 +22,16 @@ export const config = {
   aiBaseUrl: process.env.AI_BASE_URL || "https://api.openai.com/v1",
   aiModel: process.env.AI_MODEL || "gpt-4o",
   corsOrigin: process.env.CORS_ORIGIN || "http://localhost:5173",
+
+  /**
+   * Session-cookie signing secret for email/password accounts.
+   * Required in production (validateConfig fails closed); dev falls back to an
+   * ephemeral random secret (sessions reset on restart — acceptable in dev).
+   * Never shared with the client and never the API token.
+   */
+  sessionSecret: resolveSessionSecret(),
+  /** Session lifetime in hours (finite expiration; default 7 days). */
+  sessionTtlHours: parseInt(process.env.PROBE_SESSION_TTL_HOURS || "168", 10),
 
   // ── Security hardening (P0 pre-hosting) ──────────────────────────────────
   /**
@@ -32,6 +57,8 @@ export const config = {
     general: { max: parseInt(process.env.PROBE_RATE_MAX_GENERAL || "300", 10), windowMs: 5 * 60_000 },
     createInvestigation: { max: parseInt(process.env.PROBE_RATE_MAX_CREATE || "20", 10), windowMs: 60 * 60_000 },
     startInvestigation: { max: parseInt(process.env.PROBE_RATE_MAX_START || "30", 10), windowMs: 60 * 60_000 },
+    /** Signup + login share one bucket — bounds password guessing and account spam. */
+    auth: { max: parseInt(process.env.PROBE_RATE_MAX_AUTH || "20", 10), windowMs: 15 * 60_000 },
   },
 
   /** JSON body size limit — Probe payloads are small; 1 MB is generous. */
@@ -76,6 +103,13 @@ export function validateConfig(): void {
   }
   if (!config.solariApiKey) {
     throw new Error("SOLARI_API_KEY is required");
+  }
+  // Session signing secret: fail closed in production. Dev keeps working with
+  // an ephemeral secret (mirrors the ephemeral dev API-token convention).
+  if (isProduction && !process.env.PROBE_SESSION_SECRET) {
+    throw new Error(
+      "PROBE_SESSION_SECRET is required when NODE_ENV=production — sessions cannot be signed without it"
+    );
   }
   // Fail closed in production: an unauthenticated cost-incurring API must
   // never be exposed. Dev gets an ephemeral token (printed once by auth.ts).

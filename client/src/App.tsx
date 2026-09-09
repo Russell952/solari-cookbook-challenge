@@ -1,8 +1,8 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { NewInvestigation } from "./NewInvestigation";
 import { InvestigationView } from "./InvestigationView";
-import { AuthGate, TokenManagerButton } from "./AuthGate";
-import { healthUrl, listInvestigations, type Investigation, phaseLabel } from "./api";
+import { AuthScreen } from "./AuthGate";
+import { getSessionUser, logout, healthUrl, listInvestigations, type Investigation, type SessionUser, phaseLabel } from "./api";
 import { SearchIcon } from "./icons";
 
 type Route =
@@ -21,15 +21,16 @@ export function App() {
   const [route, setRoute] = useState<Route>(parseRoute);
   const [health, setHealth] = useState<{ status: string } | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
+  // null = unchecked, undefined = unauthenticated, user = signed in
+  const [user, setUser] = useState<SessionUser | null | undefined>(null);
 
-  // Listen for hash changes
   useEffect(() => {
     const handler = () => setRoute(parseRoute());
     window.addEventListener("hashchange", handler);
     return () => window.removeEventListener("hashchange", handler);
   }, []);
 
-  // Health check — same base URL as every other API call (api.ts healthUrl)
+  // Health check — unauthenticated by design (header connectivity indicator).
   useEffect(() => {
     fetch(healthUrl)
       .then((r) => {
@@ -40,8 +41,30 @@ export function App() {
       .catch((e) => setHealthError(e instanceof Error ? e.message : "offline"));
   }, []);
 
+  // Session check — the HttpOnly cookie is attached automatically by the
+  // browser; no token material is ever read or stored by the frontend.
+  const refreshUser = useCallback(async () => {
+    try {
+      setUser(await getSessionUser());
+    } catch {
+      setUser(undefined); // server unreachable — treat as signed out with a notice
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshUser();
+  }, [refreshUser]);
+
   const navigate = (path: string) => {
     window.location.hash = path;
+  };
+
+  const handleSignOut = async () => {
+    try {
+      await logout();
+    } finally {
+      setUser(undefined);
+    }
   };
 
   return (
@@ -67,27 +90,39 @@ export function App() {
               Connected
             </span>
           )}
-          <TokenManagerButton />
+          {user && (
+            <>
+              <span className="conn-user-email" title={user.email}>{user.email}</span>
+              <button className="btn btn-secondary conn-token-btn" onClick={() => void handleSignOut()}>
+                Sign out
+              </button>
+            </>
+          )}
         </div>
       </header>
       <main className="main">
-        {/* Every API call is authenticated; AuthGate verifies the token before
-            data views mount so failures surface as a clear sign-in instead of
-            silent empty screens. */}
-        <AuthGate>
-          {route.page === "home" && (
-            <HomeView
-              onNewInvestigation={() => navigate("/")}
-              onSelectInvestigation={(id) => navigate(`/investigation/${id}`)}
-            />
-          )}
-          {route.page === "investigation" && (
-            <InvestigationView
-              investigationId={route.id}
-              onBack={() => navigate("/")}
-            />
-          )}
-        </AuthGate>
+        {user === null ? (
+          <div className="card auth-gate-card">
+            <div className="loading">Checking your session…</div>
+          </div>
+        ) : user === undefined ? (
+          <AuthScreen onAuthenticated={() => void refreshUser()} offlineNotice={healthError} />
+        ) : (
+          <>
+            {route.page === "home" && (
+              <HomeView
+                onNewInvestigation={() => navigate("/")}
+                onSelectInvestigation={(id) => navigate(`/investigation/${id}`)}
+              />
+            )}
+            {route.page === "investigation" && (
+              <InvestigationView
+                investigationId={route.id}
+                onBack={() => navigate("/")}
+              />
+            )}
+          </>
+        )}
       </main>
     </div>
   );

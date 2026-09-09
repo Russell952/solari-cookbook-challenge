@@ -844,3 +844,39 @@ body {
   padding: 0.2rem 0.6rem;
   font-size: 0.7rem;
 }
+
+.conn-user-email {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auth-switch {
+  margin: 1rem 0 0 0;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.auth-link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 0.85rem;
+  text-decoration: underline;
+}
+
+.auth-link:hover {
+  color: var(--info);
+}
+
+@media (max-width: 768px) {
+  .conn-user-email {
+    display: none;
+  }
+}

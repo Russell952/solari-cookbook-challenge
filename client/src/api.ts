@@ -39,48 +39,20 @@ export const apiOrigin = API_BASE;
 /** Base for all Probe API paths. */
 const BASE = `${API_BASE}/api`;
 
-// ── Auth token ─────────────────────────────────────────────────────────────
-// The API requires a bearer token. The token reaches the client through the
-// existing mechanisms, in priority order:
-//   1. VITE_PROBE_API_TOKEN — baked in at build time for single-operator
-//      deployments where the operator controls the pipeline (never a secret
-//      from the server; it is a deployment-time decision).
-//   2. localStorage["probe_token"] — entered by the operator in the UI's
-//      token prompt (AuthGate) for production use; survives page reloads.
-//   3. localStorage["probe_token"] can be replaced at runtime via
-//      setProbeToken() — used by the auth gate's save/clear actions.
-// The token is a caller identity, not a server-side secret; it never grants
-// access to anything beyond that identity's own investigations.
-function getAuthToken(): string {
-  try {
-    return (
-      (viteEnv.VITE_PROBE_API_TOKEN as string | undefined) ||
-      localStorage.getItem("probe_token") ||
-      ""
-    );
-  } catch {
-    return (viteEnv.VITE_PROBE_API_TOKEN as string | undefined) || "";
-  }
-}
+// ── Session authentication ───────────────────────────────────────────────
+// Browser accounts authenticate with a signed HttpOnly session cookie.
+// The cookie is set by the server (signup/login) and attached automatically
+// by the browser on every same-site request; cross-origin requests use
+// credentials: "include". The token itself is never readable by — or
+// stored in — the frontend (nothing readable is kept client-side; no web
+// storage, no component state, no URL parameters).
+const FETCH_CREDENTIALS: RequestCredentials = "include";
 
-/** Whether an API token is configured (build-time env or stored locally). */
-export function probeTokenSet(): boolean {
-  return getAuthToken().length > 0;
-}
-
-/**
- * Store the API token entered in the UI (localStorage["probe_token"]).
- * Call with an empty string to clear the stored token. Has no effect when
- * VITE_PROBE_API_TOKEN was baked into the build — that identity wins.
- */
-export function setProbeToken(token: string): void {
-  try {
-    const trimmed = token.trim();
-    if (trimmed) localStorage.setItem("probe_token", trimmed);
-    else localStorage.removeItem("probe_token");
-  } catch {
-    // localStorage unavailable (storage disabled) — auth will fail at the API.
-  }
+/** The safe public user shape returned by the auth endpoints. */
+export interface SessionUser {
+  id: string;
+  email: string;
+  createdAt: string;
 }
 
 export class ApiError extends Error {
@@ -94,25 +66,29 @@ export class ApiError extends Error {
 export const healthUrl = `${BASE}/health`;
 
 function authHeaders(extra?: Record<string, string>): Record<string, string> {
-  const token = getAuthToken();
   const headers: Record<string, string> = { "Content-Type": "application/json", ...extra };
-  if (token) headers.Authorization = `Bearer ${token}`;
   return headers;
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
+    credentials: FETCH_CREDENTIALS,
     headers: authHeaders((options?.headers as Record<string, string>) || undefined),
     ...options,
   });
   if (!res.ok) {
+    const body = await res
+      .json()
+      .catch(() => ({ error: undefined as string | undefined }));
     if (res.status === 401) {
-      throw new ApiError(
-        401,
-        "Authentication required — enter your Probe API token to use this deployment"
-      );
+      // Surface a specific server message (e.g. login's "Invalid email or
+      // password"); the bare session-expiry 401 gets the actionable prompt.
+      const specific =
+        body.error && body.error !== "Authentication required"
+          ? body.error
+          : "Authentication required — please sign in";
+      throw new ApiError(401, specific);
     }
-    const body = await res.json().catch(() => ({ error: res.statusText }));
     throw new ApiError(res.status, body.error || `HTTP ${res.status}`);
   }
   return res.json();
@@ -120,8 +96,44 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
 /** Authorized fetch for evidence artifacts (returns the raw Response). */
 export async function fetchEvidence(path: string): Promise<Response> {
-  const res = await fetch(`${BASE}${path}`, { headers: authHeaders() });
+  const res = await fetch(`${BASE}${path}`, { credentials: FETCH_CREDENTIALS, headers: authHeaders() });
   return res;
+}
+
+// ── Auth API (session cookies) ─────────────────────────────────────────
+
+/** Current session user, or null when unauthenticated. */
+export async function getSessionUser(): Promise<SessionUser | null> {
+  try {
+    const res = await fetch(`${BASE}/auth/me`, { credentials: FETCH_CREDENTIALS });
+    if (res.status === 401) return null;
+    if (!res.ok) throw new ApiError(res.status, `HTTP ${res.status}`);
+    const body = (await res.json()) as { user?: SessionUser };
+    return body.user ?? null;
+  } catch (e) {
+    if (e instanceof ApiError) throw e;
+    throw new ApiError(0, "The Probe server could not be reached");
+  }
+}
+
+export async function login(email: string, password: string): Promise<SessionUser> {
+  const { user } = await request<{ user: SessionUser }>("/auth/login", {
+    method: "POST",
+    body: JSON.stringify({ email, password }),
+  });
+  return user;
+}
+
+export async function signup(email: string, password: string): Promise<SessionUser> {
+  const { user } = await request<{ user: SessionUser }>("/auth/signup", {
+    method: "POST",
+    body: JSON.stringify({ email, password }),
+  });
+  return user;
+}
+
+export async function logout(): Promise<void> {
+  await request("/auth/logout", { method: "POST" });
 }
 
 // ── Types (mirror shared/src/types.ts) ────────────────────────────────────
@@ -354,6 +366,7 @@ export function subscribeToEvents(
   (async () => {
     try {
       const res = await fetch(`${BASE}/investigations/${investigationId}/events`, {
+        credentials: FETCH_CREDENTIALS,
         headers: authHeaders(),
         signal: controller.signal,
       });

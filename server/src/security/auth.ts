@@ -18,6 +18,7 @@
 import { randomBytes, createHmac, timingSafeEqual } from "crypto";
 import type { NextFunction, Request, Response } from "express";
 import { config, isProduction } from "../config/index.js";
+import { sessionUserId } from "../auth/session.js";
 
 /** Token → owner id. Each token is its own owner identity. */
 const tokenOwnerById = new Map<string, string>();
@@ -72,17 +73,42 @@ function safeEqual(a: string, b: string): boolean {
   return ha.length === hb.length && timingSafeEqual(ha, hb);
 }
 
-/** Extract the caller's owner id from the Authorization header, or null. */
+/**
+ * Extract the caller's owner id.
+ *
+ * Two credential types, both resolving to a stable owner identity:
+ *   1. Bearer API token (machine/API access; unchanged) — owner is derived
+ *      from the token itself.
+ *   2. Signed session cookie (browser accounts) — owner is the verified
+ *      `sub` (user id) from the HttpOnly cookie; the user must still exist.
+ * Anonymous mode (dev-only) still short-circuits to "anonymous".
+ */
 function authenticate(req: Request): string | null {
   if (config.allowAnonymous) return "anonymous";
   const header = req.headers.authorization;
-  if (!header || !header.startsWith("Bearer ")) return null;
-  const token = header.slice(7).trim();
-  if (!token) return null;
-  for (const [known] of tokenOwnerById) {
-    if (safeEqual(token, known)) return tokenOwnerById.get(known)!;
+  if (header && header.startsWith("Bearer ")) {
+    const token = header.slice(7).trim();
+    if (token) {
+      for (const [known] of tokenOwnerById) {
+        if (safeEqual(token, known)) return tokenOwnerById.get(known)!;
+      }
+    }
   }
+  // Browser session: signature + expiry verified; the user record must
+  // exist on disk (checked here via the store's id lookup).
+  const sessionSub = sessionUserId(req);
+  if (sessionSub && sessionUserExists(sessionSub)) return sessionSub;
   return null;
+}
+
+/**
+ * Pluggable session-user existence check. The users store is injected at
+ * startup (avoids a circular import between security/auth and auth/users)
+ * and defaults to rejecting all session credentials.
+ */
+let sessionUserExists: (userId: string) => boolean = () => false;
+export function setSessionUserChecker(fn: (userId: string) => boolean): void {
+  sessionUserExists = fn;
 }
 
 export interface AuthedRequest extends Request {
@@ -102,6 +128,8 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
     return;
   }
   (req as AuthedRequest).ownerId = ownerId;
+  // Session-authenticated requests expose the user id for /api/auth/me.
+  (req as AuthedRequest & { sessionUserId?: string }).sessionUserId = sessionUserId(req) ?? undefined;
   next();
 }
 

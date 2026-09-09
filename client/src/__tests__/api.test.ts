@@ -226,37 +226,8 @@ describe("client data flow: API base URL resolution (production deployment)", ()
   });
 });
 
-describe("client authentication: bearer token flow", () => {
-  const savedEnv = { ...import.meta.env };
-  const savedStorage = new Map<string, string>();
-
-  // Node-environment localStorage stand-in (the api layer try/catches its absence,
-  // but a working shim lets us exercise the real storage path). Re-stubbed in
-  // beforeEach because the file-level afterEach unstubAllGlobals() between tests.
-  beforeEach(() => {
-    const store = new Map<string, string>();
-    vi.stubGlobal("localStorage", {
-      getItem: (k: string) => store.get(k) ?? null,
-      setItem: (k: string, v: string) => void store.set(k, v),
-      removeItem: (k: string) => void store.delete(k),
-    });
-    (globalThis as { __probeStore?: Map<string, string> }).__probeStore = store;
-    savedStorage.clear();
-  });
-
-  afterEach(() => {
-    Object.assign(import.meta.env, savedEnv);
-    delete import.meta.env.VITE_PROBE_API_TOKEN;
-    vi.resetModules();
-  });
-
-  afterAll(() => {
-    vi.unstubAllGlobals();
-  });
-
-  it("sends Authorization: Bearer from the stored probe_token on every request", async () => {
-    const store = (globalThis as { __probeStore?: Map<string, string> }).__probeStore!;
-    store.set("probe_token", "tok_abc123");
+describe("client authentication: cookie session flow", () => {
+  it("sends credentials: include on data requests so the session cookie rides along", async () => {
     fetchMock.mockResolvedValue(jsonResponse(summaryFixture));
 
     const { listInvestigations, getSummary } = await import("../api.js");
@@ -264,65 +235,20 @@ describe("client authentication: bearer token flow", () => {
     await getSummary("inv_1");
 
     for (const call of fetchMock.mock.calls) {
-      const headers = (call[1] as { headers: Record<string, string> }).headers;
-      expect(headers.Authorization).toBe("Bearer tok_abc123");
+      expect((call[1] as RequestInit).credentials).toBe("include");
+      // Cookie-based auth: no credential material in headers, ever.
+      expect((call[1] as { headers: Record<string, string> }).headers.Authorization).toBeUndefined();
     }
   });
 
-  it("prefers the build-time VITE_PROBE_API_TOKEN over the stored token", async () => {
-    const store = (globalThis as { __probeStore?: Map<string, string> }).__probeStore!;
-    store.set("probe_token", "stored-token");
-    import.meta.env.VITE_PROBE_API_TOKEN = "build-time-token";
-    vi.resetModules();
-    fetchMock.mockResolvedValue(jsonResponse(summaryFixture));
-
-    const { listInvestigations } = await import("../api.js");
-    await listInvestigations();
-
-    const headers = (fetchMock.mock.calls[0][1] as { headers: Record<string, string> }).headers;
-    expect(headers.Authorization).toBe("Bearer build-time-token");
-  });
-
-  it("sends no Authorization header when no token is configured", async () => {
-    // Empty string = no build-time token (Vitest env values are strings; an
-    // empty value is falsy in the api.ts resolution chain).
-    import.meta.env.VITE_PROBE_API_TOKEN = "";
-    vi.resetModules();
-    fetchMock.mockResolvedValue(jsonResponse(summaryFixture));
-
-    const { listInvestigations } = await import("../api.js");
-    await listInvestigations();
-
-    const headers = (fetchMock.mock.calls[0][1] as { headers: Record<string, string> }).headers;
-    expect(headers.Authorization).toBeUndefined();
-  });
-
-  it("surfaces a 401 as an actionable ApiError instead of a silent failure", async () => {
-    import.meta.env.VITE_PROBE_API_TOKEN = "";
-    vi.resetModules();
-    fetchMock.mockResolvedValueOnce(jsonResponse({ error: "Authentication required" }, 401));
-
-    const { listInvestigations, ApiError } = await import("../api.js");
-    const err = await listInvestigations().then(
-      () => null,
-      (e) => e
-    );
-    expect(err).toBeInstanceOf(ApiError);
-    expect((err as { status: number }).status).toBe(401);
-    expect((err as Error).message).toMatch(/token/i);
-  });
-
-  it("attaches the token to evidence and SSE requests too", async () => {
-    const store = (globalThis as { __probeStore?: Map<string, string> }).__probeStore!;
-    store.set("probe_token", "tok_ev_sse");
-
+  it("sends credentials: include on evidence and SSE requests too", async () => {
     const { fetchEvidence, subscribeToEvents } = await import("../api.js");
 
     fetchMock.mockResolvedValueOnce(new Response("x"));
     await fetchEvidence("evidence/ev_1/content");
-    expect(
-      (fetchMock.mock.calls[0][1] as { headers: Record<string, string> }).headers.Authorization
-    ).toBe("Bearer tok_ev_sse");
+    const evidenceCall = fetchMock.mock.calls[0];
+    expect((evidenceCall[1] as RequestInit).credentials).toBe("include");
+    expect((evidenceCall[1] as { headers: Record<string, string> }).headers.Authorization).toBeUndefined();
 
     // SSE stream fetch (cancel immediately)
     const sseResponse = {
@@ -335,23 +261,132 @@ describe("client authentication: bearer token flow", () => {
     unsub();
     const sseCall = fetchMock.mock.calls[1];
     expect(sseCall[0]).toContain("/api/investigations/inv_1/events");
-    expect((sseCall[1] as { headers: Record<string, string> }).headers.Authorization).toBe(
-      "Bearer tok_ev_sse"
-    );
+    expect((sseCall[1] as RequestInit).credentials).toBe("include");
   });
 
-  it("stores, reports, and clears the token through setProbeToken/probeTokenSet", async () => {
-    const store = (globalThis as { __probeStore?: Map<string, string> }).__probeStore!;
-    import.meta.env.VITE_PROBE_API_TOKEN = "";
-    vi.resetModules();
+  it("logs in with a POST of JSON credentials to /api/auth/login", async () => {
+    const user = { id: "usr_1", email: "user@example.com", createdAt: "2026-09-06T00:00:00.000Z" };
+    fetchMock.mockResolvedValueOnce(jsonResponse({ user }));
 
-    const { setProbeToken, probeTokenSet } = await import("../api.js");
-    expect(probeTokenSet()).toBe(false);
-    setProbeToken("  tok_xyz  ");
-    expect(store.get("probe_token")).toBe("tok_xyz"); // trimmed on save
-    expect(probeTokenSet()).toBe(true);
-    setProbeToken("");
-    expect(store.has("probe_token")).toBe(false);
-    expect(probeTokenSet()).toBe(false);
+    const { login } = await import("../api.js");
+    await expect(login("user@example.com", "password123")).resolves.toEqual(user);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain("/api/auth/login");
+    expect((init as RequestInit).method).toBe("POST");
+    expect(JSON.parse((init as { body: string }).body)).toEqual({
+      email: "user@example.com",
+      password: "password123",
+    });
+    expect((init as RequestInit).credentials).toBe("include");
+  });
+
+  it("signs up with a POST of JSON credentials to /api/auth/signup", async () => {
+    const user = { id: "usr_2", email: "new@example.com", createdAt: "2026-09-06T00:00:00.000Z" };
+    fetchMock.mockResolvedValueOnce(jsonResponse({ user }, 201));
+
+    const { signup } = await import("../api.js");
+    await expect(signup("new@example.com", "password123")).resolves.toEqual(user);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain("/api/auth/signup");
+    expect((init as RequestInit).method).toBe("POST");
+    expect(JSON.parse((init as { body: string }).body)).toEqual({
+      email: "new@example.com",
+      password: "password123",
+    });
+  });
+
+  it("logs out with a POST to /api/auth/logout", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }));
+
+    const { logout } = await import("../api.js");
+    await expect(logout()).resolves.toBeUndefined();
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain("/api/auth/logout");
+    expect((init as RequestInit).method).toBe("POST");
+    expect((init as RequestInit).credentials).toBe("include");
+  });
+
+  it("getSessionUser returns the session user when the cookie is valid", async () => {
+    const user = { id: "usr_3", email: "me@example.com", createdAt: "2026-09-06T00:00:00.000Z" };
+    fetchMock.mockResolvedValueOnce(jsonResponse({ user }));
+
+    const { getSessionUser } = await import("../api.js");
+    await expect(getSessionUser()).resolves.toEqual(user);
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain("/api/auth/me");
+    expect((init as RequestInit).credentials).toBe("include");
+  });
+
+  it("getSessionUser returns null (not an error) when unauthenticated", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ error: "Authentication required" }, 401));
+
+    const { getSessionUser } = await import("../api.js");
+    await expect(getSessionUser()).resolves.toBeNull();
+  });
+
+  it("getSessionUser reports an unreachable server instead of silently signing out", async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+
+    const { getSessionUser, ApiError } = await import("../api.js");
+    const err = await getSessionUser().then(
+      () => null,
+      (e) => e
+    );
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as { status: number }).status).toBe(0);
+    expect((err as Error).message).toMatch(/could not be reached/i);
+  });
+
+  it("surfaces a 401 on protected APIs as an actionable sign-in error", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ error: "Authentication required" }, 401));
+
+    const { listInvestigations, ApiError } = await import("../api.js");
+    const err = await listInvestigations().then(
+      () => null,
+      (e) => e
+    );
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as { status: number }).status).toBe(401);
+    expect((err as Error).message).toMatch(/sign in/i);
+  });
+
+  it("propagates auth endpoint errors (duplicate email, validation) with server messages", async () => {
+    const { signup, login, ApiError } = await import("../api.js");
+
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ error: "An account with this email already exists" }, 409)
+    );
+    const dup = await signup("dupe@example.com", "password123").then(
+      () => null,
+      (e) => e
+    );
+    expect(dup).toBeInstanceOf(ApiError);
+    expect((dup as { status: number }).status).toBe(409);
+    expect((dup as Error).message).toMatch(/already exists/i);
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ error: "Invalid email or password" }, 401));
+    const bad = await login("who@example.com", "wrongpassword").then(
+      () => null,
+      (e) => e
+    );
+    expect(bad).toBeInstanceOf(ApiError);
+    expect((bad as { status: number }).status).toBe(401);
+    expect((bad as Error).message).toMatch(/invalid email or password/i);
+  });
+
+  it("stores no credential material anywhere in the client source", async () => {
+    // Regression guard for the milestone requirement: the session lives only
+    // in the HttpOnly cookie — never localStorage/sessionStorage/state/URL.
+    const fs = await import("fs");
+    for (const file of ["../api.ts", "../AuthGate.tsx", "../App.tsx"]) {
+      const src = fs.readFileSync(new URL(file, import.meta.url), "utf-8");
+      expect(src, `${file} must not touch web storage`).not.toMatch(/localStorage|sessionStorage/);
+      expect(src, `${file} must not read build-time token env`).not.toMatch(/VITE_PROBE_API_TOKEN/);
+      expect(src, `${file} must not put tokens in URLs`).not.toMatch(/probe_token=/);
+    }
   });
 });

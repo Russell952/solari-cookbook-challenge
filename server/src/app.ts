@@ -13,7 +13,9 @@ import cors from "cors";
 import helmet from "helmet";
 import { config, isProduction } from "./config/index.js";
 import { apiRouter } from "./api/index.js";
-import { requireAuth } from "./security/auth.js";
+import { authRouter } from "./auth/routes.js";
+import { hasUserByIdSync } from "./auth/users.js";
+import { requireAuth, setSessionUserChecker } from "./security/auth.js";
 import { generalLimiter } from "./security/rate-limit.js";
 import { safeUrlError } from "./security/url-validation.js";
 
@@ -74,7 +76,9 @@ export function buildApp(): express.Express {
       },
       methods: ["GET", "POST", "OPTIONS"],
       allowedHeaders: ["Content-Type", "Authorization"],
-      credentials: false, // bearer tokens, not cookies
+      // Cookie sessions: the allowlisted frontend must be able to send its
+      // credentials; `*` is still never used with credentials.
+      credentials: true,
       maxAge: 600,
     })
   );
@@ -87,6 +91,12 @@ export function buildApp(): express.Express {
   };
   app.get("/health", healthHandler);
   app.get("/api/health", healthHandler);
+
+  // ── Session-user lookup for cookie auth ─────────────────────────────
+  // Injected here (module load time) so requireAuth can verify that a
+  // session's `sub` refers to an existing user without a circular import.
+  // preloadUsers() in server.ts fills the cache before listening.
+  setSessionUserChecker(hasUserByIdSync);
 
   // ── Body parsing ─────────────────────────────────────────────────────────
   app.use(express.json({ limit: config.bodyLimit }));
@@ -116,7 +126,11 @@ export function buildApp(): express.Express {
     }
   );
 
-  // ── Authentication: every /api route requires a valid bearer token ───────
+  // ── Authentication: every /api route requires credentials ───────────────
+  // /api/auth/* is mounted BEFORE the gate: signup/login must be reachable
+  // unauthenticated (they are rate-limited and CSRF-checked internally);
+  // /api/auth/me performs its own session check.
+  app.use("/api/auth", authRouter);
   app.use("/api", requireAuth);
 
   // ── Rate limiting (after auth so 401s aren't counted against callers) ────

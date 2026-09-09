@@ -15,8 +15,23 @@
  * never leak a slot and wedge the deployment.
  */
 import type { NextFunction, Request, Response } from "express";
-import rateLimit, { ipKeyGenerator } from "express-rate-limit";
+import rateLimit, { ipKeyGenerator, type Store } from "express-rate-limit";
+import { MemoryStore } from "express-rate-limit";
 import { config } from "../config/index.js";
+
+/**
+ * Per-limiter MemoryStore instances. Production behavior is identical to the
+ * library default (which also creates a MemoryStore internally), but holding
+ * the references ourselves lets resetRateLimits() actually reach the stores —
+ * express-rate-limit v8 closes over the store, so the middleware object
+ * itself exposes no reset surface.
+ */
+const limiterStores: Store[] = [];
+function newStore(): Store {
+  const store = new MemoryStore();
+  limiterStores.push(store);
+  return store;
+}
 
 // ── HTTP rate limits ────────────────────────────────────────────────────────
 
@@ -28,6 +43,7 @@ const json429 = (_req: Request, res: Response): void => {
 export const generalLimiter = rateLimit({
   windowMs: config.rateLimit.general.windowMs,
   max: config.rateLimit.general.max,
+  store: newStore(),
   standardHeaders: "draft-8",
   legacyHeaders: false,
   handler: json429,
@@ -42,6 +58,7 @@ export const generalLimiter = rateLimit({
 export const createInvestigationLimiter = rateLimit({
   windowMs: config.rateLimit.createInvestigation.windowMs,
   max: config.rateLimit.createInvestigation.max,
+  store: newStore(),
   standardHeaders: "draft-8",
   legacyHeaders: false,
   handler: json429,
@@ -52,6 +69,21 @@ export const createInvestigationLimiter = rateLimit({
 export const startInvestigationLimiter = rateLimit({
   windowMs: config.rateLimit.startInvestigation.windowMs,
   max: config.rateLimit.startInvestigation.max,
+  store: newStore(),
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  handler: json429,
+  keyGenerator: (req) => ipKeyGenerator(req.ip ?? "unknown"),
+});
+
+/**
+ * Signup + login limiter — one shared bucket so password guessing cannot
+ * hide inside separate signup/login budgets.
+ */
+export const authLimiter = rateLimit({
+  windowMs: config.rateLimit.auth.windowMs,
+  max: config.rateLimit.auth.max,
+  store: newStore(),
   standardHeaders: "draft-8",
   legacyHeaders: false,
   handler: json429,
@@ -60,9 +92,8 @@ export const startInvestigationLimiter = rateLimit({
 
 /** Test helper: reset all in-memory rate-limit buckets. */
 export function resetRateLimits(): void {
-  for (const limiter of [generalLimiter, createInvestigationLimiter, startInvestigationLimiter]) {
-    const store = (limiter as unknown as { store?: { clearAll?: () => void } }).store;
-    store?.clearAll?.();
+  for (const store of limiterStores) {
+    void store.resetAll?.();
   }
 }
 

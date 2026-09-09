@@ -1,11 +1,12 @@
 /**
- * AuthGate decision-logic tests.
+ * Authentication-surface tests (cookie sessions).
  *
- * The gate renders React, which the node test environment cannot mount, so
- * these cover its decision procedure directly: probeAuthState() maps API
- * outcomes (200 / 401 / network failure) to the three gate states, and the
- * token save/verify path persists through api.ts's existing localStorage
- * mechanism. React rendering is verified by typecheck + build.
+ * The node test environment cannot mount React components, so these cover
+ * the client's auth decision layer: getSessionUser() state mapping (signed
+ * in / signed out / unreachable server), the login/signup/logout API calls
+ * the AuthScreen submits, and the source-level guarantees the screen relies
+ * on (credentials: include everywhere, no token storage, no build-time token
+ * env, no secrets in the client). Rendering is verified by typecheck + build.
  */
 /** @vitest-environment node */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -30,100 +31,147 @@ function jsonResponse(body: unknown, status = 200): Response {
   } as unknown as Response;
 }
 
-function localStorageShim(): {
-  setItem: (k: string, v: string) => void;
-  getItem: (k: string) => string | null;
-  removeItem: (k: string) => void;
-  store: Map<string, string>;
-} {
-  const store = new Map<string, string>();
-  return {
-    store,
-    getItem: (k) => store.get(k) ?? null,
-    setItem: (k, v) => void store.set(k, v),
-    removeItem: (k) => void store.delete(k),
-  };
-}
+const user = { id: "usr_1", email: "me@example.com", createdAt: "2026-09-06T00:00:00.000Z" };
 
-describe("AuthGate decision logic", () => {
-  const savedEnv = { ...import.meta.env };
+describe("session state mapping (AuthScreen gate)", () => {
+  it("a valid session cookie maps to the signed-in state", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ user }));
 
-  afterEach(() => {
-    Object.assign(import.meta.env, savedEnv);
-    delete import.meta.env.VITE_PROBE_API_TOKEN;
-    vi.resetModules();
+    const { getSessionUser } = await import("../api.js");
+    await expect(getSessionUser()).resolves.toEqual(user);
+    expect(fetchMock.mock.calls[0][0]).toContain("/api/auth/me");
+    expect((fetchMock.mock.calls[0][1] as RequestInit).credentials).toBe("include");
   });
 
-  it("maps a successful authenticated call to the authed state", async () => {
-    const ls = localStorageShim();
-    vi.stubGlobal("localStorage", ls);
-    ls.store.set("probe_token", "tok_valid");
-    fetchMock.mockResolvedValueOnce(jsonResponse([]));
-
-    const { probeAuthState } = await import("../AuthGate.js");
-    await expect(probeAuthState()).resolves.toBe("ok");
-    expect(fetchMock.mock.calls[0][0]).toContain("/api/investigations");
-  });
-
-  it("maps a 401 (missing/invalid token) to the token-prompt state", async () => {
-    const ls = localStorageShim();
-    vi.stubGlobal("localStorage", ls);
+  it("no cookie (401) maps to the signed-out state — the AuthScreen renders", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ error: "Authentication required" }, 401));
 
-    const { probeAuthState } = await import("../AuthGate.js");
-    await expect(probeAuthState()).resolves.toBe("unauthorized");
+    const { getSessionUser } = await import("../api.js");
+    await expect(getSessionUser()).resolves.toBeNull();
   });
 
-  it("maps a network failure to the offline/retry state — never to a token rejection", async () => {
-    vi.stubGlobal("localStorage", localStorageShim());
+  it("an unreachable server maps to the retry state, never to a false 'signed out'", async () => {
     fetchMock.mockRejectedValueOnce(new TypeError("Failed to fetch"));
 
-    const { probeAuthState } = await import("../AuthGate.js");
-    await expect(probeAuthState()).resolves.toBe("unreachable");
+    const { getSessionUser, ApiError } = await import("../api.js");
+    const err = await getSessionUser().then(
+      () => null,
+      (e) => e
+    );
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as { status: number }).status).toBe(0);
   });
 
-  it("token save → verify → clear flow persists through the api layer", async () => {
-    const ls = localStorageShim();
-    vi.stubGlobal("localStorage", ls);
+  it("a 500 from /me is surfaced as an error, not treated as signed-out", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ error: "Internal server error" }, 500));
 
-    const { setProbeToken, probeTokenSet } = await import("../api.js");
-    expect(probeTokenSet()).toBe(false);
+    const { getSessionUser, ApiError } = await import("../api.js");
+    const err = await getSessionUser().then(
+      () => null,
+      (e) => e
+    );
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as { status: number }).status).toBe(500);
+  });
+});
 
-    setProbeToken("tok_entered_by_user");
-    expect(probeTokenSet()).toBe(true);
-    expect(ls.store.get("probe_token")).toBe("tok_entered_by_user");
+describe("AuthScreen submissions (login / signup / logout)", () => {
+  it("login posts JSON credentials and returns the session user", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ user }));
 
-    fetchMock.mockResolvedValueOnce(jsonResponse([]));
-    const { probeAuthState } = await import("../AuthGate.js");
-    await expect(probeAuthState()).resolves.toBe("ok");
+    const { login } = await import("../api.js");
+    await expect(login("me@example.com", "password123")).resolves.toEqual(user);
 
-    setProbeToken("");
-    expect(probeTokenSet()).toBe(false);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain("/api/auth/login");
+    expect((init as RequestInit).method).toBe("POST");
+    expect((init as RequestInit).credentials).toBe("include");
+    expect(JSON.parse((init as { body: string }).body)).toEqual({
+      email: "me@example.com",
+      password: "password123",
+    });
   });
 
-  it("a rejected token is reported, not silently accepted", async () => {
-    const ls = localStorageShim();
-    vi.stubGlobal("localStorage", ls);
+  it("signup posts JSON credentials and returns the created user", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ user }, 201));
 
-    const { setProbeToken } = await import("../api.js");
-    setProbeToken("tok_wrong");
-    fetchMock.mockResolvedValueOnce(jsonResponse({ error: "Authentication required" }, 401));
+    const { signup } = await import("../api.js");
+    await expect(signup("me@example.com", "password123")).resolves.toEqual(user);
 
-    const { probeAuthState } = await import("../AuthGate.js");
-    await expect(probeAuthState()).resolves.toBe("unauthorized");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain("/api/auth/signup");
+    expect((init as RequestInit).method).toBe("POST");
+    expect(JSON.parse((init as { body: string }).body)).toEqual({
+      email: "me@example.com",
+      password: "password123",
+    });
   });
 
-  it("does not send an Authorization header for the anonymous-mode probe", async () => {
-    // Empty string = no build-time token configured (env values are strings;
-    // an empty value is falsy in api.ts's resolution chain).
-    import.meta.env.VITE_PROBE_API_TOKEN = "";
-    vi.resetModules();
-    vi.stubGlobal("localStorage", localStorageShim());
-    fetchMock.mockResolvedValueOnce(jsonResponse([]));
+  it("a 409 duplicate signup surfaces the server's message to the form", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ error: "An account with this email already exists" }, 409)
+    );
 
-    const { probeAuthState } = await import("../AuthGate.js");
-    await expect(probeAuthState()).resolves.toBe("ok");
-    const headers = (fetchMock.mock.calls[0][1] as { headers: Record<string, string> }).headers;
-    expect(headers.Authorization).toBeUndefined();
+    const { signup, ApiError } = await import("../api.js");
+    const err = await signup("dupe@example.com", "password123").then(
+      () => null,
+      (e) => e
+    );
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as Error).message).toMatch(/already exists/i);
+  });
+
+  it("invalid login surfaces the generic server error (no account-existence leak)", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ error: "Invalid email or password" }, 401));
+
+    const { login, ApiError } = await import("../api.js");
+    const err = await login("ghost@example.com", "wrongpassword").then(
+      () => null,
+      (e) => e
+    );
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as Error).message).toBe("Invalid email or password");
+  });
+
+  it("logout posts with credentials and succeeds", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }));
+
+    const { logout } = await import("../api.js");
+    await expect(logout()).resolves.toBeUndefined();
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain("/api/auth/logout");
+    expect((init as RequestInit).method).toBe("POST");
+    expect((init as RequestInit).credentials).toBe("include");
+  });
+});
+
+describe("cookie-session source guarantees", () => {
+  it("the AuthScreen never handles token material", async () => {
+    const fs = await import("fs");
+    const src = fs.readFileSync(new URL("../AuthGate.tsx", import.meta.url), "utf-8");
+    expect(src).not.toMatch(/localStorage|sessionStorage/);
+    expect(src).not.toMatch(/VITE_PROBE_API_TOKEN|probe_token/);
+    expect(src).toMatch(/Confirm password/i);
+    expect(src).toMatch(/Create account/);
+    expect(src).toMatch(/Sign in/);
+  });
+
+  it("every api.ts fetch site sends credentials: include", async () => {
+    const fs = await import("fs");
+    const src = fs.readFileSync(new URL("../api.ts", import.meta.url), "utf-8");
+    const fetchSites = src.match(/fetch\(/g)?.length ?? 0;
+    expect(fetchSites).toBeGreaterThanOrEqual(3); // request(), fetchEvidence(), SSE, /me
+    expect(src).toMatch(/credentials:\s*FETCH_CREDENTIALS/);
+    expect(src).toMatch(/const FETCH_CREDENTIALS: RequestCredentials = "include"/);
+  });
+
+  it("the client contains no server-secret surface", async () => {
+    const fs = await import("fs");
+    for (const file of ["../api.ts", "../AuthGate.tsx", "../App.tsx"]) {
+      const src = fs.readFileSync(new URL(file, import.meta.url), "utf-8");
+      expect(src, file).not.toMatch(/PROBE_SESSION_SECRET|PROBE_API_TOKEN|SOLARI_API_KEY/);
+      expect(src, file).not.toMatch(/localStorage|sessionStorage/);
+    }
   });
 });

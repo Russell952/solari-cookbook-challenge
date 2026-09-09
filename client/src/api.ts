@@ -62,6 +62,28 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Session-expiry notification.
+ *
+ * A 401 from a PROTECTED api call (investigations, summary, evidence, SSE —
+ * not the auth endpoints themselves) means the HttpOnly session cookie is
+ * missing, expired, or was rejected. The browser cannot read or clear the
+ * cookie itself, so the server's next login/signup response replaces it.
+ * The app layer subscribes via onSessionExpired() and transitions to the
+ * Sign In screen; navigation must never be blocked by a stale session.
+ */
+type SessionExpiredListener = () => void;
+const sessionExpiredListeners = new Set<SessionExpiredListener>();
+
+export function onSessionExpired(listener: SessionExpiredListener): () => void {
+  sessionExpiredListeners.add(listener);
+  return () => sessionExpiredListeners.delete(listener);
+}
+
+function notifySessionExpired(): void {
+  for (const listener of sessionExpiredListeners) listener();
+}
+
 /** Health endpoint of the configured backend (used by the header indicator). */
 export const healthUrl = `${BASE}/health`;
 
@@ -81,6 +103,12 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
       .json()
       .catch(() => ({ error: undefined as string | undefined }));
     if (res.status === 401) {
+      // A protected endpoint rejected the session cookie — notify the gate so
+      // the UI transitions to Sign In (fix for the stranded-on-401 dead end).
+      // Auth endpoints are exempt: login/signup 401s are handled locally by
+      // the form as invalid credentials, not as session expiry.
+      const isAuthEndpoint = path.startsWith("/auth/");
+      if (!isAuthEndpoint) notifySessionExpired();
       // Surface a specific server message (e.g. login's "Invalid email or
       // password"); the bare session-expiry 401 gets the actionable prompt.
       const specific =
@@ -97,6 +125,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 /** Authorized fetch for evidence artifacts (returns the raw Response). */
 export async function fetchEvidence(path: string): Promise<Response> {
   const res = await fetch(`${BASE}${path}`, { credentials: FETCH_CREDENTIALS, headers: authHeaders() });
+  if (res.status === 401) notifySessionExpired();
   return res;
 }
 
@@ -188,6 +217,27 @@ export interface Finding {
   updatedAt: string;
 }
 
+/**
+ * Finding shape as delivered inside a summary report. The report serializer
+ * carries the fields the report UI renders; finders that need the rest read
+ * the full finding from summary.findings by id.
+ */
+export interface ReportFinding {
+  id: string | null;
+  title: string;
+  severity: string;
+  description?: string;
+  recommendation?: string | null;
+}
+
+/**
+ * How an evidence item was actually produced. Reported by the backend
+ * summary endpoint ("recon" = reconnaissance capture with no experiment —
+ * context, not behavioral proof; "verification" = produced by an experiment
+ * that tested a hypothesis; "experiment" = produced by a normal experiment).
+ */
+export type EvidenceProvenance = "recon" | "experiment" | "verification";
+
 export interface Evidence {
   id: string;
   investigationId: string;
@@ -197,6 +247,10 @@ export interface Evidence {
   uri: string | null;
   contentHash: string | null;
   metadata: Record<string, unknown>;
+  provenance?: EvidenceProvenance;
+  artifactAvailable?: boolean;
+  mimeType?: string;
+  byteSize?: number;
   createdAt: string;
 }
 
@@ -235,6 +289,7 @@ export interface InvestigationSummary {
     status: string;
     result: string | null;
     error: string | null;
+    hypothesisId?: string | null;
   }>;
   experimentCounts: {
     total: number;
@@ -262,7 +317,7 @@ export interface InvestigationSummary {
   report: {
     id: string;
     summary: string;
-    confirmedFindings: Finding[];
+    confirmedFindings: ReportFinding[];
     rejectedHypotheses: string[];
     inconclusiveHypotheses: string[];
     totalExperiments: number;
@@ -370,6 +425,7 @@ export function subscribeToEvents(
         headers: authHeaders(),
         signal: controller.signal,
       });
+      if (res.status === 401) notifySessionExpired();
       if (!res.ok || !res.body) return;
       const reader = res.body.getReader();
       const decoder = new TextDecoder();

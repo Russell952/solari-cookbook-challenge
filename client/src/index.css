@@ -22,6 +22,15 @@
   box-sizing: border-box;
 }
 
+/* Long-string safety (root-cause fix, not overflow suppression): URLs,
+   hashes, and identifiers can appear in any text node. `overflow-wrap:
+   anywhere` lets them wrap instead of stretching flex/grid items past the
+   viewport, and it also shrinks those items' min-content size so flex
+   children with min-width:auto stop forcing page-wide overflow. */
+h1, h2, h3, h4, p, li, span, label, div, button, a, pre, code {
+  overflow-wrap: anywhere;
+}
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   background: var(--bg-primary);
@@ -42,8 +51,10 @@ body {
 
 .header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
+  row-gap: 0.5rem;
   padding: 1rem 2rem;
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border);
@@ -53,8 +64,10 @@ body {
   font-size: 1.25rem;
   font-weight: 600;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.5rem;
+  min-width: 0;
 }
 
 .header h1 span {
@@ -105,8 +118,10 @@ body {
 
 .card-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
+  gap: 0.5rem;
   margin-bottom: 1rem;
 }
 
@@ -302,7 +317,8 @@ body {
 
 .finding-card .finding-meta {
   display: flex;
-  gap: 1rem;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
   margin-bottom: 0.75rem;
   font-size: 0.8rem;
   color: var(--text-muted);
@@ -329,8 +345,9 @@ body {
 /* Evidence list */
 .evidence-item {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 0.75rem;
+  gap: 0.4rem 0.75rem;
   padding: 0.5rem;
   border-bottom: 1px solid var(--border);
   font-size: 0.8rem;
@@ -338,6 +355,12 @@ body {
 
 .evidence-item:last-child {
   border-bottom: none;
+}
+
+/* The URI/description span can shrink; long values wrap via the global
+   overflow-wrap rule instead of pushing the row wider than the card. */
+.evidence-item > span {
+  min-width: 0;
 }
 
 .evidence-type {
@@ -349,6 +372,22 @@ body {
   text-transform: uppercase;
   font-weight: 600;
 }
+
+/* Provenance chip: how an evidence item was produced (recon capture,
+   experiment run, or independent verification run). */
+.prov-chip {
+  flex-shrink: 0;
+  padding: 0.1rem 0.4rem;
+  border-radius: 3px;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+.prov-recon { background: var(--bg-hover); color: var(--text-muted); }
+.prov-experiment { background: rgba(6, 182, 212, 0.15); color: var(--info); }
+.prov-verification { background: rgba(16, 185, 129, 0.15); color: var(--success); }
 
 /* Empty state */
 .empty-state {
@@ -784,6 +823,31 @@ body {
   .progress-metrics {
     grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
   }
+  .header {
+    padding: 0.75rem 1rem;
+  }
+  .header h1 {
+    font-size: 1.1rem;
+  }
+  .card {
+    padding: 1rem;
+  }
+}
+
+/* Very narrow phones: drop the tagline so the header row fits 320px. */
+@media (max-width: 480px) {
+  .header h1 span {
+    display: none;
+  }
+}
+
+/* Investigation view header — wraps on narrow screens instead of clipping */
+.view-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  margin-bottom: 1rem;
 }
 
 /* ── Auth gate (API token) ─────────────────────────────────────────────── */

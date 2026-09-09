@@ -67,7 +67,11 @@ describe("resolveFindingEvidenceIds", () => {
     makeEvidence({ id: "ev_exp1_a", experimentId: "exp_1" }),
     makeEvidence({ id: "ev_exp1_b", experimentId: "exp_1" }),
     makeEvidence({ id: "ev_exp2", experimentId: "exp_2" }),
-    makeEvidence({ id: "ev_recon", experimentId: null, type: "url" }),
+    // A dangling experiment reference (the "recon" sentinel id used
+    // historically): provenance cannot be established, so it must never
+    // support a finding.
+    makeEvidence({ id: "ev_recon", experimentId: "recon", type: "url" }),
+    makeEvidence({ id: "ev_recon_null", experimentId: null, type: "url" }),
   ];
 
   it("keeps hypothesis-linked evidence that exists in the investigation", () => {
@@ -115,8 +119,32 @@ describe("resolveFindingEvidenceIds", () => {
     // for the investigation, excluding the recon-only URL evidence.
     expect(ids).toContain("ev_exp1_a");
     expect(ids).toContain("ev_exp1_b");
-    expect(ids).toContain("ev_exp2");
-    expect(ids).not.toContain("ev_recon");
+    expect(ids).not.toContain("ev_exp2"); // references exp_2, not in this investigation's experiment set
+    expect(ids).not.toContain("ev_recon"); // sentinel experimentId "recon"
+    expect(ids).not.toContain("ev_recon_null"); // no experimentId = recon
+  });
+
+  it("rejects recon-only evidence cited by a hypothesis — findings require behavioral proof", () => {
+    const hyp = makeHypothesis({ supportingEvidenceIds: ["ev_recon_null", "ev_recon", "ev_exp1_a"] });
+    const ids = resolveFindingEvidenceIds({ title: "T" }, {
+      investigationId: invId,
+      hypothesis: hyp,
+      experiments: [exp],
+      evidence,
+    });
+    // Only the experiment-generated citation survives the provenance gate.
+    expect(ids).toEqual(["ev_exp1_a"]);
+  });
+
+  it("rejects evidence whose experimentId does not reference a known experiment", () => {
+    const hyp = makeHypothesis({ supportingEvidenceIds: ["ev_recon"] });
+    const ids = resolveFindingEvidenceIds({ title: "T" }, {
+      investigationId: invId,
+      hypothesis: hyp,
+      experiments: [exp],
+      evidence,
+    });
+    expect(ids).toEqual([]);
   });
 
   it("resolves experiment evidence by explicit text cross-reference", () => {

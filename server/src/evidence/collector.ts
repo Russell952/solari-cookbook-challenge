@@ -161,10 +161,14 @@ export async function captureReplay(
 /**
  * Capture a URL visit as evidence. URL evidence has no artifact bytes;
  * the URL itself is the evidence and is stored as the `uri`.
+ *
+ * `experimentId` is optional: reconnaissance URLs (captured before any
+ * experiment exists) are recorded without one so provenance classification
+ * can distinguish recon evidence from experiment-generated evidence.
  */
 export async function captureUrlEvidence(
   investigationId: string,
-  experimentId: string,
+  experimentId: string | undefined,
   url: string,
   pageTitle?: string
 ): Promise<Evidence> {

@@ -125,12 +125,19 @@ async function me(req: Request, res: Response): Promise<void> {
   // relying on requireAuth having run.
   const userId = sessionUserId(req);
   if (!userId) {
+    // Expired/invalid/absent session: clear whatever cookie the browser sent
+    // (it may be a stale token the server can never accept again — e.g. one
+    // signed by a replaced secret). The next login/signup sets a fresh one;
+    // existing accounts are unaffected. Idempotent when no cookie was sent.
+    clearSessionCookie(res);
     res.status(401).json({ error: "Authentication required" });
     return;
   }
   const user = await getUserById(userId);
   if (!user) {
-    // Signed for a user that no longer exists on disk — treat as unauthenticated.
+    // Signed for a user that no longer exists on disk — treat as unauthenticated
+    // and clear the now-orphaned cookie.
+    clearSessionCookie(res);
     res.status(401).json({ error: "Authentication required" });
     return;
   }

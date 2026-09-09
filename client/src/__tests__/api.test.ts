@@ -31,11 +31,13 @@ const summaryFixture = {
     {
       id: "ev_1", investigationId: "inv_1", experimentId: "exp_1", observationId: null,
       type: "screenshot", uri: null, contentHash: "abc123", metadata: { artifactAvailable: true },
+      provenance: "experiment",
       createdAt: "2026-09-06T00:00:10.000Z",
     },
     {
       id: "ev_2", investigationId: "inv_1", experimentId: "exp_1", observationId: null,
       type: "url", uri: "https://example.com/login", contentHash: null, metadata: {},
+      provenance: "experiment",
       createdAt: "2026-09-06T00:00:11.000Z",
     },
   ],
@@ -58,10 +60,8 @@ const summaryFixture = {
     summary: "Executive summary text",
     confirmedFindings: [
       {
-        id: "fnd_1", investigationId: "inv_1", title: "Login renders as documented",
-        severity: "info", description: "d", status: "confirmed", confidence: 0.95,
-        rootCause: null, reproductionSteps: [], recommendation: null,
-        evidenceIds: ["ev_1"], createdAt: "2026-09-06T00:00:50.000Z", updatedAt: "2026-09-06T00:00:50.000Z",
+        id: "fnd_1", title: "Login renders as documented",
+        severity: "info", description: "d", recommendation: null,
       },
     ],
     rejectedHypotheses: [],
@@ -115,7 +115,8 @@ describe("client data flow: getSummary", () => {
     // Data the UI relies on is present and coherent
     expect(summary.investigation.status).toBe("completed");
     expect(summary.findingsCount).toBe(1);
-    expect(summary.report?.confirmedFindings[0].evidenceIds).toEqual(["ev_1"]);
+    expect(summary.findings[0].evidenceIds).toEqual(["ev_1"]);
+    expect(summary.report?.confirmedFindings[0].title).toBe("Login renders as documented");
     expect(summary.evidenceCount).toBe(summary.evidence.length);
     expect(summary.incomplete).toBe(false);
   });

@@ -190,6 +190,68 @@ describe("AuthScreen submissions (login / signup / logout)", () => {
   });
 });
 
+describe("session-expiry transition (regression: stranded on a 401 dead end)", () => {
+  it("a 401 from a protected API notifies the session-expiry listener (gate transitions to Sign In)", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ error: "Authentication required" }, 401));
+
+    const mod = await import("../api.js");
+    const expired = vi.fn();
+    const off = mod.onSessionExpired(expired);
+    try {
+      await mod.listInvestigations().catch(() => {}); // protected endpoint → 401
+      expect(expired).toHaveBeenCalledTimes(1);
+    } finally {
+      off();
+    }
+  });
+
+  it("an expired session on the summary endpoint also notifies the listener", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ error: "Authentication required" }, 401));
+
+    const mod = await import("../api.js");
+    const expired = vi.fn();
+    const off = mod.onSessionExpired(expired);
+    try {
+      await mod.getSummary("inv_1").catch(() => {});
+      expect(expired).toHaveBeenCalledTimes(1);
+    } finally {
+      off();
+    }
+  });
+
+  it("401s from the auth endpoints (login/signup) do NOT fire the expiry listener — they are form-level errors", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ error: "Invalid email or password" }, 401));
+
+    const mod = await import("../api.js");
+    const expired = vi.fn();
+    const off = mod.onSessionExpired(expired);
+    try {
+      await mod.login("ghost@example.com", "wrongpassword").catch(() => {});
+      expect(expired).not.toHaveBeenCalled();
+    } finally {
+      off();
+    }
+  });
+
+  it("unsubscribing stops the notifications", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ error: "Authentication required" }, 401));
+
+    const mod = await import("../api.js");
+    const expired = vi.fn();
+    const off = mod.onSessionExpired(expired);
+    off();
+    await mod.listInvestigations().catch(() => {});
+    expect(expired).not.toHaveBeenCalled();
+  });
+
+  it("App subscribes to the expiry listener (single auth state, no duplicate init)", async () => {
+    const fs = await import("fs");
+    const src = fs.readFileSync(new URL("../App.tsx", import.meta.url), "utf-8");
+    expect(src).toContain("onSessionExpired");
+    expect(src).toMatch(/setAuth\(\{ kind: "unauthenticated" \}\)/);
+  });
+});
+
 describe("cookie-session source guarantees", () => {
   it("the AuthScreen never handles token material", async () => {
     const fs = await import("fs");

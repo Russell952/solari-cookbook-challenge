@@ -8,6 +8,19 @@ import {
 import { InvestigationProgress, TerminalBanner } from "./InvestigationProgress";
 import { buildProgressModel } from "./progress";
 import { ArrowLeftIcon, CheckIcon } from "./icons";
+import type { EvidenceProvenance } from "./api";
+
+/**
+ * Provenance chip — how an evidence item was actually produced. Recon items
+ * are context (repository/recon captures with no experiment); experiment and
+ * verification items are behavioral observations, verification being the
+ * strongest (independent re-run that tested the hypothesis).
+ */
+function ProvenanceChip({ provenance }: { provenance?: EvidenceProvenance }) {
+  if (!provenance) return null;
+  const label = provenance === "verification" ? "Verification" : provenance === "experiment" ? "Experiment" : "Recon";
+  return <span className={`prov-chip prov-${provenance}`}>{label}</span>;
+}
 
 interface Props {
   investigationId: string;
@@ -90,17 +103,19 @@ export function InvestigationView({ investigationId, onBack }: Props) {
   const evidenceById = new Map(summary.evidence.map((e) => [e.id, e]));
   const experimentById = new Map(summary.experiments.map((e) => [e.id, e]));
   const reportFindings = summary.report?.confirmedFindings ?? [];
-  const reportFindingIds = new Set(reportFindings.map((f) => f.id));
+  const reportFindingIds = new Set(
+    reportFindings.map((f) => f.id).filter((id): id is string => id != null)
+  );
   const progressModel = buildProgressModel(summary);
 
   return (
     <div>
-      {/* Back + title */}
-      <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginBottom: "1rem" }}>
-        <button className="btn btn-secondary" onClick={onBack} style={{ padding: "0.4rem 0.75rem" }}>
+      {/* Back + title — wraps on narrow screens instead of overflowing */}
+      <div className="view-header">
+        <button className="btn btn-secondary" onClick={onBack} style={{ padding: "0.4rem 0.75rem", flexShrink: 0 }}>
           <ArrowLeftIcon aria-hidden="true" /> Back
         </button>
-        <div style={{ minWidth: 0 }}>
+        <div style={{ minWidth: 0, flex: 1 }}>
           <h2 style={{ fontSize: "1.1rem", fontWeight: 600 }}>Investigation</h2>
           <p style={{ fontSize: "0.8rem", color: "var(--text-muted)", margin: 0 }}>
             {inv.objective}
@@ -111,7 +126,7 @@ export function InvestigationView({ investigationId, onBack }: Props) {
             </p>
           )}
         </div>
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "0.75rem" }}>
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "0.75rem", flexShrink: 0 }}>
           <span className={`status-${inv.status}`} style={{ fontWeight: 500 }}>
             {statusLabel(inv.status as Parameters<typeof statusLabel>[0])}
           </span>
@@ -219,7 +234,7 @@ function FindingsSection({
             </div>
           )}
 
-          {/* Evidence provenance: finding -> evidence -> experiment */}
+          {/* Evidence provenance: finding -> evidence -> producing run */}
           <div style={{ marginTop: "0.75rem", borderTop: "1px solid var(--border)", paddingTop: "0.75rem" }}>
             <p style={{ fontSize: "0.7rem", color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em", margin: "0 0 0.5rem 0" }}>
               Supporting evidence
@@ -246,7 +261,8 @@ function FindingsSection({
                 return (
                   <div key={evId} className="evidence-item">
                     <span className="evidence-type">{ev.type}</span>
-                    <span style={{ flex: 1, fontSize: "0.8rem", color: "var(--text-secondary)" }}>
+                    <ProvenanceChip provenance={ev.provenance} />
+                    <span style={{ flex: 1, minWidth: 0, fontSize: "0.8rem", color: "var(--text-secondary)" }}>
                       {exp ? (
                         <>Experiment #{exp.sequence}: {exp.objective}</>
                       ) : (
@@ -421,12 +437,21 @@ function EvidenceSection({
   evidence: InvestigationSummary["evidence"];
   onInspect: (ev: Evidence) => void;
 }) {
+  // Truthful provenance breakdown from the backend's classification — total
+  // plus how many are recon captures vs experiment runs vs verification runs.
+  const reconCount = evidence.filter((ev) => ev.provenance === "recon").length;
+  const experimentCount = evidence.filter((ev) => ev.provenance === "experiment").length;
+  const verificationCount = evidence.filter((ev) => ev.provenance === "verification").length;
+
   return (
     <div className="card">
       <div className="card-header">
         <h2>Evidence</h2>
         <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
-          {evidence.length}
+          {evidence.length} total
+          {reconCount + experimentCount + verificationCount > 0 && (
+            <> · {reconCount} recon · {experimentCount} experiment · {verificationCount} verification</>
+          )}
         </span>
       </div>
       {evidence.length === 0 ? (
@@ -437,7 +462,8 @@ function EvidenceSection({
           return (
             <div key={ev.id} className="evidence-item">
               <span className="evidence-type">{ev.type}</span>
-              <span style={{ flex: 1, fontSize: "0.8rem", color: "var(--text-secondary)" }}>
+              <ProvenanceChip provenance={ev.provenance} />
+              <span style={{ flex: 1, minWidth: 0, fontSize: "0.8rem", color: "var(--text-secondary)" }}>
                 {ev.uri || (ev.metadata?.pageTitle as string | undefined) || ev.id.slice(0, 12)}
               </span>
               {unavailable && (
@@ -517,7 +543,7 @@ function EvidenceViewer({ evidence, onClose }: { evidence: Evidence; onClose: ()
     >
       <div
         className="card"
-        style={{ maxWidth: "min(900px, 92vw)", maxHeight: "85vh", overflowY: "auto", width: "100%" }}
+        style={{ maxWidth: "min(900px, 94vw)", maxHeight: "85vh", overflowY: "auto", width: "100%" }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="card-header">

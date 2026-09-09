@@ -18,6 +18,27 @@ function ownerIdOf(req: Request): string {
   return (req as Request & { ownerId?: string }).ownerId ?? "";
 }
 
+/**
+ * Provenance class of an evidence item — how it was actually produced:
+ *  - "recon":       reconnaissance capture (no experimentId — repository
+ *                   source, recon screenshot/URL). Legitimate context
+ *                   evidence, but NOT behavioral proof.
+ *  - "verification": produced by an experiment that tested a hypothesis
+ *                   (verification experiments carry a hypothesisId).
+ *  - "experiment":  produced by a normal experiment.
+ */
+type EvidenceProvenance = "recon" | "experiment" | "verification";
+
+function evidenceProvenance(
+  ev: { experimentId: string | null },
+  experimentsById: Map<string, { hypothesisId: string | null }>
+): EvidenceProvenance {
+  if (ev.experimentId === null) return "recon";
+  const exp = experimentsById.get(ev.experimentId);
+  if (!exp) return "recon"; // sentinel/unknown ids — treat as recon, not proof
+  return exp.hypothesisId ? "verification" : "experiment";
+}
+
 interface SummaryResponse {
   investigation: {
     id: string;
@@ -54,6 +75,8 @@ interface SummaryResponse {
     observationId: string | null;
     uri: string | null;
     contentHash: string | null;
+    /** How the evidence was produced: recon | experiment | verification. */
+    provenance: EvidenceProvenance;
     createdAt: string;
   }>;
   evidenceCount: number;
@@ -61,8 +84,14 @@ interface SummaryResponse {
     id: string;
     title: string;
     severity: string;
+    description: string;
     status: string;
     confidence: number;
+    rootCause: string | null;
+    recommendation: string | null;
+    reproductionSteps: string[];
+    evidenceIds: string[];
+    createdAt: string;
   }>;
   findingsCount: number;
   hypotheses: Array<{
@@ -76,7 +105,13 @@ interface SummaryResponse {
   report: {
     id: string;
     summary: string;
-    confirmedFindings: Array<{ id: string; title: string; severity: string }>;
+    confirmedFindings: Array<{
+      id: string;
+      title: string;
+      severity: string;
+      description: string;
+      recommendation: string | null;
+    }>;
     rejectedHypotheses: string[];
     inconclusiveHypotheses: string[];
     totalExperiments: number;
@@ -127,6 +162,12 @@ summaryRouter.get("/", (req: Request, res: Response) => {
   const report = store.getReport(id);
   const budgetData = getBudget(id);
 
+  const experimentsById = new Map(
+    experiments.map((e) => [e.id, { hypothesisId: e.hypothesisId }])
+  );
+  const provenanceOf = (ev: { experimentId: string | null }): EvidenceProvenance =>
+    evidenceProvenance(ev, experimentsById);
+
   const experimentCounts = {
     total: experiments.length,
     completed: experiments.filter((e) => e.status === "completed").length,
@@ -164,6 +205,8 @@ summaryRouter.get("/", (req: Request, res: Response) => {
           id: f.id,
           title: f.title,
           severity: f.severity,
+          description: f.description,
+          recommendation: f.recommendation,
         })),
         rejectedHypotheses: report.rejectedHypotheses,
         inconclusiveHypotheses: report.inconclusiveHypotheses,
@@ -207,6 +250,7 @@ summaryRouter.get("/", (req: Request, res: Response) => {
       observationId: e.observationId,
       uri: e.uri,
       contentHash: e.contentHash,
+      provenance: provenanceOf(e),
       createdAt: e.createdAt,
     })),
     evidenceCount: evidence.length,
@@ -214,9 +258,14 @@ summaryRouter.get("/", (req: Request, res: Response) => {
       id: f.id,
       title: f.title,
       severity: f.severity,
+      description: f.description,
       status: f.status,
       confidence: f.confidence,
+      rootCause: f.rootCause,
+      recommendation: f.recommendation,
+      reproductionSteps: f.reproductionSteps,
       evidenceIds: f.evidenceIds,
+      createdAt: f.createdAt,
     })),
     findingsCount: findings.length,
     hypotheses: hypotheses.map((h) => ({

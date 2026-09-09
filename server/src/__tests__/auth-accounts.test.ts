@@ -292,6 +292,47 @@ describe("session cookie security", () => {
     const sig = createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
     const res = await fetch(`${baseUrl}/api/auth/me`, { headers: { Cookie: `probe_session=v1.${payload}.${sig}` } });
     expect(res.status).toBe(401);
+    // Expired session: the stale cookie is actively cleared so the browser's
+    // jar is clean, and the Sign In screen can take over (client maps this
+    // 401 to unauthenticated).
+    const clear = res.headers.get("set-cookie") ?? "";
+    expect(clear).toContain("Max-Age=0");
+  });
+
+  it("an expired session does NOT lock the account out — the same account can log in again", async () => {
+    // 1. Account exists with a valid (now-expired) session cookie.
+    const email = "relogin@example.com";
+    await post(`${baseUrl}/api/auth/signup`, { email, password: "longenough1" });
+    const expired = `probe_session=v1.${Buffer.from(
+      JSON.stringify({ sub: "usr_expired_nonexistent_placeholder", iat: 1, exp: 1 })
+    ).toString("base64url")}.AAAA`; // invalid/expired — rejected
+
+    // 2. Expired/stale cookie → /me 401 + stale cookie cleared...
+    const meAfterExpiry = await fetch(`${baseUrl}/api/auth/me`, { headers: { Cookie: expired } });
+    expect(meAfterExpiry.status).toBe(401);
+    expect(meAfterExpiry.headers.get("set-cookie") ?? "").toContain("Max-Age=0");
+
+    // 3. ...and login with the SAME credentials succeeds (no recreation needed).
+    const relogin = await post(`${baseUrl}/api/auth/login`, { email, password: "longenough1" });
+    expect(relogin.status).toBe(200);
+    const freshCookie = sessionCookieOf(relogin);
+    expect(freshCookie).toContain("probe_session=");
+
+    // 4. The fresh session is fully authenticated again.
+    const me = await fetch(`${baseUrl}/api/auth/me`, { headers: { Cookie: freshCookie } });
+    expect(me.status).toBe(200);
+  });
+
+  it("session TTL defaults to 30 days (720h) and is reflected in the cookie Max-Age", async () => {
+    const res = await post(`${baseUrl}/api/auth/signup`, {
+      email: "ttl@example.com",
+      password: "longenough1",
+    });
+    const setCookie = res.headers.get("set-cookie") ?? "";
+    const maxAge = parseInt(/Max-Age=(\d+)/.exec(setCookie)?.[1] ?? "0", 10);
+    // 720h in seconds, with a small skew tolerance for the floor operation.
+    expect(maxAge).toBeGreaterThanOrEqual(720 * 3600 - 5);
+    expect(maxAge).toBeLessThanOrEqual(720 * 3600);
   });
 
   it("missing cookie → 401 on /me and on protected APIs", async () => {

@@ -30,8 +30,8 @@ export const config = {
    * Never shared with the client and never the API token.
    */
   sessionSecret: resolveSessionSecret(),
-  /** Session lifetime in hours (finite expiration; default 7 days). */
-  sessionTtlHours: parseInt(process.env.PROBE_SESSION_TTL_HOURS || "168", 10),
+  /** Session lifetime in hours (finite expiration; default 30 days). */
+  sessionTtlHours: parseInt(process.env.PROBE_SESSION_TTL_HOURS || "720", 10),
 
   // ── Security hardening (P0 pre-hosting) ──────────────────────────────────
   /**

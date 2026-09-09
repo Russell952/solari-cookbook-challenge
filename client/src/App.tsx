@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { NewInvestigation } from "./NewInvestigation";
 import { InvestigationView } from "./InvestigationView";
 import { AuthScreen, authStateFromProbe, authStateFromError, type AuthState } from "./AuthGate";
-import { getSessionUser, logout, healthUrl, listInvestigations, type Investigation, type SessionUser, phaseLabel } from "./api";
+import { getSessionUser, logout, healthUrl, listInvestigations, onSessionExpired, type Investigation, type SessionUser, phaseLabel } from "./api";
 import { SearchIcon } from "./icons";
 
 type Route =
@@ -57,6 +57,16 @@ export function App() {
   useEffect(() => {
     void refreshUser();
   }, [refreshUser]);
+
+  // Session expiry can surface on ANY protected API call, not just /me
+  // (e.g. the home list failing after the cookie expired). api.ts notifies
+  // this single listener and the gate transitions to the Sign In screen —
+  // one auth state, no duplicate initialization. Idempotent: a 401 storm
+  // from several in-flight requests calls the setter repeatedly with the
+  // same value. Sign Out disappears with the authenticated state.
+  useEffect(() => {
+    return onSessionExpired(() => setAuth({ kind: "unauthenticated" }));
+  }, []);
 
   const navigate = (path: string) => {
     window.location.hash = path;

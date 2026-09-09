@@ -134,6 +134,38 @@ describe("progress stages: phase mapping", () => {
       expect(stage.label.toLowerCase()).not.toMatch(/\bplan\b/);
     }
   });
+
+  it("maps CREATED (pre-recon) to the first stage so the stepper never has an empty current", () => {
+    const model = buildProgressModel(makeSummary({ phase: "created" }));
+    expect(model.stageLabel).toBe("Understanding the target");
+    expect(model.stages.find((s) => s.phase === "recon")?.state).toBe("current");
+  });
+
+  it("maps the outcome phases (confirmed/rejected/inconclusive) to the report stage", () => {
+    // The backend state machine really passes through these phases between
+    // verification and report — the stepper must not lose its current stage.
+    for (const phase of ["confirmed", "rejected", "inconclusive"] as const) {
+      const model = buildProgressModel(makeSummary({ phase }));
+      expect(model.stageLabel).toBe("Preparing report");
+      expect(model.stages.find((s) => s.phase === "report")?.state).toBe("current");
+      expect(model.stages.find((s) => s.phase === "verification")?.state).toBe("completed");
+      expect(model.stages.some((s) => s.state === "current" || s.state === "completed")).toBe(true);
+    }
+  });
+
+  it("every real backend phase resolves to a stepper stage (no unmapped phase)", () => {
+    // Mirrors shared/src/states.ts PHASE_SEQUENCE + transition targets.
+    const allPhases = [
+      "created", "recon", "plan", "experiment", "execute", "observe",
+      "analyze", "hypothesis", "verification", "confirmed", "rejected",
+      "inconclusive", "report", "complete",
+    ] as const;
+    for (const phase of allPhases) {
+      const states = stageStates("running", phase);
+      const withCurrent = states.filter((s) => s.state === "current");
+      expect(withCurrent, `phase ${phase} must have exactly one current stage`).toHaveLength(1);
+    }
+  });
 });
 
 describe("progress metrics: real data only", () => {
@@ -335,5 +367,32 @@ describe("hypothesis outcomes: honest semantics", () => {
   it("makes no unverified claims in report context", () => {
     const model = buildProgressModel(makeSummary({ phase: "report" }));
     expect(model.reportContext).toEqual(["Experiments complete"]);
+  });
+});
+
+describe("evidence provenance (backend-reported)", () => {
+  it("breaks evidence down by type using the real types present", () => {
+    const model = buildProgressModel(
+      makeSummary({
+        phase: "observe",
+        evidence: [
+          { type: "repository_source" },
+          { type: "screenshot" }, { type: "url" },
+        ],
+      })
+    );
+    const types = model.evidenceBreakdown.map((e) => e.type);
+    expect(types).toContain("repository_source");
+    expect(types).toContain("screenshot");
+    expect(types).toContain("url");
+  });
+
+  it("derives counters only from summary fields the backend actually sends", () => {
+    // Guard against the UI inventing counts: the model reads experimentCounts,
+    // evidenceCount, findingsCount — none synthesized.
+    const model = buildProgressModel(makeSummary({ phase: "execute", findingsCount: 0 }));
+    const byLabel = Object.fromEntries(model.metrics.map((m) => [m.label, m.value]));
+    expect(byLabel["Findings"]).toBe("0");
+    expect(byLabel["Evidence"]).toBe("0");
   });
 });

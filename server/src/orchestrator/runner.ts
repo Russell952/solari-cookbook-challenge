@@ -34,6 +34,7 @@ import {
   captureActionTrace,
   captureRepositoryEvidence,
   captureReplay,
+  captureEvidence,
 } from "../evidence/index.js";
 import * as budget from "./budget.js";
 import { emit } from "../api/events.js";
@@ -143,13 +144,17 @@ async function runRecon(investigation: Investigation): Promise<Investigation> {
     );
   }
   if (appRecon) {
-    await captureScreenshot(
-      investigation.id,
-      "recon",
-      Buffer.from(appRecon.screenshot, "base64"),
-      { type: "application_recon" }
-    );
-    await captureUrlEvidence(investigation.id, "recon", appRecon.initialUrl, appRecon.pageTitle);
+    // Recon evidence carries NO experimentId: it is reconnaissance, not
+    // experiment-generated proof. A "recon" sentinel id would masquerade as
+    // an experiment reference and let recon artifacts pass finding-evidence
+    // provenance checks as behavioral evidence.
+    await captureEvidence({
+      investigationId: investigation.id,
+      type: "screenshot",
+      content: Buffer.from(appRecon.screenshot, "base64"),
+      metadata: { type: "application_recon", phase: "recon", format: "png" },
+    });
+    await captureUrlEvidence(investigation.id, undefined, appRecon.initialUrl, appRecon.pageTitle);
   }
 
   // Store recon results for later phases

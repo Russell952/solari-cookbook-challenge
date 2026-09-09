@@ -31,6 +31,18 @@ export function resolveFindingEvidenceIds(
     evidence: Evidence[];
   }
 ): string[] {
+  // Provenance gate: only experiment-generated evidence may support a
+  // finding. Recon artifacts (repository_source, recon screenshots/URLs)
+  // carry no experimentId — they describe the target, they are not observed
+  // behavior. Verified evidence: experimentId must reference an experiment
+  // that actually exists in this investigation (the "recon" sentinel id used
+  // historically does not, and null means recon by definition).
+  const experimentIds = new Set(ctx.experiments.map((e) => e.id));
+  const isExperimentEvidence = (e: Evidence): boolean =>
+    e.investigationId === ctx.investigationId &&
+    e.experimentId !== null &&
+    experimentIds.has(e.experimentId);
+
   const inInvestigation = new Set(
     ctx.evidence.filter((e) => e.investigationId === ctx.investigationId).map((e) => e.id)
   );
@@ -47,8 +59,10 @@ export function resolveFindingEvidenceIds(
     );
   }
 
-  // 2. Evidence the hypothesis itself cites (validated below against the
-  //    investigation's evidence set).
+  // 2. Evidence the hypothesis itself cites — accepted only when it is
+  //    experiment-generated (see the provenance gate above). Recon evidence
+  //    may inform analysis, but a finding's behavioral proof must come from
+  //    an experiment that observed the application.
   if (ctx.hypothesis) {
     candidates.push(...ctx.hypothesis.supportingEvidenceIds, ...ctx.hypothesis.contradictingEvidenceIds);
   }
@@ -67,17 +81,17 @@ export function resolveFindingEvidenceIds(
   // Fall back to the experiment-generated evidence set for this investigation.
   if (candidates.length === 0) {
     candidates.push(
-      ...ctx.evidence
-        .filter((e) => e.experimentId !== null && e.investigationId === ctx.investigationId)
-        .map((e) => e.id)
+      ...ctx.evidence.filter((e) => isExperimentEvidence(e)).map((e) => e.id)
     );
   }
 
-  // Validate: exists, belongs to this investigation, dedupe, keep order.
+  // Validate: exists, belongs to this investigation, is experiment-generated
+  // (provenance gate — applies to every path, including hypothesis citations),
+  // dedupe, keep order.
   const validated: string[] = [];
   for (const id of candidates) {
-    if (!inInvestigation.has(id)) continue;
-    if (!byId.has(id)) continue;
+    const ev = byId.get(id);
+    if (!ev || !inInvestigation.has(id) || !isExperimentEvidence(ev)) continue;
     if (!validated.includes(id)) validated.push(id);
   }
   return validated;

@@ -40,6 +40,12 @@ export interface ProgressStage {
 /**
  * The ordered investigation lifecycle. `experiment` and `execute` are distinct
  * backend phases (designing vs. running), as are `observe`/`analyze`/`hypothesis`.
+ *
+ * `created` (pre-recon) and the post-verification outcome phases
+ * (`confirmed`/`rejected`/`inconclusive` — real backend phases the state
+ * machine passes through on the way to `report`) map onto their neighboring
+ * presentation stage via PHASE_TO_STAGE below, so the stepper always has a
+ * current stage no matter which backend phase is live.
  */
 export const PROGRESS_STAGES: ProgressStage[] = [
   { phase: "recon", label: "Understanding the target" },
@@ -53,6 +59,33 @@ export const PROGRESS_STAGES: ProgressStage[] = [
   { phase: "report", label: "Preparing report" },
   { phase: "complete", label: "Investigation complete" },
 ];
+
+/**
+ * Backend phases that are not stepper rows of their own, mapped to the row
+ * that represents them. Everything not listed maps to itself. Source:
+ * shared/src/states.ts VALID_PHASE_TRANSITIONS — kept in sync by test.
+ */
+const PHASE_TO_STAGE: Record<InvestigationPhase, ProgressStage["phase"]> = {
+  created: "recon",          // pre-recon: nothing collected yet
+  recon: "recon",
+  plan: "plan",
+  experiment: "experiment",
+  execute: "execute",
+  observe: "observe",
+  analyze: "analyze",
+  hypothesis: "hypothesis",
+  verification: "verification",
+  confirmed: "report",       // outcome phases sit between verification and report
+  rejected: "report",
+  inconclusive: "report",
+  report: "report",
+  complete: "complete",
+};
+
+/** The stepper row a backend phase is presented by. */
+export function stagePhaseFor(phase: InvestigationPhase): ProgressStage["phase"] {
+  return PHASE_TO_STAGE[phase] ?? phase;
+}
 
 export type StageState = "completed" | "current" | "pending" | "failed" | "cancelled";
 
@@ -74,7 +107,7 @@ export function stageStates(
   status: InvestigationStatus,
   currentPhase: InvestigationPhase
 ): StageViewState[] {
-  const currentIdx = PROGRESS_STAGES.findIndex((s) => s.phase === currentPhase);
+  const currentIdx = PROGRESS_STAGES.findIndex((s) => s.phase === stagePhaseFor(currentPhase));
   return PROGRESS_STAGES.map((stage, i) => {
     let state: StageState;
     if (status === "completed") {

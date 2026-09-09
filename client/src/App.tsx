@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { NewInvestigation } from "./NewInvestigation";
 import { InvestigationView } from "./InvestigationView";
 import { healthUrl, listInvestigations, type Investigation, phaseLabel } from "./api";
+import { SearchIcon } from "./icons";
 
 type Route =
   | { page: "home" }
@@ -82,27 +83,6 @@ export function App() {
         )}
       </main>
     </div>
-  );
-}
-
-/** Inline SVG search icon — brand mark for the app header. */
-function SearchIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      className={className}
-      width="18"
-      height="18"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      style={{ flexShrink: 0 }}
-    >
-      <circle cx="11" cy="11" r="8" />
-      <path d="m21 21-4.35-4.35" />
-    </svg>
   );
 }
 

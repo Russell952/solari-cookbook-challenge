@@ -22,6 +22,9 @@ const UI_SOURCE_FILES = [
   "src/NewInvestigation.tsx",
   "src/api.ts",
   "src/main.tsx",
+  "src/progress.ts",
+  "src/InvestigationProgress.tsx",
+  "src/icons.tsx",
   "index.html",
 ];
 
@@ -42,9 +45,12 @@ describe("UI hygiene: no emoji used as interface icons", () => {
   it("renders icons as inline SVG components, not text glyphs", async () => {
     const appSource = readFileSync(join(clientRoot, "src/App.tsx"), "utf8");
     const viewSource = readFileSync(join(clientRoot, "src/InvestigationView.tsx"), "utf8");
-    expect(appSource).toContain("function SearchIcon");
-    expect(viewSource).toContain("function ArrowLeftIcon");
-    expect(viewSource).toContain("function CheckIcon");
+    const iconsSource = readFileSync(join(clientRoot, "src/icons.tsx"), "utf8");
+    expect(appSource).toContain('from "./icons"');
+    expect(viewSource).toContain('from "./icons"');
+    expect(iconsSource).toContain("export function SearchIcon");
+    expect(iconsSource).toContain("export function ArrowLeftIcon");
+    expect(iconsSource).toContain("export function CheckIcon");
   });
 });
 

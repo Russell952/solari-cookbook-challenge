@@ -1,11 +1,13 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   getSummary, subscribeToEvents, cancelInvestigation,
   evidenceContentUrl, fetchEvidence,
   type InvestigationSummary, type Finding, type Evidence,
-  type SSEEvent, type InvestigationPhase, type ExperimentFailure,
-  PHASE_ORDER, phaseIndex, phaseLabel, statusLabel,
+  type SSEEvent, type ExperimentFailure, statusLabel,
 } from "./api";
+import { InvestigationProgress, TerminalBanner } from "./InvestigationProgress";
+import { buildProgressModel } from "./progress";
+import { ArrowLeftIcon, CheckIcon } from "./icons";
 
 interface Props {
   investigationId: string;
@@ -18,7 +20,6 @@ export function InvestigationView({ investigationId, onBack }: Props) {
   const [events, setEvents] = useState<SSEEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [viewingEvidence, setViewingEvidence] = useState<Evidence | null>(null);
-  const eventsEndRef = useRef<HTMLDivElement>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -63,11 +64,6 @@ export function InvestigationView({ investigationId, onBack }: Props) {
     return unsub;
   }, [investigationId, refresh]);
 
-  // Auto-scroll events
-  useEffect(() => {
-    eventsEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [events]);
-
   if (loading) {
     return (
       <div className="card">
@@ -91,11 +87,11 @@ export function InvestigationView({ investigationId, onBack }: Props) {
 
   const inv = summary.investigation;
   const isTerminal = inv.status === "completed" || inv.status === "failed" || inv.status === "cancelled";
-  const currentIdx = phaseIndex(inv.currentPhase as InvestigationPhase);
   const evidenceById = new Map(summary.evidence.map((e) => [e.id, e]));
   const experimentById = new Map(summary.experiments.map((e) => [e.id, e]));
   const reportFindings = summary.report?.confirmedFindings ?? [];
   const reportFindingIds = new Set(reportFindings.map((f) => f.id));
+  const progressModel = buildProgressModel(summary);
 
   return (
     <div>
@@ -131,100 +127,9 @@ export function InvestigationView({ investigationId, onBack }: Props) {
         </div>
       </div>
 
-      {/* Terminal-state banner — explicit, never inferred from HTTP 200 */}
-      {inv.status === "cancelled" && (
-        <div className="card" style={{ borderLeft: "4px solid var(--text-muted)" }}>
-          <h3 style={{ margin: "0 0 0.25rem 0" }}>Investigation cancelled</h3>
-          <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)", margin: 0 }}>
-            This investigation was cancelled before completion. Partial data below is
-            <strong> not a confirmed result</strong> — no report exists.
-          </p>
-        </div>
-      )}
-      {inv.status === "failed" && (
-        <div className="card" style={{ borderLeft: "4px solid var(--danger)" }}>
-          <h3 style={{ margin: "0 0 0.25rem 0", color: "var(--danger)" }}>Investigation failed</h3>
-          <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)", margin: 0 }}>
-            The investigation ended with an error before a report could be produced.
-            {summary.probeFailures.length > 0 && " See Probe/execution failures below."}
-          </p>
-        </div>
-      )}
-      {summary.incomplete && inv.status !== "failed" && inv.status !== "cancelled" && (
-        <div className="card" style={{ borderLeft: "4px solid var(--warning)" }}>
-          <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)", margin: 0 }}>
-            Investigation is in progress — data below is partial and may change.
-          </p>
-        </div>
-      )}
-
-      {/* Phase timeline */}
-      <div className="card" style={{ padding: "1rem 1.5rem" }}>
-        <div className="timeline">
-          {PHASE_ORDER.map((phase, i) => (
-            <div
-              key={phase}
-              className={`timeline-step ${
-                inv.status === "failed"
-                  ? i < currentIdx ? "completed" : "failed"
-                  : i < currentIdx ? "completed"
-                  : i === currentIdx ? "active"
-                  : "pending"
-              }`}
-              title={phaseLabel(phase)}
-            />
-          ))}
-        </div>
-        <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.7rem", color: "var(--text-muted)", marginTop: "0.25rem" }}>
-          <span>{phaseLabel(inv.currentPhase as InvestigationPhase)}</span>
-          <span>
-            {summary.runtime?.durationMs != null
-              ? `Runtime ${formatDuration(summary.runtime.durationMs)}`
-              : summary.budget
-                ? `Budget: ${summary.budget.usedExperiments}/${summary.budget.maxExperiments} experiments · ${summary.budget.usedBrowserActions}/${summary.budget.maxBrowserActions} browser · ${summary.budget.usedAiCalls}/${summary.budget.maxAiCalls} AI`
-                : ""}
-          </span>
-        </div>
-      </div>
-
-      {/* At-a-glance counts */}
-      <div className="two-col">
-        <div className="card" style={{ padding: "0.75rem 1.5rem" }}>
-          <div style={{ display: "flex", gap: "1.5rem", fontSize: "0.85rem" }}>
-            <Metric label="Experiments" value={`${summary.experimentCounts.completed}/${summary.experimentCounts.total}`} />
-            <Metric label="Evidence" value={String(summary.evidenceCount)} />
-            <Metric label="Hypotheses" value={`${summary.hypotheses.filter((h) => h.status === "confirmed").length} confirmed`} />
-            <Metric label="Findings" value={String(summary.findingsCount)} />
-            <Metric label="Report" value={summary.report ? "Available" : isTerminal ? "None" : "Pending"} />
-          </div>
-        </div>
-      </div>
-
-      {/* Live progress log */}
-      {events.length > 0 && (
-        <div className="card">
-          <div className="card-header">
-            <h2>Live Progress</h2>
-            <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
-              {events.length} events
-            </span>
-          </div>
-          <div style={{ maxHeight: 220, overflowY: "auto", fontSize: "0.8rem", fontFamily: "monospace" }}>
-            {events.map((evt, i) => (
-              <div key={i} style={{ padding: "0.25rem 0", borderBottom: "1px solid var(--border)", color: "var(--text-secondary)" }}>
-                <span style={{ color: "var(--text-muted)", marginRight: "0.5rem" }}>
-                  {new Date(evt.timestamp).toLocaleTimeString()}
-                </span>
-                <span style={{ fontWeight: 500 }}>{formatEventType(evt.type)}</span>
-                {evt.data.phase != null && <span style={{ color: "var(--info)" }}>&rarr; {String(evt.data.phase)}</span>}
-                {evt.data.experimentId != null && <span> #{String(evt.data.experimentId).slice(0, 8)}</span>}
-                {evt.data.error != null && <span style={{ color: "var(--danger)" }}> Error: {String(evt.data.error)}</span>}
-              </div>
-            ))}
-            <div ref={eventsEndRef} />
-          </div>
-        </div>
-      )}
+      {/* Live progress experience — real phases, counters, and events */}
+      <TerminalBanner model={progressModel} />
+      <InvestigationProgress summary={summary} events={events} />
 
       {/* Findings — with evidence provenance */}
       <FindingsSection
@@ -743,81 +648,5 @@ function ReplayPreview({ url, authenticated }: { url: string; authenticated?: bo
         {preview}
       </pre>
     </div>
-  );
-}
-
-function Metric({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <div style={{ fontSize: "1rem", fontWeight: 600, color: "var(--text-primary)" }}>{value}</div>
-      <div style={{ fontSize: "0.7rem", color: "var(--text-muted)" }}>{label}</div>
-    </div>
-  );
-}
-
-function formatDuration(ms: number): string {
-  const s = Math.round(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  return `${m}m ${s % 60}s`;
-}
-
-function formatEventType(type: string): string {
-  const labels: Record<string, string> = {
-    connected: "Connected",
-    phase_change: "Phase",
-    experiment_started: "Experiment started",
-    experiment_completed: "Experiment done",
-    action_started: "Action",
-    action_completed: "Action done",
-    observation_recorded: "Observation",
-    hypothesis_proposed: "Hypothesis",
-    hypothesis_updated: "Hypothesis updated",
-    finding_created: "Finding",
-    error: "Error",
-    complete: "Complete",
-  };
-  return labels[type] || type;
-}
-
-/**
- * Inline SVG icon primitives — no icon library dependency added.
- */
-function ArrowLeftIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      className={className}
-      width="14"
-      height="14"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      style={{ display: "inline-block", verticalAlign: "-2px" }}
-    >
-      <path d="m12 19-7-7 7-7" />
-      <path d="M19 12H5" />
-    </svg>
-  );
-}
-
-function CheckIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      className={className}
-      width="12"
-      height="12"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2.5"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      style={{ display: "inline-block", verticalAlign: "-1px" }}
-    >
-      <path d="M20 6 9 17l-5-5" />
-    </svg>
   );
 }

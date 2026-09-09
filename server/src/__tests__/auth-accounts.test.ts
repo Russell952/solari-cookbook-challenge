@@ -103,7 +103,9 @@ describe("POST /api/auth/signup", () => {
     expect(body.user.createdAt).toBeTruthy();
     expect(JSON.stringify(body)).not.toMatch(/password|hash|secret/i);
 
-    // Session cookie: HttpOnly, SameSite=Lax, Path=/, finite Max-Age.
+    // Session cookie: HttpOnly, Path=/, finite Max-Age. SameSite follows the
+    // environment: Lax in test (NODE_ENV=test, same-site localhost), None in
+    // production (cross-site Vercel → Render) — asserted in its own test below.
     const setCookie = res.headers.get("set-cookie") ?? "";
     expect(setCookie).toContain("HttpOnly");
     expect(setCookie).toContain("SameSite=Lax");
@@ -197,6 +199,52 @@ describe("POST /api/auth/login", () => {
     await post(`${baseUrl}/api/auth/signup`, { email: "caps@example.com", password: "longenough1" });
     const res = await post(`${baseUrl}/api/auth/login`, { email: "  CAPS@Example.COM ", password: "longenough1" });
     expect(res.status).toBe(200);
+  });
+
+  it("is publicly reachable: no Origin, no credentials → 200, never the auth-gate 401", async () => {
+    // Guards against /api/auth/* being accidentally mounted behind requireAuth.
+    await post(`${baseUrl}/api/auth/signup`, { email: "public@example.com", password: "longenough1" });
+    const res = await post(`${baseUrl}/api/auth/login`, { email: "public@example.com", password: "longenough1" });
+    expect(res.status).toBe(200); // requireAuth would answer 401 with shape {error:"Authentication required"}
+    expect(((await res.json()) as { error?: string }).error).not.toBe("Authentication required");
+  });
+
+  it("sets the session cookie on login (Set-Cookie present, HttpOnly)", async () => {
+    await post(`${baseUrl}/api/auth/signup`, { email: "cookie@example.com", password: "longenough1" });
+    const res = await post(`${baseUrl}/api/auth/login`, { email: "cookie@example.com", password: "longenough1" });
+    const setCookie = res.headers.get("set-cookie") ?? "";
+    expect(setCookie).toContain("probe_session=");
+    expect(setCookie).toContain("HttpOnly");
+  });
+});
+
+// ── Production cookie attributes (SameSite=None; Secure) ───────────────────
+
+describe("session cookie SameSite policy", () => {
+  it("selects SameSite=None in production and SameSite=Lax otherwise", async () => {
+    const { sameSiteForEnvironment } = await import("../auth/session.js");
+    expect(sameSiteForEnvironment(true)).toBe("none"); // cross-site Vercel → Render
+    expect(sameSiteForEnvironment(false)).toBe("lax"); // dev: localhost is same-site
+  });
+
+  it("clearing matches the establishing attributes so logout sticks", async () => {
+    const { setSessionCookie, clearSessionCookie } = await import("../auth/session.js");
+    const setHeader = vi.fn();
+    const res = {
+      getHeader: vi.fn().mockReturnValue(undefined),
+      setHeader,
+    } as unknown as Parameters<typeof setSessionCookie>[0];
+    setSessionCookie(res, "v1.abc.def");
+    clearSessionCookie(res);
+    // setSessionCookie appends to Set-Cookie as an array of strings.
+    const flat = (v: unknown): string => (Array.isArray(v) ? v.join("; ") : String(v));
+    const establish = flat(setHeader.mock.calls[0][1]);
+    const clear = flat(setHeader.mock.calls[1][1]);
+    const sameSiteOf = (h: string) => /SameSite=(\w+)/.exec(h)?.[1];
+    expect(sameSiteOf(clear)).toBe(sameSiteOf(establish));
+    expect(clear).toContain("Max-Age=0");
+    // Secure must match too — browsers treat attributes as part of cookie identity.
+    expect(clear.includes("Secure")).toBe(establish.includes("Secure"));
   });
 });
 

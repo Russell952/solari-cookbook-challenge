@@ -6,13 +6,15 @@
  * Format: `v1.<base64url(payload)>.<base64url(hmac-sha256(payload))>`
  *
  * Cookie contract (set with matching attributes on login/signup and logout):
- *   HttpOnly | Secure in production | SameSite=Lax | Path=/ | Max-Age
+ *   HttpOnly | Secure in production | Path=/ | Max-Age
+ *   SameSite=None in production (cross-site Vercel → Render deployment:
+ *   browsers attach None cookies to cross-site fetches, but only when Secure
+ *   is also set), SameSite=Lax in development (localhost is same-site).
  *
- * CSRF posture: SameSite=Lax already blocks cross-site POSTs from being
- * sent with the cookie in modern browsers. As defense in depth for the
- * cross-origin (Vercel → Render) deployment, requireSameOrigin() also
- * verifies the Origin header on state-changing requests against the CORS
- * allowlist — a forged cross-site request cannot present a trusted Origin.
+ * CSRF posture: with SameSite=None the cookie travels on cross-site requests,
+ * so the Origin check in requireSameOrigin() is the primary CSRF defense for
+ * state-changing requests: a forged cross-site request cannot present a
+ * trusted Origin, and non-browser clients cannot hold the HttpOnly cookie.
  */
 import { createHmac, timingSafeEqual } from "crypto";
 import type { NextFunction, Request, Response } from "express";
@@ -92,18 +94,32 @@ export function sessionUserId(req: Request): string | null {
   return verifySessionToken(cookies[SESSION_COOKIE]);
 }
 
+/**
+ * SameSite policy for the session cookie.
+ *
+ * Production is a cross-site deployment (Vercel frontend → Render API): a
+ * SameSite=Lax cookie is never attached by browsers to cross-site fetches,
+ * which silently breaks every authenticated request after login. SameSite=None
+ * travels cross-site but is only honored alongside Secure — production sets
+ * both. Development keeps Lax: localhost is same-site, and None without a
+ * secure context would be rejected by the browser anyway.
+ */
+export function sameSiteForEnvironment(isProd: boolean): "lax" | "none" {
+  return isProd ? "none" : "lax";
+}
+
 /** Cookie attributes used by BOTH establishing (login/signup) and clearing. */
 export function sessionCookieOptions(): {
   httpOnly: true;
   secure: boolean;
-  sameSite: "lax";
+  sameSite: "lax" | "none";
   path: "/";
   maxAge: number;
 } {
   return {
     httpOnly: true,
     secure: isProduction,
-    sameSite: "lax",
+    sameSite: sameSiteForEnvironment(isProduction),
     path: "/",
     maxAge: config.sessionTtlHours * 3600 * 1000,
   };
@@ -117,7 +133,7 @@ export function setSessionCookie(res: Response, token: string): void {
     `Path=${opts.path}`,
     `Max-Age=${Math.floor(opts.maxAge / 1000)}`,
     "HttpOnly",
-    "SameSite=Lax",
+    `SameSite=${opts.sameSite === "none" ? "None" : "Lax"}`,
     ...(opts.secure ? ["Secure"] : []),
   ];
   const existing = res.getHeader("Set-Cookie");
@@ -133,7 +149,7 @@ export function clearSessionCookie(res: Response): void {
     `Path=${opts.path}`,
     "Max-Age=0",
     "HttpOnly",
-    "SameSite=Lax",
+    `SameSite=${opts.sameSite === "none" ? "None" : "Lax"}`,
     ...(opts.secure ? ["Secure"] : []),
   ];
   const existing = res.getHeader("Set-Cookie");

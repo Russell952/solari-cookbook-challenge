@@ -4,8 +4,12 @@
  *
  * Everything rendered is derived from the real backend summary via
  * buildProgressModel(): a phase-mapped stage stepper, truthful activity line,
- * real counters, actual evidence-type breakdown, and the real experiment
- * checklist. No percentages, no invented activity, no emoji icons.
+ * real counters, and live events. No percentages, no invented activity, no
+ * emoji icons.
+ *
+ * Deliberately does NOT repeat the full Experiments/Evidence lists — those
+ * render once, in the sections below the progress grid. The activity card's
+ * current-experiment line covers "what is running right now".
  */
 import { CheckIcon, CrossIcon, DotIcon, CircleIcon, BanIcon, AlertIcon } from "./icons";
 import {
@@ -78,49 +82,6 @@ export function InvestigationProgress({ summary, events }: Props) {
             ))}
           </div>
         </div>
-
-        {model.evidenceBreakdown.length > 0 && (
-          <div className="card progress-evidence">
-            <h2>Evidence collected</h2>
-            <ul className="progress-evidence-list">
-              {model.evidenceBreakdown.map((e) => (
-                <li key={e.type}>
-                  <span className="evidence-type">{e.type}</span>
-                  <span className="progress-evidence-count">{e.count}</span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-
-        {model.experimentList.length > 0 && (
-          <div className="card progress-experiments">
-            <h2>Experiments</h2>
-            <ol className="progress-exp-list">
-              {model.experimentList.map((e) => (
-                <li key={e.sequence} className={`progress-exp progress-exp-${e.state}`}>
-                  <span className="progress-exp-marker" aria-hidden="true">
-                    {e.state === "completed" && <CheckIcon size={11} />}
-                    {e.state === "running" && <DotIcon size={9} className="progress-pulse" />}
-                    {e.state === "failed" && <CrossIcon size={11} />}
-                    {e.state === "inconclusive" && <CircleIcon size={9} />}
-                    {e.state === "pending" && <CircleIcon size={9} />}
-                  </span>
-                  <span className="progress-exp-seq">#{e.sequence}</span>
-                  <span className="progress-exp-objective" title={e.objective}>
-                    {e.objective}
-                  </span>
-                  {e.state === "failed" && (
-                    <span className="progress-exp-note">Probe limitation</span>
-                  )}
-                  {e.state === "inconclusive" && (
-                    <span className="progress-exp-note">Inconclusive result</span>
-                  )}
-                </li>
-              ))}
-            </ol>
-          </div>
-        )}
 
         {events.length > 0 && (
           <div className="card progress-events">

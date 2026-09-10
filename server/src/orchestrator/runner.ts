@@ -1190,7 +1190,12 @@ export async function runInvestigation(
 
   const startTime = Date.now();
   budget.initBudget(investigationId);
-
+  // Start wall-clock accounting unless a clock is already ticking (e.g. a
+  // test/resume flow pinned a pre-expired origin — restarting it here would
+  // silently grant a full fresh budget).
+  if (!budget.isRuntimeClockRunning(investigationId)) {
+    budget.startRuntimeClock(investigationId);
+  }
   // Every actual upstream model request (including retries) is charged
   // against this investigation's AI budget by the adapter.
   setAiRequestRecorder((count = 1) => {
@@ -1202,12 +1207,12 @@ export async function runInvestigation(
   transitionStatus(investigation.status, "running");
   store.updateInvestigation(investigationId, { status: "running" });
 
-  // Runtime-expiry accounting: record elapsed time continuously so
-  // budget.isExpired() reflects real execution time.
-  const runtimeTimer = setInterval(() => {
-    budget.recordRuntime(investigationId, 1000);
-  }, 1000);
-  runtimeTimer.unref?.();
+  // Runtime-expiry accounting: isExpired() derives remaining time from the
+  // runtime clock (startRuntimeClock) — no interval needed. The clock is the
+  // single source of truth; elapsed time is never ALSO accumulated into
+  // usedRuntime (that double-counting expired investigations at ~half the
+  // configured budget, killing runs inside "Preparing experiments" before
+  // the first browser action could execute).
 
   try {
     // Resume from current phase — do not restart completed phases.
@@ -1433,8 +1438,10 @@ export async function runInvestigation(
       emit("error", investigationId, { error: errorMsg });
     }
   } finally {
-    clearInterval(runtimeTimer);
-    budget.recordRuntime(investigationId, Date.now() - startTime);
+    // Stop wall-clock accounting — do not also add elapsed time into
+    // usedRuntime (the clock already covers the entire run; adding the
+    // elapsed span again double-counted runtime).
+    budget.stopRuntimeClock(investigationId);
 
     // Release the HTTP-layer concurrency slot in EVERY termination path —
     // completion, failure, cancellation, runtime expiry, or unexpected

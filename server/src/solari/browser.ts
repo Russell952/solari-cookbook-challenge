@@ -95,6 +95,40 @@ export interface ProbeBrowserSession {
 }
 
 /**
+ * Upper bound on one browser-session launch attempt. The SDK's HTTP layer
+ * already retries transient request failures internally (2 attempts × 90s
+ * worst case); without an outer bound, a degraded gateway could consume an
+ * entire investigation runtime across the per-experiment launch sequence
+ * before a single action executed (observed as investigations failing with
+ * "Runtime budget expired" while still in Preparing experiments, 0/4 run).
+ */
+const LAUNCH_TIMEOUT_MS = 45_000;
+
+/** Launch with retries and a probe — bounded, so failures surface fast. */
+async function launchBounded(
+  solari: ReturnType<typeof getBrowserSolari>,
+  opts?: { recording?: boolean; stealth?: boolean; proxy?: string }
+) {
+  const launch = solari.launch({
+    recording: opts?.recording ?? true,
+    stealth: opts?.stealth,
+    proxy: opts?.proxy,
+    retries: 1, // one re-launch attempt after the first failure (SDK default 0)
+    probe: true,
+    probeTimeoutMs: 5_000,
+  });
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Solari browser session launch exceeded ${LAUNCH_TIMEOUT_MS}ms`)), LAUNCH_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([launch, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Create a new browser session with recording enabled.
  *
  * Opens a default page immediately so the caller can start navigating.
@@ -104,13 +138,8 @@ export async function createBrowserSession(
   opts?: { recording?: boolean; stealth?: boolean; proxy?: string }
 ): Promise<ProbeBrowserSession> {
   const solari = getBrowserSolari();
-  const recording = opts?.recording ?? true;
 
-  const session = await solari.launch({
-    recording,
-    stealth: opts?.stealth,
-    proxy: opts?.proxy,
-  });
+  const session = await launchBounded(solari, opts);
 
   const probeSessionId = `bsess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -193,7 +222,7 @@ export async function createBrowserSession(
     probeSessionId,
     session,
     solariSessionId: session.id,
-    recordingEnabled: recording,
+    recordingEnabled: opts?.recording ?? true,
   };
 }
 
@@ -1123,8 +1152,15 @@ export async function evaluate(
 export async function closeBrowserSession(
   session: ProbeBrowserSession
 ): Promise<void> {
+  // Bound the close: the SDK close path includes a release acknowledgment;
+  // a wedged gateway must not stall the experiment loop (the release is
+  // also retried/cleaned up at investigation level, so a timeout here only
+  // means we stop waiting, not that the browser leaks indefinitely).
   try {
-    await session.session.close();
+    await Promise.race([
+      session.session.close(),
+      new Promise((resolve) => setTimeout(resolve, 10_000)),
+    ]);
   } catch (e) {
     console.error(
       `Error closing browser for session ${session.probeSessionId}:`,

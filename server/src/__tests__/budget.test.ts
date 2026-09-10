@@ -116,8 +116,13 @@ describe("Budget Manager", () => {
 
     it("returns true when runtime exceeds limit", () => {
       budget.initBudget("test-inv", { maxRuntimeMs: 100 });
-      budget.recordRuntime("test-inv", 150);
-      expect(budget.isExpired("test-inv")).toBe(true);
+      // Pin the clock origin 150ms in the past.
+      budget.startRuntimeClock("test-inv", Date.now() - 150);
+      try {
+        expect(budget.isExpired("test-inv")).toBe(true);
+      } finally {
+        budget.stopRuntimeClock("test-inv");
+      }
     });
   });
 

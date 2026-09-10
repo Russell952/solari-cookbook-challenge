@@ -138,9 +138,9 @@ describe("runtime budget is enforced", () => {
   it("an expired runtime budget stops the investigation and marks it failed", async () => {
     const id = createTestInvestigation();
 
-    // Pre-exhaust the runtime budget
+    // Pre-exhaust the runtime budget (pin the clock origin past the limit).
     budget.initBudget(id);
-    budget.recordRuntime(id, budget.getBudget(id).maxRuntimeMs + 1);
+    budget.startRuntimeClock(id, Date.now() - (budget.getBudget(id).maxRuntimeMs + 1));
     expect(budget.isExpired(id)).toBe(true);
 
     await runInvestigation(id);
@@ -150,14 +150,23 @@ describe("runtime budget is enforced", () => {
     expect(status).not.toBe("completed");
   });
 
-  it("isExpired() does not fire before maxRuntimeMs is consumed", () => {
+  it("isExpired() derives from the runtime clock and never double-counts", () => {
     const id = createTestInvestigation();
     budget.initBudget(id);
+    // No clock started: not expired.
     expect(budget.isExpired(id)).toBe(false);
-    budget.recordRuntime(id, 1000);
-    expect(budget.isExpired(id)).toBe(false);
-    budget.recordRuntime(id, budget.getBudget(id).maxRuntimeMs);
-    expect(budget.isExpired(id)).toBe(true);
+    budget.startRuntimeClock(id);
+    try {
+      // A short wall-clock span well under the limit is NOT expired — even
+      // though the runner used to ALSO tick a 1s interval on top.
+      budget.startRuntimeClock(id, Date.now() - 1000);
+      expect(budget.isExpired(id)).toBe(false);
+      // Backdate past the limit: expired.
+      budget.startRuntimeClock(id, Date.now() - (budget.getBudget(id).maxRuntimeMs + 1));
+      expect(budget.isExpired(id)).toBe(true);
+    } finally {
+      budget.stopRuntimeClock(id);
+    }
   });
 });
 

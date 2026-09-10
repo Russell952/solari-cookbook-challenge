@@ -141,17 +141,43 @@ export function consume(
   return { ...b };
 }
 
-export function isExpired(investigationId: string): boolean {
+/**
+ * Get remaining wall-clock runtime in ms, computed from the started-at
+ * timestamp — the single source of truth. Elapsed time is never accumulated
+ * into a counter (double-counting made `isExpired()` true at ~half the
+ * configured budget: a 1s interval ticked elapsed time while a runner finally
+ * block ALSO added Date.now() - startTime).
+ */
+export function remainingRuntime(investigationId: string): number {
   const b = getBudget(investigationId);
-  return b.usedRuntime >= b.maxRuntimeMs;
+  const startedAt = startedAtMs.get(investigationId);
+  if (startedAt === undefined) return b.maxRuntimeMs; // not started yet
+  return Math.max(0, b.maxRuntimeMs - (Date.now() - startedAt));
 }
 
-export function recordRuntime(investigationId: string, ms: number): void {
-  const b = getBudget(investigationId);
-  b.usedRuntime += ms;
-  budgets.set(investigationId, b);
+/** Started-at timestamps per investigation, set by startRuntimeClock(). */
+const startedAtMs = new Map<string, number>();
+
+/** Begin wall-clock accounting (called once when the runner starts).
+ * `origin` lets tests (and future resume flows) pin the start timestamp. */
+export function startRuntimeClock(investigationId: string, origin?: number): void {
+  startedAtMs.set(investigationId, origin ?? Date.now());
+}
+
+export function stopRuntimeClock(investigationId: string): void {
+  startedAtMs.delete(investigationId);
+}
+
+/** True when a runtime clock is already ticking for this investigation. */
+export function isRuntimeClockRunning(investigationId: string): boolean {
+  return startedAtMs.has(investigationId);
+}
+
+export function isExpired(investigationId: string): boolean {
+  return remainingRuntime(investigationId) <= 0;
 }
 
 export function resetBudget(investigationId: string): void {
   budgets.delete(investigationId);
+  startedAtMs.delete(investigationId);
 }

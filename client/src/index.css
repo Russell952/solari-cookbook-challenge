@@ -448,7 +448,7 @@ body {
 /* ── Investigation progress ─────────────────────────────────────────────── */
 .progress-grid {
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) 1.4fr;
+  grid-template-columns: minmax(260px, 1fr) minmax(0, 1.4fr);
   gap: 1rem;
   align-items: start;
 }
@@ -773,14 +773,52 @@ body {
 .progress-event-type {
   color: var(--text-secondary);
   font-weight: 500;
+  flex-shrink: 0;
 }
 
+/* Root-cause fix for Recent Activity horizontal overflow: long error text
+   (API errors, URLs, JSON fragments, provider messages) must WRAP, not
+   truncate. The old `white-space: nowrap` + ellipsis made the span's
+   min-content width equal the entire error string, which inflated the
+   `.progress-grid` column track past the viewport and forced page-wide
+   horizontal scrolling. Wrapping plus a shrinkable grid track keeps the
+   string inside the card at any width. */
 .progress-event-error {
   color: var(--danger);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   min-width: 0;
+  flex: 1 1 0;
+}
+
+/* The events card lives in a grid column whose automatic minimum is its
+   min-content size; allow every track and card in the chain to shrink below
+   that so a long error can never widen the page. */
+.progress-events {
+  min-width: 0;
+}
+
+.progress-grid > .card,
+.progress-grid > .progress-side {
+  min-width: 0;
+}
+
+.progress-side {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.progress-side > .card {
+  min-width: 0;
+}
+
+/* On very narrow screens the baseline row layout wastes space; stack the
+   event type above the error text instead. */
+@media (max-width: 480px) {
+  .progress-event-list li {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.15rem;
+  }
 }
 
 /* Terminal banners */

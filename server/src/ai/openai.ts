@@ -7,7 +7,6 @@
  * AI output validation: every parseJSON result is validated at runtime.
  * AI output is NEVER trusted simply because it is valid JSON.
  */
-import { config } from "../config/index.js";
 import type {
   AIAdapter,
   AIPlanResult,
@@ -26,6 +25,266 @@ import type {
   Finding,
   Evidence,
 } from "@probe/shared";
+
+// ── AI context budget (prevents oversized requests to the model provider) ──
+//
+// Probe assembles the full investigation context into every AI request.
+// Without a hard budget, long investigations (many experiments × observations
+// × evidence × replays × older adaptive rounds) can exceed the provider's
+// context limit and the request is rejected with a 400 context-length error.
+//
+// Strategy:
+//  1. A safe application ceiling (~220k input tokens) lives well below the
+//     provider limit (262144) so retries, system prompt overhead, and JSON
+//     serialization never push us over the edge.
+//  2. Before every AI request, estimate the candidate prompt size and, when
+//     it exceeds the ceiling, compact it deterministically: keep the current
+//     objective/phase/experiment/observation, relevant evidence references,
+//     active hypotheses, and recent experiment history; drop raw duplicates,
+//     stale older history, and repeated full-recon payloads.
+//  3. Evidence is by default referenced by id/type + compact metadata
+//     (never the full saved artifact text) unless the current decision
+//     explicitly needs it.
+//  4. A final pre-request guard enforces the ceiling even if estimation is
+//     wrong: if the request still exceeds the budget, compact again or fail
+//     cleanly with a clear internal error (never send an oversized request).
+//
+// The ceiling is configurable via PROBE_AI_CONTEXT_BUDGET (input tokens).
+// Default ~220000 leaves ~40k headroom below the 262144 model limit.
+
+import { config } from "../config/index.js";
+
+const RAW_CONTEXT_BUDGET_TOKENS = parseInt(process.env.PROBE_AI_CONTEXT_BUDGET || "220000", 10);
+if (!Number.isFinite(RAW_CONTEXT_BUDGET_TOKENS) || RAW_CONTEXT_BUDGET_TOKENS < 1000) {
+  throw new Error(
+    `PROBE_AI_CONTEXT_BUDGET must be a positive integer (input tokens); got "${process.env.PROBE_AI_CONTEXT_BUDGET ?? "(unset)"}"`
+  );
+}
+
+/**
+ * Crude but stable heuristic estimate of the token cost of a text payload.
+ * We do not import a heavy tokenizer here — a conservative chars-per-token
+ * estimate is enough for a safety ceiling, and it is always an overestimate
+ * for English/JSON payloads (real tokenizers produce fewer tokens), so the
+ * guard is fail-safe rather than fail-open.
+ *
+ * Empirically: GPT-family tokenizers average ~3.8–4.2 chars/token on prose,
+ * and JSON/evidence dumps are similar. We use 3.5 as the low end so the
+ * estimate is slightly conservative (more bytes = more estimated tokens).
+ */
+const ESTIMATED_CHARS_PER_TOKEN = 3.5;
+
+/**
+ * Estimate the number of input tokens in assembled prompt text.
+ * Designed to be deterministic and conservative.
+ */
+export function estimatePromptTokens(text: string): number {
+  // Account for the JSON -> stringify escaping overhead: the string we
+  // receive is already the final content, but newline/indentation from
+  // JSON.stringify adds chars that still cost tokens. Scale by a small
+  // fixed safety factor so JSON-heavy sections are not under-counted.
+  //
+  // Base64 payloads (screenshots, saved artifacts) tokenize far denser than
+  // prose (~2 chars/token vs ~4). Long alphanumeric runs are treated as
+  // base64 so the estimate stays conservative for the payloads that caused
+  // the original context overflow.
+  let base64Chars = 0;
+  for (const match of text.matchAll(/[A-Za-z0-9+/=]{200,}/g)) base64Chars += match[0].length;
+  const proseChars = text.length - base64Chars;
+  const scaled = (proseChars * 1.05) / ESTIMATED_CHARS_PER_TOKEN + (base64Chars * 1.05) / 2;
+  return Math.ceil(scaled);
+}
+
+/** Inverse of estimatePromptTokens: the maximum character count that stays
+ * within `tokens` estimated input tokens. Used by the hard truncation path. */
+function maxCharsForTokens(tokens: number): number {
+  return Math.max(0, Math.floor((tokens * ESTIMATED_CHARS_PER_TOKEN) / 1.05));
+}
+
+/** Deterministic text truncation with an explicit marker (never silent). */
+function truncateText(text: string, maxChars: number, label: string): string {
+  if (text.length <= maxChars) return text;
+  const marker = ` <...${label} truncated for AI context budget; full value retained in Probe evidence store...>`;
+  const keep = Math.max(0, maxChars - marker.length);
+  return text.slice(0, keep) + marker;
+}
+
+/**
+ * Hard limit on total input tokens per AI request.
+ *
+ * This is a *Probe application budget*, deliberately below the provider limit
+ * (262144 for the current model range) so retries, system-prompt overhead,
+ * JSON serialization, and estimation error can never tip us into a 400
+ * context-length rejection. Configurable via PROBE_AI_CONTEXT_BUDGET.
+ */
+export const AI_CONTEXT_BUDGET_TOKENS = RAW_CONTEXT_BUDGET_TOKENS;
+
+/** Maximum characters of raw evidence metadata dumped per evidence item in any
+ * prompt. Evidence payloads (action traces, replays, repository source) can
+ * be very large; we never dump the full artifact text into the prompt by
+ * default.
+ */
+export const MAX_EVIDENCE_METADATA_CHARS_PER_ITEM = 900;
+
+/**
+ * Compact an evidence array down to metadata references suitable for an AI
+ * prompt, preserving id/type/phase + a short metadata excerpt. Dropped items
+ * are still persisted in the store — this only affects what is sent to the AI.
+ *
+ * Priority is preserved naturally: the caller decides which evidence to pass
+ * in. This helper only reduces the size of that set; it does not discard the
+ * current experiment's evidence first.
+ */
+export function compactEvidenceForPrompt(
+  evidence: Array<{ id: string; type: string; experimentId: string | null; metadata: Record<string, unknown>; uri: string | null }>,
+  options?: {
+    /** If true, keep the full non-null uri as a compact reference line. */
+    keepUris?: boolean;
+    /** When true, evidence from the current (most recent) experiment is kept
+     * verbatim (still compacted), older experiments are more aggressively
+     * summarized. */
+    preferCurrentExperimentId?: string | null;
+  }
+): string {
+  const items = evidence.map((e) => {
+    const metaStr = JSON.stringify(e.metadata ?? {});
+    const truncatedMeta = metaStr.length > MAX_EVIDENCE_METADATA_CHARS_PER_ITEM
+      ? metaStr.slice(0, MAX_EVIDENCE_METADATA_CHARS_PER_ITEM) + "\n<...truncated in prompt; artifact retained in evidence store...>"
+      : metaStr;
+    const phase = (e.metadata?.phase as string | undefined) ?? (e.metadata?.type as string | undefined) ?? "";
+    const base = `[${e.id}] ${e.type}${phase ? ` (${phase})` : ""}`;
+    const parts: string[] = [base];
+    if (options?.keepUris && e.uri) parts.push(`uri: ${e.uri}`);
+    parts.push(`metadata: ${truncatedMeta}`);
+    return parts.join("\n");
+  });
+  return items.join("\n");
+}
+
+/**
+ * Keep only the most recent N completed experiment outcome lines for prompt
+ * size. The full experiment list stays in the store.
+ */
+export function summarizeExperimentHistory(
+  experiments: Array<{ sequence: number; objective: string; status: string; result: string | null; error: string | null }>,
+  keepRecent: number
+): string {
+  const lines = experiments
+    .slice()
+    .sort((a, b) => a.sequence - b.sequence)
+    .map(
+      (e) =>
+        `- #${e.sequence} [${e.status}] ${e.objective.slice(0, 150)}` +
+        (e.result ? ` | result: ${e.result}` : "") +
+        (e.error ? ` | error: ${e.error.slice(0, 200)}` : "")
+    );
+  if (lines.length <= keepRecent) return lines.join("\n");
+  const head = lines.slice(0, lines.length - keepRecent);
+  const tail = lines.slice(lines.length - keepRecent);
+  const headSummary = head.length > 0
+    ? `... ${head.length} earlier experiments omitted from prompt (retained in evidence store) ...\n` + head.slice(0, 1).join("\n")
+    : "";
+  return [headSummary, ...tail].join("\n").trim();
+}
+
+/**
+ * Final safety guard: if assembled text still exceeds the budget, either
+ * compact it further (drop repeated metadata blocks) or throw a clear internal
+ * error. Never send an oversized request to the provider.
+ *
+ * Returns the text to send. Throws when even an aggressive compact cannot
+ * fit (documented limitation, not a silent truncation).
+ */
+/**
+ * Final safety guard: guarantee the assembled prompt fits the budget.
+ *
+ * Reduction is deterministic and layered, never blind:
+ *  1. Repeated passes trim the tail of the largest metadata line (compact
+ *     further), preserving priority-ordered content at the top of the prompt
+ *     (objective → phase → current experiment/observation → evidence refs →
+ *     older history).
+ *  2. If still over budget, a final head-keeping truncation cuts only the
+ *     oldest tail content and embeds an explicit marker. Because prompt
+ *     builders put current objective/experiment/observation first, the
+ *     current decision context always survives; the full data remains
+ *     persisted in Probe's evidence store.
+ *
+ * The returned text is ALWAYS within `maxTokens` — an oversized request is
+ * never sent to the provider.
+ */
+export function enforceContextBudget(
+  text: string,
+  label: string,
+  maxTokens: number,
+): string {
+  let current = text;
+  const maxAttempts = 6;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (estimatePromptTokens(current) <= maxTokens) return current;
+
+    // Compact pass: trim the tail of the longest line (largest metadata
+    // block) until we fit or the skeleton is reached.
+    const lines = current.split("\n");
+    if (lines.length === 0) break;
+    const longestIdx = lines.reduce((best, line, i) => (line.length > (lines[best]?.length ?? 0) ? i : best), 0);
+    const longest = lines[longestIdx];
+    const drop = Math.max(1, Math.ceil(longest.length * 0.35));
+    lines[longestIdx] = longest.slice(0, longest.length - drop) + " <...truncated for context budget...>";
+    current = lines.join("\n");
+  }
+
+  if (estimatePromptTokens(current) <= maxTokens) return current;
+
+  // Hard guarantee: iterative head-keeping truncation to the exact token
+  // budget. Current objective/experiment/observation live at the top of every
+  // Probe prompt, so they survive; only the oldest tail content is dropped.
+  // The loop converges because the estimate is monotonically non-decreasing
+  // in length and each pass strictly shortens the text.
+  const marker = `\n<...${label}: context truncated to fit the AI context budget; full data retained in Probe's evidence store...>`;
+  let maxChars = Math.max(0, maxCharsForTokens(maxTokens) - marker.length);
+  for (let i = 0; i < 8; i++) {
+    current = current.slice(0, maxChars) + marker;
+    if (estimatePromptTokens(current) <= maxTokens) return current;
+    maxChars = Math.floor(maxChars * 0.8);
+  }
+
+  const finalEstimate = estimatePromptTokens(current);
+  if (finalEstimate > maxTokens) {
+    // Unreachable in practice (each pass shrinks 20% while the budget is
+    // fixed); kept as a fail-closed internal error rather than ever sending
+    // an oversized request.
+    throw new Error(
+      `AI context budget exceeded: ${label} is ~${finalEstimate.toLocaleString()} estimated input tokens (limit ${maxTokens.toLocaleString()}). ` +
+      `PROBE_AI_CONTEXT_BUDGET is misconfigured; set it to a value well below the model context limit.`
+    );
+  }
+  return current;
+}
+
+/** Slack reserved for chat-message framing (roles, model fields) so the
+ * budget math for the user prompt stays conservative. */
+const REQUEST_FRAMING_TOKEN_SLACK = 256;
+
+/**
+ * Bound the user prompt of an AI request inside `chat()` — the single choke
+ * point for every model request. The system prompt (action schema, validation
+ * rules the model must obey) is never truncated; it is small and fixed.
+ *
+ * If the system prompt alone consumes the budget, fail cleanly with a clear
+ * internal error instead of sending an oversized request.
+ */
+function fitUserPromptToBudget(systemPrompt: string, userPrompt: string): string {
+  const reserved = estimatePromptTokens(systemPrompt) + REQUEST_FRAMING_TOKEN_SLACK;
+  const available = AI_CONTEXT_BUDGET_TOKENS - reserved;
+  if (available < 2000) {
+    throw new Error(
+      `AI context budget misconfigured: system prompt (~${reserved.toLocaleString()} tokens) leaves only ${available.toLocaleString()} of ${AI_CONTEXT_BUDGET_TOKENS.toLocaleString()} budget. ` +
+      `Increase PROBE_AI_CONTEXT_BUDGET to a value still below the model context limit.`
+    );
+  }
+  return enforceContextBudget(userPrompt, "AI request", available);
+}
 
 // ── JSON parsing ───────────────────────────────────────────────────────────
 
@@ -394,6 +653,9 @@ export function setAiRequestRecorder(fn: ((count?: number) => void) | null): voi
 }
 
 async function chat(systemPrompt: string, userPrompt: string): Promise<string> {
+  // Final pre-request guard (hard safety): no model request ever leaves this
+  // function with a prompt over the configured context budget.
+  const boundedUserPrompt = fitUserPromptToBudget(systemPrompt, userPrompt);
   let lastError: Error | undefined;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     // Count this actual upstream model request before sending it. Retries
@@ -409,7 +671,7 @@ async function chat(systemPrompt: string, userPrompt: string): Promise<string> {
         model: config.aiModel,
         messages: [
           { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
+          { role: "user", content: boundedUserPrompt },
         ],
         temperature: 0.2,
       }),
@@ -477,6 +739,88 @@ async function chatWithValidation<T>(
 }
 
 // ── Adapter implementation ─────────────────────────────────────────────────
+
+/**
+ * Sanitize repository recon for an AI prompt: cap the readme (which can be
+ * arbitrarily large) and drop bulky packageJson internals. The full data
+ * stays in Probe's store — this only bounds what is serialized to the model.
+ */
+function compactRepoReconForPrompt(repoRecon: RepositoryRecon | null): Record<string, unknown> {
+  if (!repoRecon) return {};
+  return {
+    ...repoRecon,
+    readme: repoRecon.readme ? truncateText(repoRecon.readme, 4000, "repository readme") : null,
+    packageJson: repoRecon.packageJson
+      ? { name: (repoRecon.packageJson as Record<string, unknown>).name ?? null, scripts: (repoRecon.packageJson as Record<string, unknown>).scripts ?? null }
+      : null,
+  };
+}
+
+/**
+ * Sanitize application recon for an AI prompt.
+ *
+ * CRITICAL: `screenshot` is a raw base64 PNG (hundreds of KB). It carries
+ * zero textual information for the model and was the primary source of the
+ * original context overflow — it is referenced, never embedded. The full
+ * screenshot remains persisted as recon evidence by the orchestrator.
+ */
+function compactAppReconForPrompt(appRecon: ApplicationRecon | null): Record<string, unknown> {
+  if (!appRecon) return {};
+  return {
+    pageTitle: appRecon.pageTitle,
+    initialUrl: appRecon.initialUrl,
+    navigation: appRecon.navigation,
+    forms: appRecon.forms,
+    buttons: appRecon.buttons,
+    links: appRecon.links,
+    primaryWorkflow: appRecon.primaryWorkflow,
+    interactableElements: appRecon.interactableElements,
+    screenshot: `<omitted from prompt: full-page screenshot persisted as recon evidence (${Math.round((appRecon.screenshot ?? "").length / 1024)}KB base64)>`,
+  };
+}
+
+/** Cap a single observation's free-text fields; structure is preserved. */
+function compactObservationForPrompt(o: Observation): Record<string, unknown> {
+  const MAX = 1200;
+  return {
+    id: o.id,
+    experimentId: o.experimentId,
+    actionId: o.actionId,
+    expected: o.expected ? truncateText(o.expected, MAX, "observation.expected") : null,
+    actual: truncateText(o.actual, MAX, "observation.actual"),
+    type: o.type,
+    description: truncateText(o.description, MAX, "observation.description"),
+    timestamp: o.timestamp,
+  };
+}
+
+/**
+ * Compact an observations array for analysis prompts. Current-experiment
+ * observations are kept with per-field caps; older experiments are
+ * summarized to one line each (the current decision never depends on the
+ * full text of historical observations).
+ */
+function compactObservationsForPrompt(
+  observations: Observation[],
+  currentExperimentId: string | null,
+): string {
+  const current = observations.filter((o) => o.experimentId === currentExperimentId);
+  const older = observations.filter((o) => o.experimentId !== currentExperimentId);
+  const currentSection = current
+    .map((o) => JSON.stringify(compactObservationForPrompt(o)))
+    .join("\n");
+  const olderSection = older.length
+    ? `<${older.length} observations from earlier experiments summarized; full text retained in Probe's evidence store>\n` +
+      older
+        .slice(-12)
+        .map((o) => `- [${o.id}] exp=${o.experimentId} type=${o.type}: ${o.description.slice(0, 160)}`)
+        .join("\n")
+    : "";
+  // Current experiment first: the priority order (objective → phase →
+  // current experiment → current observation → history) must survive even
+  // head-keeping truncation in the final budget guard.
+  return [currentSection, olderSection].filter(Boolean).join("\n");
+}
 
 export function createOpenAIAdapter(): AIAdapter {
   return {
@@ -562,7 +906,7 @@ AVOID: Duplicates, screenshot-only experiments.
   If the application has a mobile menu (#menu-toggle or equivalent), prioritize a mobile experiment high enough that it actually runs within the primary budget.
   Mobile experiments are NOT optional extras — they are a core part of testing a responsive portfolio site.`;
 
-      const userPrompt = `Objective: ${objective}\n\nRepository Recon: ${JSON.stringify(repoRecon, null, 2)}\n\nApplication Recon: ${JSON.stringify(appRecon, null, 2)}`;
+      const userPrompt = `Objective: ${objective}\n\nRepository Recon: ${JSON.stringify(compactRepoReconForPrompt(repoRecon), null, 2)}\n\nApplication Recon: ${JSON.stringify(compactAppReconForPrompt(appRecon), null, 2)}`;
 
       return chatWithValidation(systemPrompt, userPrompt, (r) =>
         validatePlanResult(parseJSON(r), appRecon?.interactableElements)
@@ -571,7 +915,7 @@ AVOID: Duplicates, screenshot-only experiments.
 
     async analyzeRepository(repoRecon, objective): Promise<string> {
       const systemPrompt = `You are a software analyst. Analyze the repository data and provide insights relevant to the investigation objective. Be specific and evidence-based.`;
-      const userPrompt = `Objective: ${objective}\n\nRepository data: ${JSON.stringify(repoRecon, null, 2)}`;
+      const userPrompt = `Objective: ${objective}\n\nRepository data: ${JSON.stringify(compactRepoReconForPrompt(repoRecon), null, 2)}`;
       return chat(systemPrompt, userPrompt);
     },
 
@@ -606,7 +950,7 @@ FORM SUBMISSION OBSERVATION RULES:
 - If the submit action itself failed (button not found, button disabled, page error), that is an EXECUTION or APPLICATION failure depending on root cause.
 
 ACTION SCHEMA: The only valid browser actions are: launch, navigate, click, type, readText, screenshot, getTitle, setViewport. Do NOT invent other actions (wait, sleep, hover, scroll, drag, etc.). For settling after a click, use navigate (to same URL or anchor), screenshot, or getTitle.`;
-      const userPrompt = `Objective: ${objective}\n\nExperiment: ${experiment.objective}\n\nExperiment status: ${experiment.status}${experiment.error ? `\nExperiment error: ${experiment.error}` : ""}\n\nObservations: ${JSON.stringify(observations, null, 2)}`;
+      const userPrompt = `Objective: ${objective}\n\nExperiment: ${experiment.objective}\n\nExperiment status: ${experiment.status}${experiment.error ? `\nExperiment error: ${experiment.error}` : ""}\n\nObservations (current experiment in full; earlier experiments summarized):\n${compactObservationsForPrompt(observations, experiment.id ?? null)}`;
       return chat(systemPrompt, userPrompt);
     },
 
@@ -628,7 +972,7 @@ Return JSON:
   "contradictingEvidenceIds": ["ev_id2"]
 }`;
 
-      const userPrompt = `Objective: ${objective}\n\nAnalysis: ${analysis}\n\nEvidence IDs: ${evidence.map((e) => `${e.id} (${e.type}): ${JSON.stringify(e.metadata)}`).join("\n")}`;
+      const userPrompt = `Objective: ${objective}\n\nAnalysis: ${analysis}\n\nEvidence references (compact metadata; full artifacts retained in Probe's evidence store):\n${compactEvidenceForPrompt(evidence)}`;
 
       return chatWithValidation(systemPrompt, userPrompt, (r) => validateHypothesisResult(parseJSON(r)));
     },
@@ -663,7 +1007,7 @@ Return JSON:
   }
 }`;
 
-      const userPrompt = `Hypothesis: ${hypothesis.statement}\nCurrent confidence: ${hypothesis.confidence}\n\nExisting evidence: ${evidence.map((e) => `${e.id}: ${JSON.stringify(e.metadata)}`).join("\n")}`;
+      const userPrompt = `Hypothesis: ${hypothesis.statement}\nCurrent confidence: ${hypothesis.confidence}\n\nExisting evidence (compact metadata):\n${compactEvidenceForPrompt(evidence)}`;
 
       return chatWithValidation(systemPrompt, userPrompt, (r) => validateVerificationResult(parseJSON(r)));
     },
@@ -684,7 +1028,7 @@ Return JSON:
   "status": "confirmed|rejected|inconclusive"
 }`;
 
-      const userPrompt = `Hypothesis: ${hypothesis.statement}\nCurrent confidence: ${hypothesis.confidence}\nCurrent status: ${hypothesis.status}\n\nNew evidence: ${newEvidence.map((e) => `${e.id} (${e.type}): ${JSON.stringify(e.metadata)}`).join("\n")}`;
+      const userPrompt = `Hypothesis: ${hypothesis.statement}\nCurrent confidence: ${hypothesis.confidence}\nCurrent status: ${hypothesis.status}\n\nNew evidence (compact metadata):\n${compactEvidenceForPrompt(newEvidence)}`;
 
       return chatWithValidation(systemPrompt, userPrompt, (r) => validateEvaluationResult(parseJSON(r)));
     },
@@ -734,7 +1078,7 @@ IMPORTANT: For mobile/responsive experiments, use a dedicated setViewport action
 
 If shouldContinue is false, omit nextExperiment.`;
 
-      const userPrompt = `Objective: ${objective}\n\nExperiments completed: ${completedExperiments.length}\nExperiments failed: ${failedExperiments.length}\nActions executed: ${executedActions}\n\nAnalysis: ${analysis}\n\nEvidence summary: ${evidence.map(e => `${e.type}: ${JSON.stringify(e.metadata).slice(0, 200)}`).join("\n")}\n\nApplication Recon: ${JSON.stringify(appRecon, null, 2)}`;
+      const userPrompt = `Objective: ${objective}\n\nExperiments completed: ${completedExperiments.length}\nExperiments failed: ${failedExperiments.length}\nActions executed: ${executedActions}\n\nAnalysis: ${analysis}\n\nEvidence summary (compact metadata, recent first):\n${compactEvidenceForPrompt(evidence.slice(-40))}\n\nApplication Recon: ${JSON.stringify(compactAppReconForPrompt(appRecon), null, 2)}`;
 
       return chatWithValidation(systemPrompt, userPrompt, (r) => validateAdaptiveDecision(parseJSON(r), appRecon?.interactableElements));
     },
@@ -792,9 +1136,39 @@ If there are no confirmed application findings, confirmedFindings should be an e
             (e.error ? ` | error: ${e.error.slice(0, 200)}` : "")
         )
         .join("\n");
-      const userPrompt = `Investigation: ${investigation.objective}\nTarget: ${investigation.repositoryUrl} / ${investigation.applicationUrl}\n\nFindings: ${JSON.stringify(findings, null, 2)}\n\nHypotheses: ${JSON.stringify(hypotheses, null, 2)}\n\nExperiments run (${experiments.length}) — ACTUAL recorded outcomes; do not assume outcomes not listed here:\n${experimentLines}\n\nEvidence collected: ${evidence.length} items by type: ${JSON.stringify(evidenceTypeCounts)}`;
 
-      return chatWithValidation(systemPrompt, userPrompt, (r) => validateReportResult(parseJSON(r)));
+      // Assemble the candidate report context, then force it through the
+      // context budget so a fixed-size investigation never exceeds the model
+      // context limit. Findings/hypotheses/experiments are the richest arrays,
+      // so we compact the experiment history into recent lines and reference
+      // evidence by compact metadata (never the full saved artifact text).
+      const compactExperimentLines = summarizeExperimentHistory(
+        experiments,
+        Math.max(2, Math.min(experiments.length, 6))
+      );
+      const compactEvidenceMetadata = compactEvidenceForPrompt(evidence, { keepUris: false });
+
+      const reportEvidenceSection = compactEvidenceMetadata
+        ? `Evidence metadata (compact):\n${compactEvidenceMetadata}`
+        : "";
+
+      const candidatePrompt =
+        `Investigation: ${investigation.objective}\n` +
+        `Target: ${investigation.repositoryUrl} / ${investigation.applicationUrl}\n\n` +
+        `Findings: ${JSON.stringify(findings, null, 2)}\n\n` +
+        `Hypotheses: ${JSON.stringify(hypotheses, null, 2)}\n\n` +
+        `Experiments run (${experiments.length}) - ACTUAL recorded outcomes; do not assume outcomes not listed here:\n${compactExperimentLines}\n\n` +
+        `Evidence collected: ${evidence.length} items by type: ${JSON.stringify(evidenceTypeCounts)}\n\n` +
+        reportEvidenceSection;
+
+      const boundedPrompt = enforceContextBudget(
+        candidatePrompt,
+        "report generation",
+        AI_CONTEXT_BUDGET_TOKENS
+      );
+
+      return await chatWithValidation(systemPrompt, boundedPrompt, (r) =>
+        validateReportResult(parseJSON(r)));
     },
   };
 }

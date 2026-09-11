@@ -18,6 +18,7 @@ import { BrowserSession as SolariBrowserSession } from "@solarisdk/browser";
 import { getBrowserSolari, trackBrowserSession, untrackBrowserSession } from "./client.js";
 import { store } from "../store/index.js";
 import { isPubliclyRoutableHost } from "../security/url-validation.js";
+import { profiler } from "../profiler/index.js";
 
 // ── Connection-time network policy (DNS-rebinding / SSRF enforcement) ──────
 
@@ -139,7 +140,12 @@ export async function createBrowserSession(
 ): Promise<ProbeBrowserSession> {
   const solari = getBrowserSolari();
 
-  const session = await launchBounded(solari, opts);
+  const session = await profiler.span(
+    "browser",
+    "solari.launch",
+    { recording: opts?.recording ?? true },
+    () => launchBounded(solari, opts)
+  );
 
   const probeSessionId = `bsess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -259,7 +265,9 @@ export async function navigate(
   page.on("download", downloadHandler);
 
   try {
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15_000 });
+    await profiler.span("browser", "navigate.goto", { url }, () =>
+      page.goto(url, { waitUntil: "domcontentloaded", timeout: 15_000 })
+    );
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     // If a download was triggered, that's not a navigation failure
@@ -279,7 +287,9 @@ export async function navigate(
 
   // Wait for SPA content to settle after navigation
   try {
-    await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => {});
+    await profiler.span("browser", "navigate.networkidle", { url }, () =>
+      page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => {})
+    );
   } catch { /* best effort — not all pages reach networkidle */ }
 
   return {
@@ -947,9 +957,11 @@ export async function click(
 ): Promise<void> {
   const page = await getDefaultPage(session);
 
-  // Wait briefly for the page to settle (SPA rendering, lazy content)
+  // Wait for the page to settle (SPA rendering, lazy content)
   try {
-    await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => {});
+    await profiler.span("browser", "click.preNetworkIdle", { selector }, () =>
+      page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => {})
+    );
   } catch { /* best effort */ }
 
   let lastError: Error | null = null;
@@ -961,7 +973,12 @@ export async function click(
 
     // Use waitForSelector for reliable element detection
     // This handles SPA rendering timing better than polling count()
-    const found = await waitForElement(page, resolved, attempt === 0 ? 10_000 : 4_000);
+    const found = await profiler.span(
+      "browser",
+      "click.waitForElement",
+      { selector, attempt },
+      () => waitForElement(page, resolved, attempt === 0 ? 10_000 : 4_000)
+    );
     if (!found) {
       lastError = new Error(`Element not found: ${selector} (resolved: ${resolved})`);
       if (attempt < CLICK_MAX_RETRIES) {
@@ -1011,9 +1028,13 @@ export async function click(
     try {
       // Capture URL before click to detect SPA navigation
       const urlBefore = page.url();
-      await locator.first().click({ timeout: 10_000 });
+      await profiler.span("browser", "click.click", { selector, attempt }, () =>
+        locator.first().click({ timeout: 10_000 })
+      );
       // Wait for DOM to settle after click (SPA transition, hash navigation)
-      await waitForPostClickSettling(page, urlBefore);
+      await profiler.span("browser", "click.postClickSettling", { selector, attempt }, () =>
+        waitForPostClickSettling(page, urlBefore)
+      );
       return; // success
     } catch (clickErr) {
       const clickMsg = clickErr instanceof Error ? clickErr.message : String(clickErr);
@@ -1054,7 +1075,12 @@ export async function type(
     const resolved = await resolveTarget(page, selector, reconContext);
 
     // Wait for element to exist with reliable detection
-    const found = await waitForElement(page, resolved, attempt === 0 ? 10_000 : 4_000);
+    const found = await profiler.span(
+      "browser",
+      "type.waitForElement",
+      { selector, attempt },
+      () => waitForElement(page, resolved, attempt === 0 ? 10_000 : 4_000)
+    );
     if (!found) {
       lastError = new Error(`Element not found for typing: ${selector} (resolved: ${resolved})`);
       if (attempt < TYPE_MAX_RETRIES) {
@@ -1090,7 +1116,9 @@ export async function type(
     try {
       // Focus the element first to ensure it's interactable
       try { await locator.first().focus({ timeout: 2_000 }); } catch { /* best effort */ }
-      await locator.first().fill(text);
+      await profiler.span("browser", "type.fill", { selector, attempt }, () =>
+        locator.first().fill(text)
+      );
       return; // success
     } catch (typeErr) {
       const msg = typeErr instanceof Error ? typeErr.message : String(typeErr);
@@ -1117,8 +1145,9 @@ export async function screenshot(
   session: ProbeBrowserSession
 ): Promise<Buffer> {
   const page = await getDefaultPage(session);
-  const buffer = await page.screenshot({ type: "png" });
-  return buffer;
+  return profiler.span("browser", "screenshot", undefined, () =>
+    page.screenshot({ type: "png" })
+  );
 }
 
 /**
@@ -1128,7 +1157,7 @@ export async function getDomContent(
   session: ProbeBrowserSession
 ): Promise<string> {
   const page = await getDefaultPage(session);
-  return page.content();
+  return profiler.span("browser", "dom.content", undefined, () => page.content());
 }
 
 /**
@@ -1157,10 +1186,12 @@ export async function closeBrowserSession(
   // also retried/cleaned up at investigation level, so a timeout here only
   // means we stop waiting, not that the browser leaks indefinitely).
   try {
-    await Promise.race([
-      session.session.close(),
-      new Promise((resolve) => setTimeout(resolve, 10_000)),
-    ]);
+    await profiler.span("browser", "solari.closeSession", { probeSessionId: session.probeSessionId }, () =>
+      Promise.race([
+        session.session.close(),
+        new Promise((resolve) => setTimeout(resolve, 10_000)),
+      ])
+    );
   } catch (e) {
     console.error(
       `Error closing browser for session ${session.probeSessionId}:`,
@@ -1180,20 +1211,61 @@ export async function closeBrowserSession(
  * Get recording replay data (async upload after release).
  * Polls for up to 30 seconds.
  */
+/**
+ * Get recording replay data (async upload after release).
+ *
+ * Solari's documented contract: the replay becomes available "~1-3s after
+ * `releaseAndWait`" (@solarisdk/browser sessions resource). Measured live
+ * behavior (2026-09 replay diagnostic + profiling run inv_1789130322975):
+ * when a replay never materializes, EVERY attempt returns 404 — polling for
+ * 30s per experiment (10 × 3s) only burned ~75% of investigation runtime
+ * waiting for something that provably does not exist.
+ *
+ * Strategy (bounded, 404-aware):
+ * - Wait `delayMs` (default 2s ≈ the documented finalization window) after
+ *   release, then attempt.
+ * - HTTP 404/410 means PERMANENT absence (replay-url endpoint responds 404
+ *   both before and long after release) — stop immediately, do not retry.
+ * - Other errors (network/5xx) are transient — retry up to `maxAttempts`.
+ *
+ * Returns null when the replay is unavailable; callers must treat replay as
+ * optional evidence and record its absence, never block on it.
+ */
 export async function getReplay(
   solariSessionId: string,
-  maxAttempts = 10,
-  delayMs = 3000
+  maxAttempts = 2,
+  delayMs = 2000
 ): Promise<Uint8Array | null> {
   const solari = getBrowserSolari();
+  if (delayMs > 0) {
+    await new Promise((r) => setTimeout(r, delayMs)); // documented finalization window
+  }
   for (let i = 0; i < maxAttempts; i++) {
-    await new Promise((r) => setTimeout(r, delayMs));
     try {
-      const blob = await solari.sessions.downloadReplay(solariSessionId);
+      const blob = await profiler.span(
+        "browser",
+        "replay.download",
+        { attempt: i + 1 },
+        () => solari.sessions.downloadReplay(solariSessionId)
+      );
       return blob;
-    } catch {
-      // 404 = not uploaded yet, keep trying
-      continue;
+    } catch (err) {
+      const status = (err as { status?: number }).status;
+      const permanent = status === 404 || status === 410;
+      if (i + 1 < maxAttempts && !permanent) {
+        profiler.recordRetry("solari", "replay.download", `transient error (status ${status ?? "unknown"})`, delayMs, i + 1);
+        await new Promise((r) => setTimeout(r, delayMs));
+        continue;
+      }
+      if (!permanent) {
+        console.warn(
+          `[replay] download failed for session ${solariSessionId.slice(0, 12)}… after ${maxAttempts} attempt(s): ${
+            err instanceof Error ? err.message.slice(0, 120) : err
+          }`
+        );
+      }
+      // 404/410 or retries exhausted — permanent absence; caller records it.
+      return null;
     }
   }
   return null;

@@ -34,6 +34,7 @@ import type { StoredUser } from "../persistence/types.js";
 import { type DurableBackend, type RawDocumentPersistence } from "../persistence/types.js";
 import { memoryUsers, clearMemoryUsersForTest } from "../persistence/memory.js";
 import { setDurableBackend, getDurableBackendSync } from "../persistence/index.js";
+import { profiler } from "../profiler/index.js";
 
 function generateId(prefix: string): string {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -75,7 +76,10 @@ const durableChains = new Map<string, Promise<void>>();
  */
 function persist(collection: string, op: () => Promise<void>): void {
   const prev = durableChains.get(collection) ?? Promise.resolve();
-  const next = prev.then(op, op);
+  const wrapped = async () => {
+    await profiler.span("db", `mongo.upsert:${collection}`, { collection }, op);
+  };
+  const next = prev.then(wrapped, wrapped);
   durableChains.set(
     collection,
     next.then(

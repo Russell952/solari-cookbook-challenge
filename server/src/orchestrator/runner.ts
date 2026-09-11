@@ -37,6 +37,7 @@ import {
   captureActionTrace,
   captureRepositoryEvidence,
   captureReplay,
+  captureReplayUnavailable,
   captureEvidence,
 } from "../evidence/index.js";
 import * as budget from "./budget.js";
@@ -44,6 +45,33 @@ import { emit } from "../api/events.js";
 import { setAiRequestRecorder, estimatePromptTokens } from "../ai/openai.js";
 import { validateApplicationUrl } from "../security/url-validation.js";
 import { config } from "../config/index.js";
+import { profiler, isProfilingEnabled } from "../profiler/index.js";
+
+/**
+ * Snapshot the runtime budget into the profiler at phase/action boundaries.
+ * No-op unless PROBE_PROFILE=1.
+ */
+function profileBudgetSnapshot(investigationId: string, note: string): void {
+  if (!isProfilingEnabled()) return;
+  const b = budget.getBudget(investigationId);
+  const startedAtMs = budget.runtimeStartedAtOf(investigationId);
+  const elapsed = startedAtMs !== undefined ? Date.now() - startedAtMs : 0;
+  profiler.recordBudget({
+    phase: note,
+    investigationId,
+    configuredRuntimeMs: b.maxRuntimeMs,
+    runtimeStartedAt: startedAtMs !== undefined ? new Date(startedAtMs).toISOString() : null,
+    elapsedMs: elapsed,
+    remainingMs: budget.remainingRuntime(investigationId),
+    clockRunning: budget.isRuntimeClockRunning(investigationId),
+    usedExperiments: b.usedExperiments,
+    usedBrowserActions: b.usedBrowserActions,
+    usedSandboxCommands: b.usedSandboxCommands,
+    usedAiCalls: b.usedAiCalls,
+    usedAiTokens: b.usedAiTokens,
+    usedVerificationExperiments: b.usedVerificationExperiments,
+  });
+}
 
 let ai: AIAdapter | null = null;
 
@@ -213,6 +241,13 @@ function advancePhase(investigation: Investigation, to: InvestigationPhase): Inv
   checkpointPhaseStats(investigation.id);
   checkpointBudgetUsage(investigation.id);
   emit("phase_change", investigation.id, { phase: to });
+  // Profiling: close the previous phase span (delta timing), open the new one, snapshot budget.
+  if (isProfilingEnabled()) {
+    profiler.beginPhase(to, { from: investigation.currentPhase });
+    profiler.popContext(); // drop previous phase context
+    profiler.pushContext({ phase: to });
+    profileBudgetSnapshot(investigation.id, `phase→${to}`);
+  }
   return updated;
 }
 
@@ -268,10 +303,14 @@ async function performRepositoryRecon(investigation: Investigation): Promise<Rep
   let session: Awaited<ReturnType<typeof sandbox.createSandboxSession>> | null = null;
 
   try {
-    session = await sandbox.createSandboxSession(investigation.id, { timeoutMs: 3 * 60_000 });
+    session = await profiler.span("sandbox", "sandbox.create", undefined, () =>
+      sandbox.createSandboxSession(investigation.id, { timeoutMs: 3 * 60_000 })
+    );
 
     // Clone the repository
-    const cloneResult = await sandbox.cloneRepository(session, investigation.repositoryUrl);
+    const cloneResult = await profiler.span("sandbox", "git.clone", { url: investigation.repositoryUrl }, () =>
+      sandbox.cloneRepository(session!, investigation.repositoryUrl)
+    );
     if (cloneResult.exitCode !== 0) {
       const errorMsg = `Repository clone failed (exit ${cloneResult.exitCode}): ${cloneResult.output.slice(0, 500)}`;
       console.error(`[${investigation.id}] ${errorMsg}`);
@@ -292,11 +331,11 @@ async function performRepositoryRecon(investigation: Investigation): Promise<Rep
 
     // Read key files
     let readme: string | null = null;
-    try { readme = await sandbox.readFile(session, "/workspace/repo/README.md"); } catch { /* no readme */ }
+    try { readme = await profiler.span("sandbox", "sandbox.readFile", { path: "/workspace/repo/README.md" }, () => sandbox.readFile(session!, "/workspace/repo/README.md")); } catch { /* no readme */ }
 
     let packageJson: Record<string, unknown> | null = null;
     try {
-      const raw = await sandbox.readFile(session, "/workspace/repo/package.json");
+      const raw = await profiler.span("sandbox", "sandbox.readFile", { path: "/workspace/repo/package.json" }, () => sandbox.readFile(session!, "/workspace/repo/package.json"));
       packageJson = JSON.parse(raw);
     } catch { /* no package.json */ }
 
@@ -330,7 +369,7 @@ async function performRepositoryRecon(investigation: Investigation): Promise<Rep
     } catch { /* not python with pyproject */ }
 
     // List source directories
-    const rootFiles = await sandbox.listDirectory(session, "/workspace/repo");
+    const rootFiles = await profiler.span("sandbox", "sandbox.listDirectory", undefined, () => sandbox.listDirectory(session!, "/workspace/repo"));
     const sourceDirectories = rootFiles.filter((f) =>
       ["src", "lib", "app", "pages", "components", "server", "client", "api"].includes(f)
     );
@@ -381,19 +420,25 @@ async function performRepositoryRecon(investigation: Investigation): Promise<Rep
     };
   } finally {
     if (session) {
-      await sandbox.destroySandbox(session);
+      await profiler.span("sandbox", "sandbox.destroy", undefined, () => sandbox.destroySandbox(session!));
     }
   }
 }
 
 async function performApplicationRecon(investigation: Investigation): Promise<ApplicationRecon> {
-  const session = await browser.createBrowserSession(investigation.id, { recording: true });
+  const session = await profiler.span("browser", "browser.launch.recon", undefined, () =>
+    browser.createBrowserSession(investigation.id, { recording: true })
+  );
 
   try {
-    const nav = await browser.navigate(session, investigation.applicationUrl);
+    const nav = await profiler.span("browser", "navigate", { url: investigation.applicationUrl, context: "recon" }, () =>
+      browser.navigate(session, investigation.applicationUrl)
+    );
 
     // Take screenshot
-    const screenshotBuffer = await browser.screenshot(session);
+    const screenshotBuffer = await profiler.span("browser", "screenshot", { context: "recon" }, () =>
+      browser.screenshot(session)
+    );
     const screenshotBase64 = screenshotBuffer.toString("base64");
 
     // Extract visible elements
@@ -435,7 +480,8 @@ async function performApplicationRecon(investigation: Investigation): Promise<Ap
     // Extract structured interactable elements with CSS selectors
     let interactableElements: ApplicationRecon["interactableElements"] = [];
     try {
-      interactableElements = await browser.evaluate(session, `
+      interactableElements = await profiler.span("browser", "evaluate.interactableElements", undefined, async () =>
+        (await browser.evaluate(session, `
         (() => {
           const results = [];
 
@@ -576,7 +622,8 @@ async function performApplicationRecon(investigation: Investigation): Promise<Ap
 
           return results.slice(0, 50);
         })()
-      `) as ApplicationRecon["interactableElements"];
+      `)) as ApplicationRecon["interactableElements"]
+    );
     } catch { /* no interactable elements */ }
 
     return {
@@ -591,7 +638,9 @@ async function performApplicationRecon(investigation: Investigation): Promise<Ap
       interactableElements,
     };
   } finally {
-    await browser.closeBrowserSession(session);
+    await profiler.span("browser", "browser.close.recon", undefined, () =>
+      browser.closeBrowserSession(session)
+    );
   }
 }
 
@@ -647,6 +696,15 @@ async function runExperiment(investigation: Investigation, experiment: Experimen
   assertNotStopped(investigation.id);
   if (isPaused(investigation.id)) return;
 
+  // Profiling: per-experiment span + context (all child spans attribute here).
+  const expHandle = profiler.begin("experiment", "experiment", {
+    experimentId: experiment.id,
+    sequence: experiment.sequence,
+    objective: experiment.objective,
+  });
+  profiler.pushContext({ experimentId: experiment.id });
+  profileBudgetSnapshot(investigation.id, `experiment-start #${experiment.sequence}`);
+
   emit("experiment_started", investigation.id, { experimentId: experiment.id, objective: experiment.objective });
   store.updateExperiment(experiment.id, { status: "running" });
   checkpointBudgetUsage(investigation.id);
@@ -660,7 +718,9 @@ async function runExperiment(investigation: Investigation, experiment: Experimen
     // Auto-launch browser session if any browser action is planned
     const needsBrowser = experiment.plannedActions.some(a => a.tool === "browser" && a.action !== "launch");
     if (needsBrowser) {
-      browserSession = await browser.createBrowserSession(investigation.id, { recording: true });
+      browserSession = await profiler.span("browser", "browser.launch", { experimentId: experiment.id }, () =>
+        browser.createBrowserSession(investigation.id, { recording: true })
+      );
     }
 
     // Apply viewport from the first action that specifies one
@@ -704,6 +764,12 @@ async function runExperiment(investigation: Investigation, experiment: Experimen
         completedAt: null,
       });
 
+      // Profiling: per-action span (browser/sandbox execution only).
+      const actionHandle = profiler.begin("action", `${planned.tool}.${planned.action}`, {
+        experimentId: experiment.id,
+        target: planned.target,
+      });
+
       emit("action_started", investigation.id, { actionId: action.id, action: planned.action });
 
       try {
@@ -739,11 +805,13 @@ async function runExperiment(investigation: Investigation, experiment: Experimen
         if (result.screenshot) {
           await captureScreenshot(investigation.id, experiment.id, result.screenshot);
         }
-        await captureActionTrace(investigation.id, experiment.id, {
-          action: planned.action,
-          target: planned.target,
-          result: result.data,
-        });
+        await profiler.span("evidence", "capture.action_trace", { type: "action_trace" }, () =>
+          captureActionTrace(investigation.id, experiment.id, {
+            action: planned.action,
+            target: planned.target,
+            result: result.data,
+          })
+        );
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
         store.updateAction(action.id, {
@@ -752,8 +820,10 @@ async function runExperiment(investigation: Investigation, experiment: Experimen
           completedAt: new Date().toISOString(),
         });
         emit("action_completed", investigation.id, { actionId: action.id, status: "failed", error: errorMsg });
+        actionHandle.end(false, { error: errorMsg, timedOut: /timeout|timed out/i.test(errorMsg) });
         throw error;
       }
+      actionHandle.end(true);
     }
 
     store.updateExperiment(experiment.id, {
@@ -775,22 +845,44 @@ async function runExperiment(investigation: Investigation, experiment: Experimen
       // session to still exist, only the session ID.
       const solariSessionId = browserSession.solariSessionId;
       const recordingEnabled = browserSession.recordingEnabled;
-      await browser.closeBrowserSession(browserSession);
+      await profiler.span("browser", "browser.close", undefined, () =>
+        browser.closeBrowserSession(browserSession!)
+      );
       browserSession = null;
 
       if (recordingEnabled) {
         try {
-          // Use getReplay()'s documented default poll window (10 × 3s ≈ 30s):
-          // Solari uploads the recording asynchronously after release, and a
-          // shorter window loses replays on every live run.
-          const replay = await browser.getReplay(solariSessionId);
+          // Bounded replay retrieval (see getReplay): one attempt after the
+          // documented ~1-3s finalization window, then a single transient
+          // retry. HTTP 404 = permanent absence — measured live, polling for
+          // 30s only ever returned 404, so we stop immediately.
+          const replay = await profiler.span("browser", "replay.download", { solariSessionId }, () =>
+            browser.getReplay(solariSessionId)
+          );
           if (replay && replay.byteLength > 0) {
             await captureReplay(investigation.id, experiment.id, replay, {
               solariSessionId,
             });
-          } else if (!replay) {
+          } else {
+            // Record the absence truthfully (no fabricated artifact bytes) so
+            // the evidence trail reflects what actually happened.
+            const reason =
+              replay === null ? ("not_generated" as const) : ("download_failed" as const);
+            await captureReplayUnavailable(investigation.id, experiment.id, {
+              solariSessionId,
+              reason,
+              detail:
+                reason === "not_generated"
+                  ? "Solari replay-url returned 404 after the documented finalization window (replay never generated for this session)"
+                  : "Replay download failed after bounded retries",
+            });
+            emit("evidence_captured", investigation.id, {
+              evidenceType: "replay",
+              replayAvailable: false,
+              experimentId: experiment.id,
+            });
             console.warn(
-              `[${investigation.id}] Replay not available for session ${solariSessionId} (not yet uploaded or recording unavailable)`
+              `[${investigation.id}] Replay unavailable for session ${solariSessionId.slice(0, 12)}… (404 — permanent absence, recorded as evidence metadata)`
             );
           }
         } catch (replayError) {
@@ -802,6 +894,10 @@ async function runExperiment(investigation: Investigation, experiment: Experimen
         }
       }
     }
+    // Profiling: close the per-experiment span and context.
+    expHandle.end(true);
+    profiler.popContext();
+    profileBudgetSnapshot(investigation.id, `experiment-end #${experiment.sequence}`);
   }
 }
 
@@ -1384,6 +1480,21 @@ export async function runInvestigation(
   if (!investigation) {
     // Never leave a concurrency slot behind for an unknown investigation.
     if (opts?.releaseSlotOnFinish) releaseSlot();
+
+    if (isProfilingEnabled()) {
+      try {
+        console.log(profiler.formatReport());
+        const fsMod = await import("node:fs");
+        const nodePath = await import("node:path");
+        const dir = process.env.PROBE_PROFILE_DIR ?? nodePath.join(process.cwd(), "profile-data");
+        fsMod.mkdirSync(dir, { recursive: true });
+        const file = nodePath.join(dir, `${investigationId}-${Date.now()}.profiling.json`);
+        fsMod.writeFileSync(file, JSON.stringify(profiler.buildReport(), null, 2));
+        console.log(`[profiler] full report written to ${file}`);
+      } catch (e) {
+        console.error("[profiler] failed to emit report:", e instanceof Error ? e.message : e);
+      }
+    }
     throw new Error(`Investigation ${investigationId} not found`);
   }
 
@@ -1422,6 +1533,14 @@ export async function runInvestigation(
 
   transitionStatus(investigation.status, "running");
   store.updateInvestigation(investigationId, { status: "running" });
+
+  // Profiling: reset the recorder for this run, open the root phase span.
+  if (isProfilingEnabled()) {
+    profiler.reset();
+    profiler.pushContext({ investigationId });
+    profiler.beginPhase(investigation.currentPhase, { runStart: true });
+    profileBudgetSnapshot(investigationId, `run-start (budget=${config.maxRuntimeMs}ms)`);
+  }
 
   // Runtime-expiry accounting: isExpired() derives remaining time from the
   // runtime clock (startRuntimeClock) — no interval needed. The clock is the

@@ -13,6 +13,7 @@ import {
   captureActionTrace,
   captureEvidence,
   captureReplay,
+  captureReplayUnavailable,
   getEvidenceContent,
 } from "../evidence/index.js";
 
@@ -296,5 +297,27 @@ describe("replay wiring through getReplay", () => {
     const { buffer, hashVerified } = await getEvidenceContent(ev);
     expect(buffer!.equals(Buffer.from(replayBytes))).toBe(true);
     expect(hashVerified).toBe(true);
+  });
+
+  it("replay ABSENCE is recorded truthfully with no fabricated artifact bytes", async () => {
+    // Regression for the replay bottleneck fix: when Solari's replay-url
+    // endpoint 404s permanently, Probe records an evidence entry stating the
+    // replay is unavailable — with NO artifact bytes and no fake content.
+    const invId = createInvestigation();
+    const ev = await captureReplayUnavailable(invId, "exp_404", {
+      solariSessionId: "solari-session-404",
+      reason: "not_generated",
+      detail: "Solari replay-url returned 404 after the documented finalization window",
+    });
+
+    expect(ev.type).toBe("replay");
+    expect(ev.metadata.replayAvailable).toBe(false);
+    expect(ev.metadata.replayUnavailableReason).toBe("not_generated");
+    expect(ev.metadata.solariSessionId).toBe("solari-session-404");
+    // No artifact was persisted — content endpoint must not serve bytes.
+    expect(ev.metadata.artifactAvailable).toBe(false);
+    expect(ev.contentHash).toBe("");
+    const { buffer } = await getEvidenceContent(ev);
+    expect(buffer).toBeNull();
   });
 });

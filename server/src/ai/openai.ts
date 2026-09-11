@@ -53,6 +53,7 @@ import type {
 // Default ~220000 leaves ~40k headroom below the 262144 model limit.
 
 import { config } from "../config/index.js";
+import { profiler } from "../profiler/index.js";
 
 const RAW_CONTEXT_BUDGET_TOKENS = parseInt(process.env.PROBE_AI_CONTEXT_BUDGET || "220000", 10);
 if (!Number.isFinite(RAW_CONTEXT_BUDGET_TOKENS) || RAW_CONTEXT_BUDGET_TOKENS < 1000) {
@@ -219,9 +220,28 @@ export function enforceContextBudget(
 ): string {
   let current = text;
   const maxAttempts = 6;
+  const t0 = Date.now();
+  const estBefore = estimatePromptTokens(text);
+  const bytesBefore = Buffer.byteLength(text);
+  const recordIfCompacted = (): void => {
+    // Profiling: record whenever a compact pass actually changed the text.
+    if (Buffer.byteLength(current) !== bytesBefore) {
+      profiler.recordCompaction({
+        op: label,
+        bytesBefore,
+        bytesAfter: Buffer.byteLength(current),
+        estTokensBefore: estBefore,
+        estTokensAfter: estimatePromptTokens(current),
+        durationMs: Date.now() - t0,
+      });
+    }
+  };
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    if (estimatePromptTokens(current) <= maxTokens) return current;
+    if (estimatePromptTokens(current) <= maxTokens) {
+      recordIfCompacted();
+      return current;
+    }
 
     // Compact pass: trim the tail of the longest line (largest metadata
     // block) until we fit or the skeleton is reached.
@@ -234,7 +254,10 @@ export function enforceContextBudget(
     current = lines.join("\n");
   }
 
-  if (estimatePromptTokens(current) <= maxTokens) return current;
+  if (estimatePromptTokens(current) <= maxTokens) {
+    recordIfCompacted();
+    return current;
+  }
 
   // Hard guarantee: iterative head-keeping truncation to the exact token
   // budget. Current objective/experiment/observation live at the top of every
@@ -259,6 +282,7 @@ export function enforceContextBudget(
       `PROBE_AI_CONTEXT_BUDGET is misconfigured; set it to a value well below the model context limit.`
     );
   }
+  recordIfCompacted();
   return current;
 }
 
@@ -695,6 +719,26 @@ export function setAiBudgetGuards(guards: AiBudgetGuards | null): void {
   budgetGuards = guards;
 }
 
+/**
+ * Derive a stable per-operation label for profiling from the system prompt's
+ * role opener. Every adapter method starts with a distinctive "You are a …"
+ * sentence, so this maps each AI call to its logical operation (planning,
+ * analysis, hypothesis, verification, evaluation, continuation, report)
+ * without touching any prompt content or call sites.
+ */
+function aiOpLabel(systemPrompt: string): string {
+  const head = systemPrompt.slice(0, 120).toLowerCase();
+  if (head.includes("investigation planner")) return "ai.plan";
+  if (head.includes("software analyst")) return "ai.analyzeRepository";
+  if (head.includes("behavior analyst")) return "ai.analyzeObservation";
+  if (head.includes("software investigator")) return "ai.generateHypothesis";
+  if (head.includes("verification designer")) return "ai.designVerification";
+  if (head.includes("evidence evaluator")) return "ai.evaluateEvidence";
+  if (head.includes("deciding whether to continue")) return "ai.decideNextStep";
+  if (head.includes("report generator")) return "ai.generateReport";
+  return "ai.request";
+}
+
 async function chat(systemPrompt: string, userPrompt: string): Promise<string> {
   // ── Budget gate (before ANY request) ──────────────────────────────────
   // No model request may start when the AI-call budget, the AI-token
@@ -718,7 +762,19 @@ async function chat(systemPrompt: string, userPrompt: string): Promise<string> {
 
   // Final pre-request guard (hard safety): no model request ever leaves this
   // function with a prompt over the configured context budget.
+  const tFit = Date.now();
   const boundedUserPrompt = fitUserPromptToBudget(systemPrompt, userPrompt);
+  const fitMs = Date.now() - tFit;
+  const handle = profiler.begin("ai", aiOpLabel(systemPrompt), {
+    model: config.aiModel,
+    systemBytes: Buffer.byteLength(systemPrompt),
+    userBytesOriginal: Buffer.byteLength(userPrompt),
+    requestBytes: Buffer.byteLength(systemPrompt) + Buffer.byteLength(boundedUserPrompt),
+    estInputTokens:
+      estimatePromptTokens(systemPrompt) + estimatePromptTokens(boundedUserPrompt),
+    fitMs,
+  });
+  let retries = 0;
   let lastError: Error | undefined;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     // Count this actual upstream model request before sending it. Retries
@@ -763,10 +819,13 @@ async function chat(systemPrompt: string, userPrompt: string): Promise<string> {
       if (abort.signal.aborted) {
         const remaining = guard ? guard.remainingRuntimeMs() : 0;
         if (remaining <= 0) {
+          handle.end(false, { retries, error: "Investigation runtime expired during AI request", timedOut: true });
           throw new AiBudgetExhaustedError("runtime", "Investigation runtime expired during AI request");
         }
+        handle.end(false, { retries, error: `AI API timeout after ${timeoutMs}ms`, timedOut: true });
         throw new Error(`AI API timeout after ${timeoutMs}ms (bounded by investigation deadline)`);
       }
+      handle.end(false, { retries, error: err instanceof Error ? err.message.slice(0, 300) : String(err) });
       throw err;
     } finally {
       clearTimeout(timer);
@@ -791,7 +850,15 @@ async function chat(systemPrompt: string, userPrompt: string): Promise<string> {
 
     if (res.ok && !isBodyError) {
       const data = rawBody as { choices: { message: { content: string } }[] };
-      return data.choices[0].message.content;
+      const content = data.choices[0].message.content;
+      const usage = (rawBody as { usage?: { prompt_tokens?: number; completion_tokens?: number } }).usage;
+      handle.end(true, {
+        retries,
+        estOutputTokens: estimatePromptTokens(content),
+        usagePromptTokens: usage?.prompt_tokens,
+        usageCompletionTokens: usage?.completion_tokens,
+      });
+      return content;
     }
 
     // Determine the effective error status: body-level errors override HTTP 200
@@ -805,12 +872,17 @@ async function chat(systemPrompt: string, userPrompt: string): Promise<string> {
       const delay = RETRY_DELAY_MS[attempt] ?? 10000;
       console.warn(`AI API ${errorStatus}, retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})...`);
       lastError = new Error(`AI API error: ${res.status} ${bodyStr.slice(0, 200)}`);
+      profiler.recordRetry("ai", "ai.request", `HTTP ${errorStatus}`, delay, attempt + 1);
+      retries += 1;
+      handle.annotate({ retries });
       await new Promise((r) => setTimeout(r, delay));
       continue;
     }
 
+    handle.end(false, { retries, error: `AI API error ${res.status}: ${bodyStr.slice(0, 200)}` });
     throw new Error(`AI API error: ${res.status} ${bodyStr.slice(0, 200)}`);
   }
+  handle.end(false, { retries, error: lastError?.message?.slice(0, 300) ?? "all retries exhausted" });
   throw lastError ?? new Error("AI API: all retries exhausted");
 }
 
@@ -833,6 +905,7 @@ async function chatWithValidation<T>(
       const isRetryable = err.message?.startsWith("AI response:") || err.message?.includes("JSON");
       if (isRetryable && i < retries) {
         console.warn(`Validation failed (attempt ${i + 1}/${retries + 1}), retrying: ${err.message.slice(0, 80)}`);
+        profiler.recordRetry("ai-validation", "chatWithValidation", err.message?.slice(0, 200) ?? "parse/validation failure", 1000, i + 1);
         await new Promise((r) => setTimeout(r, 1000));
         continue;
       }

@@ -34,6 +34,7 @@
 import { Sandbox } from "@solarisdk/sdk";
 import { getSdkClient } from "./client.js";
 import { store } from "../store/index.js";
+import { profiler } from "../profiler/index.js";
 import { isSafeReadOnlyArg } from "../orchestrator/action-allowlist.js";
 
 // ── Security: valid URL patterns for repository cloning ────────────────────
@@ -118,10 +119,16 @@ export async function createSandboxSession(
   opts?: { timeoutMs?: number; template?: string }
 ): Promise<SandboxSession> {
   const client = getSdkClient();
-  const sandbox = await client.sandboxes.create({
-    template: opts?.template ?? "base",
-    timeoutMs: opts?.timeoutMs ?? 5 * 60_000,
-  });
+  const sandbox = await profiler.span(
+    "sandbox",
+    "sandbox.create",
+    { template: opts?.template ?? "base" },
+    () =>
+      client.sandboxes.create({
+        template: opts?.template ?? "base",
+        timeoutMs: opts?.timeoutMs ?? 5 * 60_000,
+      })
+  );
 
   const probeSessionId = `ssess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -190,7 +197,12 @@ export async function runCommand(
     }
   }
 
-  const result = await session.sandbox.commands.run(command, { args });
+  const result = await profiler.span(
+    "sandbox",
+    "sandbox.runCommand",
+    { command },
+    () => session.sandbox.commands.run(command, { args })
+  );
   return {
     exitCode: result.exitCode,
     stdout: result.stdout,
@@ -301,7 +313,9 @@ export async function cloneRepository(
 export async function destroySandbox(session: SandboxSession): Promise<void> {
   let killed = false;
   try {
-    await session.sandbox.kill();
+    await profiler.span("sandbox", "sandbox.destroy", { probeSessionId: session.probeSessionId }, () =>
+      session.sandbox.kill()
+    );
     killed = true;
   } catch (e) {
     console.error(`Error destroying sandbox ${session.probeSessionId}:`, e);

@@ -17,6 +17,7 @@
 import { createHash, randomUUID } from "crypto";
 import { join } from "path";
 import { store } from "../store/index.js";
+import { profiler } from "../profiler/index.js";
 import {
   getArtifactStore,
   extensionFor,
@@ -57,10 +58,12 @@ export interface CaptureEvidenceOpts {
 export async function captureEvidence(opts: CaptureEvidenceOpts): Promise<Evidence> {
   const evidenceId = opts.evidenceId ?? randomUUID();
   const artifactStore = getArtifactStore();
+  const handle = profiler.begin("evidence", "capture", { type: opts.type });
   let artifact: StoredArtifact | null = null;
 
   if (opts.content !== undefined) {
     try {
+      const tSha0 = Date.now();
       artifact = await artifactStore.save({
         evidenceId,
         investigationId: opts.investigationId,
@@ -68,7 +71,16 @@ export async function captureEvidence(opts: CaptureEvidenceOpts): Promise<Eviden
         evidenceType: opts.type,
         content: opts.content,
       });
+      handle.annotate({
+        storageMs: Date.now() - tSha0,
+        bytes: artifact?.byteSize ?? Buffer.byteLength(opts.content),
+      });
     } catch (error) {
+      handle.annotate({
+        storageMs: 0,
+        bytes: opts.content === undefined ? 0 : Buffer.byteLength(opts.content),
+        error: error instanceof Error ? error.message.slice(0, 200) : String(error),
+      });
       console.error(
         `Evidence artifact persistence failed (${opts.type}, evidence ${evidenceId}):`,
         error instanceof Error ? error.message : error
@@ -98,6 +110,7 @@ export async function captureEvidence(opts: CaptureEvidenceOpts): Promise<Eviden
       : {}),
   };
 
+  handle.end(true);
   return store.createEvidence({
     id: evidenceId,
     investigationId: opts.investigationId,
@@ -167,6 +180,39 @@ export async function captureReplay(
       ...metadata,
       format: "rrweb",
       sizeBytes: content.length,
+    },
+  });
+}
+
+/**
+ * Record that a session replay is UNAVAILABLE for an experiment.
+ *
+ * Evidence integrity rule: the record states exactly what happened — replay
+ * absence, the reason, and how hard Probe tried — with NO artifact bytes and
+ * no fabricated content. `artifactAvailable` is false and `contentHash` is
+ * empty, so the record can never be mistaken for a stored replay artifact.
+ * Existing evidence (screenshots, action traces, logs) is untouched and
+ * finding confirmation still requires actual supporting evidence.
+ */
+export async function captureReplayUnavailable(
+  investigationId: string,
+  experimentId: string,
+  info: {
+    solariSessionId: string;
+    reason: "not_generated" | "not_ready" | "download_failed";
+    detail: string;
+  }
+): Promise<Evidence> {
+  return captureEvidence({
+    investigationId,
+    experimentId,
+    type: "replay",
+    metadata: {
+      solariSessionId: info.solariSessionId,
+      replayAvailable: false,
+      replayUnavailableReason: info.reason,
+      replayUnavailableDetail: info.detail.slice(0, 300),
+      format: "rrweb",
     },
   });
 }

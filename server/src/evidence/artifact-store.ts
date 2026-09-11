@@ -22,6 +22,7 @@ import {
   DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
 import { config, isB2Configured } from "../config/index.js";
+import { profiler } from "../profiler/index.js";
 
 /** File extension + MIME per evidence type. Replay is rrweb NDJSON, NOT video/webm. */
 export const EXT_BY_TYPE: Record<string, { ext: string; mime: string }> = {
@@ -106,25 +107,45 @@ export class LocalArtifactStore implements ArtifactStore {
     evidenceType: string;
     content: string | Buffer;
   }): Promise<StoredArtifact> {
-    const buffer = Buffer.isBuffer(opts.content) ? opts.content : Buffer.from(opts.content, "utf-8");
-    const { ext, mime } = EXT_BY_TYPE[opts.evidenceType] ?? DEFAULT_EXT;
-    const dir = join(evidenceRoot(), opts.investigationId);
-    await mkdir(dir, { recursive: true });
-    const filePath = join(dir, `${opts.evidenceId}.${ext}`);
-    await writeFile(filePath, buffer);
-    const artifact: StoredArtifact = {
-      evidenceId: opts.evidenceId,
-      investigationId: opts.investigationId,
-      experimentId: opts.experimentId ?? null,
-      evidenceType: opts.evidenceType,
-      mimeType: mime,
-      byteSize: buffer.length,
-      sha256: fullSha256(buffer),
-      storagePath: filePath,
-      createdAt: new Date().toISOString(),
-    };
-    await upsertArtifactIndex(artifact);
-    return artifact;
+    const handle = profiler.begin("evidence", "artifact.save.local", { bytes: Buffer.isBuffer(opts.content) ? opts.content.length : Buffer.byteLength(opts.content) });
+    try {
+      const buffer = Buffer.isBuffer(opts.content) ? opts.content : Buffer.from(opts.content, "utf-8");
+      const { ext, mime } = EXT_BY_TYPE[opts.evidenceType] ?? DEFAULT_EXT;
+      const dir = join(evidenceRoot(), opts.investigationId);
+      const filePath = join(dir, `${opts.evidenceId}.${ext}`);
+      const tSha = Date.now();
+      const sha = fullSha256(buffer);
+      const shaMs = Date.now() - tSha;
+      const tStore = Date.now();
+      await mkdir(dir, { recursive: true });
+      await writeFile(filePath, buffer);
+      await upsertArtifactIndex({
+        evidenceId: opts.evidenceId,
+        investigationId: opts.investigationId,
+        experimentId: opts.experimentId ?? null,
+        evidenceType: opts.evidenceType,
+        mimeType: mime,
+        byteSize: buffer.length,
+        sha256: sha,
+        storagePath: filePath,
+        createdAt: new Date().toISOString(),
+      });
+      handle.end(true, { shaMs, storageMs: Date.now() - tStore });
+      return {
+        evidenceId: opts.evidenceId,
+        investigationId: opts.investigationId,
+        experimentId: opts.experimentId ?? null,
+        evidenceType: opts.evidenceType,
+        mimeType: mime,
+        byteSize: buffer.length,
+        sha256: sha,
+        storagePath: filePath,
+        createdAt: new Date().toISOString(),
+      };
+    } catch (err) {
+      handle.end(false, { error: err instanceof Error ? err.message : String(err) });
+      throw err;
+    }
   }
 
   async read(artifact: StoredArtifact): Promise<Buffer | null> {
@@ -263,37 +284,50 @@ export class B2ArtifactStore implements ArtifactStore {
     evidenceType: string;
     content: string | Buffer;
   }): Promise<StoredArtifact> {
-    const buffer = Buffer.isBuffer(opts.content) ? opts.content : Buffer.from(opts.content, "utf-8");
-    const { ext, mime } = EXT_BY_TYPE[opts.evidenceType] ?? DEFAULT_EXT;
-    const key = this.objectKey(opts.investigationId, opts.evidenceId, ext);
-    await this.client.send(
-      new PutObjectCommand({
-        Bucket: this.bucketName,
-        Key: key,
-        Body: buffer,
-        ContentType: mime,
-        // Explicitly private: B2 private buckets ignore this, but stating it
-        // documents intent and fails safe if the bucket is ever misconfigured.
-        ACL: "private",
-      })
-    );
-    return {
-      evidenceId: opts.evidenceId,
-      investigationId: opts.investigationId,
-      experimentId: opts.experimentId ?? null,
-      evidenceType: opts.evidenceType,
-      mimeType: mime,
-      byteSize: buffer.length,
-      sha256: fullSha256(buffer),
-      storagePath: key, // object key — persisted in evidence metadata
-      createdAt: new Date().toISOString(),
-    };
+    const handle = profiler.begin("evidence", "artifact.save.b2", { bytes: Buffer.isBuffer(opts.content) ? opts.content.length : Buffer.byteLength(opts.content) });
+    try {
+      const buffer = Buffer.isBuffer(opts.content) ? opts.content : Buffer.from(opts.content, "utf-8");
+      const { ext, mime } = EXT_BY_TYPE[opts.evidenceType] ?? DEFAULT_EXT;
+      const key = this.objectKey(opts.investigationId, opts.evidenceId, ext);
+      const tSha = Date.now();
+      const sha = fullSha256(buffer);
+      const shaMs = Date.now() - tSha;
+      const tStore = Date.now();
+      await this.client.send(
+        new PutObjectCommand({
+          Bucket: this.bucketName,
+          Key: key,
+          Body: buffer,
+          ContentType: mime,
+          // Explicitly private: B2 private buckets ignore this, but stating it
+          // documents intent and fails safe if the bucket is ever misconfigured.
+          ACL: "private",
+        })
+      );
+      handle.end(true, { shaMs, storageMs: Date.now() - tStore });
+      return {
+        evidenceId: opts.evidenceId,
+        investigationId: opts.investigationId,
+        experimentId: opts.experimentId ?? null,
+        evidenceType: opts.evidenceType,
+        mimeType: mime,
+        byteSize: buffer.length,
+        sha256: sha,
+        storagePath: key, // object key — persisted in evidence metadata
+        createdAt: new Date().toISOString(),
+      };
+    } catch (err) {
+      handle.end(false, { error: err instanceof Error ? err.message : String(err) });
+      throw err;
+    }
   }
 
   async read(artifact: StoredArtifact): Promise<Buffer | null> {
     try {
-      const res = await this.client.send(
-        new GetObjectCommand({ Bucket: this.bucketName, Key: artifact.storagePath })
+      const res = await profiler.span("evidence", "artifact.read.b2", { key: artifact.storagePath }, () =>
+        this.client.send(
+          new GetObjectCommand({ Bucket: this.bucketName, Key: artifact.storagePath })
+        )
       );
       const bytes = await res.Body?.transformToByteArray();
       return bytes ? Buffer.from(bytes) : null;

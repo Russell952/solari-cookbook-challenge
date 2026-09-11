@@ -206,6 +206,11 @@ export function isRuntimeClockRunning(investigationId: string): boolean {
   return startedAtMs.has(investigationId);
 }
 
+/** The wall-clock origin timestamp of the runtime clock (undefined if not running). */
+export function runtimeStartedAtOf(investigationId: string): number | undefined {
+  return startedAtMs.get(investigationId);
+}
+
 export function isExpired(investigationId: string): boolean {
   return remainingRuntime(investigationId) <= 0;
 }

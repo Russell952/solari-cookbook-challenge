@@ -12,6 +12,7 @@ __pycache__/
 venv/
 screenshot.png
 server/data/
+profile-data/
 
 # Build output
 dist/

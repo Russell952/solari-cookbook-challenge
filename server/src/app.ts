@@ -14,7 +14,7 @@ import helmet from "helmet";
 import { config, isProduction } from "./config/index.js";
 import { apiRouter } from "./api/index.js";
 import { authRouter } from "./auth/routes.js";
-import { hasUserByIdSync } from "./auth/users.js";
+import { sessionUserExists, sessionUserExistsCached } from "./auth/users.js";
 import { requireAuth, setSessionUserChecker } from "./security/auth.js";
 import { generalLimiter } from "./security/rate-limit.js";
 import { safeUrlError } from "./security/url-validation.js";
@@ -95,8 +95,10 @@ export function buildApp(): express.Express {
   // ── Session-user lookup for cookie auth ─────────────────────────────
   // Injected here (module load time) so requireAuth can verify that a
   // session's `sub` refers to an existing user without a circular import.
-  // preloadUsers() in server.ts fills the cache before listening.
-  setSessionUserChecker(hasUserByIdSync);
+  // `sessionUserExists` is the async source of truth (Mongo/memory user
+  // store, indexed lookup); `sessionUserExistsCached` is a TTL-cache
+  // fast-path so most request paths never await I/O.
+  setSessionUserChecker(sessionUserExists, sessionUserExistsCached);
 
   // ── Body parsing ─────────────────────────────────────────────────────────
   app.use(express.json({ limit: config.bodyLimit }));

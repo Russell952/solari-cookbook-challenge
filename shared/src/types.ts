@@ -33,6 +33,14 @@ export interface Investigation {
   currentPhase: InvestigationPhase;
   createdAt: string;
   updatedAt: string;
+  /** The authenticated owner (user id) at creation time. Populated server-side. */
+  ownerId?: string;
+  /** Monotonic per-phase execution stats (see PhaseStat). */
+  phaseStats?: PhaseStat[];
+  /** Structured stop reason when the run ended without completing. */
+  failure?: InvestigationFailure | null;
+  /** Last checkpointed budget usage (restored on resume/retry). */
+  budgetUsage?: BudgetUsage | null;
 }
 
 export interface CreateInvestigationInput {
@@ -248,6 +256,8 @@ export type SSEEventType =
   | "phase_change"
   | "experiment_started"
   | "experiment_completed"
+  | "budget_warning"
+  | "checkpoint"
   | "action_started"
   | "action_completed"
   | "observation_recorded"
@@ -276,16 +286,77 @@ export interface BudgetConfig {
   maxAiCalls: number;
   /** Number of experiments reserved for hypothesis verification. */
   verificationReserve: number;
+  /**
+   * Hard ceiling on estimated AI input tokens per investigation.
+   * Distinct from maxAiCalls: a few huge requests should exhaust the token
+   * budget even when the call count is not yet spent.
+   */
+  maxAiTokens: number;
 }
 
 export interface Budget extends BudgetConfig {
   usedExperiments: number;
   usedBrowserActions: number;
   usedSandboxCommands: number;
+  /**
+   * Legacy accumulated-elapsed field, retained for API compatibility.
+   * Runtime accounting now derives from the runtime clock start timestamp —
+   * elapsed time is never accumulated into this counter (double-counting
+   * used to expire investigations at ~half the configured budget).
+   */
   usedRuntime: number;
   usedAiCalls: number;
+  /** Cumulative estimated AI input tokens charged to this investigation. */
+  usedAiTokens: number;
   /** Number of verification experiments actually used. */
   usedVerificationExperiments: number;
+}
+
+/**
+ * Per-phase execution statistics recorded by the orchestrator.
+ * One entry per phase transition into a phase; endedAt/durationMs close the
+ * entry when the phase completes. AI/browser counters are per phase.
+ */
+export interface PhaseStat {
+  phase: InvestigationPhase;
+  startedAt: string;
+  endedAt: string | null;
+  durationMs: number | null;
+  aiCalls: number;
+  aiInputTokens: number;
+  experiments: number;
+  browserActions: number;
+}
+
+/** Point-in-time budget consumption checkpoint (persisted for resumability). */
+export interface BudgetUsage {
+  usedExperiments: number;
+  usedBrowserActions: number;
+  usedSandboxCommands: number;
+  usedAiCalls: number;
+  usedAiTokens: number;
+  usedVerificationExperiments: number;
+  /** ISO timestamp when the wall-clock runtime clock started (monotonic origin). */
+  runtimeStartedAt: string | null;
+}
+
+/** Why an investigation stopped without completing (structured, not generic). */
+export type InvestigationFailureReason =
+  | "runtime_expired"
+  | "ai_call_budget_exhausted"
+  | "ai_token_budget_exhausted"
+  | "experiment_budget_exhausted"
+  | "action_budget_exhausted"
+  | "analysis_budget_exhausted"
+  | "cancelled"
+  | "error";
+
+export interface InvestigationFailure {
+  reason: InvestigationFailureReason;
+  /** Human-readable detail safe to show in the UI (no secrets). */
+  message: string;
+  phase: InvestigationPhase | null;
+  at: string;
 }
 
 // ── Recon Results ──────────────────────────────────────────────────────────

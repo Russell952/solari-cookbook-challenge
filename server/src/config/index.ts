@@ -80,14 +80,57 @@ export const config = {
   limits: {
     maxUrlLength: parseInt(process.env.PROBE_MAX_URL_LENGTH || "2048", 10),
     maxObjectiveLength: parseInt(process.env.PROBE_MAX_OBJECTIVE_LENGTH || "2000", 10),
-  },
-
-  /** Evidence artifact caps: per-artifact bytes and per-investigation total. */
+  },  /** Evidence artifact caps: per-artifact bytes and per-investigation total. */
   maxArtifactBytes: parseInt(process.env.PROBE_MAX_ARTIFACT_BYTES || String(20 * 1024 * 1024), 10),
   maxInvestigationArtifactBytes: parseInt(
-    process.env.PROBE_MAX_INVESTIGATION_ARTIFACT_BYTES || String(100 * 1024 * 1024), 10
+    process.env.PROBE_MAX_INVESTIGATION_ARTIFACT_BYTES || String(100 * 1024 * 1024),
+    10
   ),
+
+  // ── Durable persistence (production) ───────────────────────────────────
+  /**
+   * MongoDB connection string. When set, structured application state
+   * (users, investigations, experiments, observations, hypotheses, findings,
+   * evidence metadata, reports) is persisted durably; the in-memory store
+   * becomes a write-through cache. Unset keeps the fully in-memory behavior
+   * (local development and tests).
+   */
+  mongodbUri: process.env.MONGODB_URI || "",
+  mongodbDbName: process.env.MONGODB_DB_NAME || "probe",
+
+  // ── Evidence artifact storage (Backblaze B2) ──────────────────────────
+  /** B2 KeyID — the S3 access key id of the bucket-restricted application key. */
+  b2KeyId: process.env.B2_KEY_ID || "",
+  /** B2 applicationKey — the S3 secret access key. Never logged. */
+  b2ApplicationKey: process.env.B2_APPLICATION_KEY || "",
+  b2BucketName: process.env.B2_BUCKET_NAME || "",
+  b2Endpoint: process.env.B2_ENDPOINT || "https://s3.us-east-005.backblazeb2.com",
+  b2Region: process.env.B2_REGION || "us-east-005",
+
+  // ── Runtime/AI budget defaults (env-overridable) ───────────────────────
+  maxAiTokens: parseInt(process.env.PROBE_MAX_AI_TOKENS || "400000", 10),
+  maxAiCalls: parseInt(process.env.PROBE_MAX_AI_CALLS || "20", 10),
+  maxRuntimeMs: parseInt(process.env.PROBE_MAX_RUNTIME_MS || String(10 * 60 * 1000), 10),
+  maxExperiments: parseInt(process.env.PROBE_MAX_EXPERIMENTS || "7", 10),
+  maxBrowserActions: parseInt(process.env.PROBE_MAX_BROWSER_ACTIONS || "40", 10),
+  maxSandboxCommands: parseInt(process.env.PROBE_MAX_SANDBOX_COMMANDS || "20", 10),
+  /**
+   * Wall-clock ceiling for any single AI provider call. Keeps one model call
+   * (including its provider-side retries) from consuming the entire
+   * investigation runtime budget when the AI endpoint degrades.
+   */
+  aiCallTimeoutMs: parseInt(process.env.PROBE_AI_CALL_TIMEOUT_MS || String(90 * 1000), 10),
 } as const;
+
+/** True when MongoDB is configured (production durable persistence). */
+export function isMongoConfigured(): boolean {
+  return config.mongodbUri.length > 0;
+}
+
+/** True when B2 evidence storage is configured. */
+export function isB2Configured(): boolean {
+  return !!(config.b2KeyId && config.b2ApplicationKey && config.b2BucketName);
+}
 
 export function validateConfig(): void {
   // trust proxy "true" is never acceptable: it makes X-Forwarded-For
@@ -118,6 +161,25 @@ export function validateConfig(): void {
       "PROBE_API_TOKEN (or PROBE_API_TOKENS) is required when NODE_ENV=production — " +
       "Probe refuses to host an unauthenticated, cost-incurring API"
     );
+  }
+  // Production MUST have durable persistence configured. Silently falling
+  // back to the ephemeral Render filesystem (in-memory state, local evidence
+  // files) is exactly the data-loss failure mode this migration removes —
+  // fail clearly at startup instead.
+  if (isProduction && !isMongoConfigured()) {
+    throw new Error(
+      "MONGODB_URI is required when NODE_ENV=production — Probe does not silently " +
+      "fall back to ephemeral local state in production"
+    );
+  }
+  if (isProduction && !isB2Configured()) {
+    throw new Error(
+      "B2_KEY_ID, B2_APPLICATION_KEY and B2_BUCKET_NAME are required when NODE_ENV=production — " +
+      "Probe does not silently fall back to ephemeral local evidence storage in production"
+    );
+  }
+  if (Number.isNaN(config.maxAiTokens) || config.maxAiTokens < 1000) {
+    throw new Error(`PROBE_MAX_AI_TOKENS must be a positive integer; got "${process.env.PROBE_MAX_AI_TOKENS ?? "(unset)"}"`);
   }
 }
 

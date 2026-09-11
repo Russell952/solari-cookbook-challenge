@@ -13,6 +13,7 @@
 import { Router, type Request, type Response } from "express";
 import { config } from "../config/index.js";
 import { authLimiter } from "../security/rate-limit.js";
+import { warmUserCache } from "./users.js";
 import {
   createUser,
   EmailAlreadyExistsError,
@@ -78,6 +79,9 @@ async function signup(req: Request, res: Response): Promise<void> {
 
   try {
     const user = await createUser(email, password);
+    // Warm the session-user cache so the very next authenticated request
+    // (frontend /me poll) resolves without an extra user lookup.
+    warmUserCache(user.id);
     setSessionCookie(res, createSessionToken(user.id));
     res.status(201).json({ user: safeUser(user) });
   } catch (err) {
@@ -109,6 +113,8 @@ async function login(req: Request, res: Response): Promise<void> {
     return;
   }
 
+  // Warm the session-user cache (same rationale as signup).
+  warmUserCache(user.id);
   setSessionCookie(res, createSessionToken(user.id));
   res.status(200).json({ user: safeUser(user) });
 }

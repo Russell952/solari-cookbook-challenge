@@ -652,7 +652,70 @@ export function setAiRequestRecorder(fn: ((count?: number) => void) | null): voi
   recordAiRequest = fn;
 }
 
+/**
+ * Thrown when the AI call/token budget or the investigation deadline is
+ * already exhausted. The orchestrator catches this and degrades gracefully
+ * (structured INCONCLUSIVE result + report) — it must never be retried.
+ */
+export class AiBudgetExhaustedError extends Error {
+  constructor(
+    public readonly reason: "ai_calls" | "ai_tokens" | "runtime",
+    message: string
+  ) {
+    super(message);
+    this.name = "AiBudgetExhaustedError";
+  }
+}
+
+/**
+ * Budget guards bound by the orchestrator for the current investigation.
+ *
+ *   canAttempt()          — false once AI-call/runtime budget is gone
+ *   estimateTokens(text)  — token estimation shared with the budget ledger
+ *   canSpendTokens(n)     — false when the token budget cannot absorb n
+ *   spendTokens(n)        — charge n estimated input tokens
+ *   remainingRuntimeMs()  — wall-clock left for THIS investigation
+ *   callTimeoutMs()       — hard ceiling for a single provider call
+ *
+ * All gating happens in `chat()` — the single choke point for every model
+ * request — so no AI call can bypass budgets or run past the deadline.
+ */
+interface AiBudgetGuards {
+  canAttempt(): boolean;
+  estimateTokens(text: string): number;
+  canSpendTokens(estimated: number): boolean;
+  spendTokens(estimated: number): void;
+  remainingRuntimeMs(): number;
+  callTimeoutMs(): number;
+}
+
+let budgetGuards: AiBudgetGuards | null = null;
+
+export function setAiBudgetGuards(guards: AiBudgetGuards | null): void {
+  budgetGuards = guards;
+}
+
 async function chat(systemPrompt: string, userPrompt: string): Promise<string> {
+  // ── Budget gate (before ANY request) ──────────────────────────────────
+  // No model request may start when the AI-call budget, the AI-token
+  // budget, or the investigation runtime is already exhausted.
+  const guard = budgetGuards;
+  if (guard) {
+    const estimated = guard.estimateTokens(systemPrompt) + guard.estimateTokens(userPrompt);
+    if (!guard.canAttempt()) {
+      throw new AiBudgetExhaustedError(
+        "ai_calls",
+        "AI call budget exhausted — no further model requests will be made"
+      );
+    }
+    if (!guard.canSpendTokens(estimated)) {
+      throw new AiBudgetExhaustedError(
+        "ai_tokens",
+        `AI token budget exhausted (request ~${estimated.toLocaleString()} tokens) — no further model requests will be made`
+      );
+    }
+  }
+
   // Final pre-request guard (hard safety): no model request ever leaves this
   // function with a prompt over the configured context budget.
   const boundedUserPrompt = fitUserPromptToBudget(systemPrompt, userPrompt);
@@ -661,21 +724,59 @@ async function chat(systemPrompt: string, userPrompt: string): Promise<string> {
     // Count this actual upstream model request before sending it. Retries
     // are real model requests and are billed as such.
     recordAiRequest?.(1);
-    const res = await fetch(`${config.aiBaseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${config.aiApiKey}`,
-      },
-      body: JSON.stringify({
-        model: config.aiModel,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: boundedUserPrompt },
-        ],
-        temperature: 0.2,
-      }),
-    });
+
+    // ── Deadline enforcement ────────────────────────────────────────────
+    // A single provider call can never run past the investigation deadline
+    // (or the configured per-call ceiling): AbortController cancels the
+    // fetch, preventing an unbounded AI operation from consuming the whole
+    // runtime budget when the provider degrades.
+    let timeoutMs = guard ? guard.callTimeoutMs() : 120_000;
+    if (guard) {
+      const remaining = guard.remainingRuntimeMs();
+      if (remaining <= 0) {
+        throw new AiBudgetExhaustedError("runtime", "Investigation runtime expired before AI request");
+      }
+      timeoutMs = Math.min(timeoutMs, remaining);
+    }
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), timeoutMs);
+
+    let res: Response;
+    try {
+      res = await fetch(`${config.aiBaseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${config.aiApiKey}`,
+        },
+        signal: abort.signal,
+        body: JSON.stringify({
+          model: config.aiModel,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: boundedUserPrompt },
+          ],
+          temperature: 0.2,
+        }),
+      });
+    } catch (err) {
+      if (abort.signal.aborted) {
+        const remaining = guard ? guard.remainingRuntimeMs() : 0;
+        if (remaining <= 0) {
+          throw new AiBudgetExhaustedError("runtime", "Investigation runtime expired during AI request");
+        }
+        throw new Error(`AI API timeout after ${timeoutMs}ms (bounded by investigation deadline)`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    // Charge the estimated input tokens for this actual request (retries
+    // re-send the same prompt and are charged again).
+    if (guard) {
+      guard.spendTokens(guard.estimateTokens(systemPrompt) + guard.estimateTokens(boundedUserPrompt));
+    }
 
     const rawBody = await res.json();
 
@@ -695,9 +796,12 @@ async function chat(systemPrompt: string, userPrompt: string): Promise<string> {
 
     // Determine the effective error status: body-level errors override HTTP 200
     const errorStatus = isBodyError ? 503 : res.status;
-    // Retry on 503 (unavailable) or 429 (rate-limited) — both are transient
+    // Retry on 503 (unavailable) or 429 (rate-limited) — both are transient.
+    // NEVER retry once a budget guard refuses further requests: retries must
+    // not bypass the AI-call/token/runtime budgets.
     const isRetryable = errorStatus === 503 || errorStatus === 429;
-    if (isRetryable && attempt < MAX_RETRIES) {
+    const budgetBlocked = guard ? !guard.canAttempt() || guard.remainingRuntimeMs() <= 0 : false;
+    if (isRetryable && attempt < MAX_RETRIES && !budgetBlocked) {
       const delay = RETRY_DELAY_MS[attempt] ?? 10000;
       console.warn(`AI API ${errorStatus}, retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})...`);
       lastError = new Error(`AI API error: ${res.status} ${bodyStr.slice(0, 200)}`);

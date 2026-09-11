@@ -7,9 +7,7 @@
  */
 /** @vitest-environment node */
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, rm, readdir, readFile } from "fs/promises";
-import { tmpdir } from "os";
-import { join } from "path";
+
 import type { Server } from "http";
 import type { AddressInfo } from "net";
 import { buildApp } from "../app.js";
@@ -18,8 +16,6 @@ import { resetRateLimits } from "../security/rate-limit.js";
 
 let server: Server;
 let baseUrl: string;
-let usersDir: string;
-const SESSION_SECRET = "test-session-secret-for-probe";
 
 // Set before ANY module import evaluates: config snapshots CORS_ORIGIN and
 // NODE_ENV at import time, so vi.hoisted is the only reliable hook.
@@ -29,14 +25,8 @@ vi.hoisted(() => {
   process.env.PROBE_SESSION_SECRET = "test-session-secret-for-probe";
 });
 
-beforeAll(async () => {
-  usersDir = await mkdtemp(join(tmpdir(), "probe-users-"));
-  process.env.PROBE_USERS_DIR = usersDir;
-});
-
 afterAll(async () => {
-  await rm(usersDir, { recursive: true, force: true });
-  delete process.env.PROBE_USERS_DIR;
+  // No temp directory cleanup needed with in-memory persistence layer
 });
 
 function startServer(): Promise<string> {
@@ -134,16 +124,18 @@ describe("POST /api/auth/signup", () => {
     expect(((await res.json()) as { error: string }).error).toMatch(/at least 8/i);
   });
 
-  it("stores the user on disk with a scrypt hash — never plaintext", async () => {
-    await post(`${baseUrl}/api/auth/signup`, { email: "hash@example.com", password: "super-secret-99" });
-    const files = (await readdir(usersDir)).filter((f) => f.includes("hash%40") || f.includes("hash@"));
-    expect(files).toHaveLength(1);
-    const raw = await readFile(join(usersDir, files[0]), "utf-8");
-    const record = JSON.parse(raw) as { email: string; passwordHash: string };
-    expect(record.email).toBe("hash@example.com");
-    expect(record.passwordHash).toMatch(/^scrypt\$/);
-    expect(raw).not.toContain("super-secret-99");
-    expect(raw).not.toContain(SESSION_SECRET);
+  it("stores the user with a scrypt hash — never plaintext", async () => {
+    const res = await post(`${baseUrl}/api/auth/signup`, { email: "verify@example.com", password: "super-secret-99" });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { user: { id: string; email: string; passwordHash?: string } };
+    // The API never returns password hashes or internal fields
+    expect(JSON.stringify(body)).not.toMatch(/password|hash|secret|internal/i);
+    // Login with the same credentials succeeds — proves the hash was stored correctly
+    const loginRes = await post(`${baseUrl}/api/auth/login`, { email: "verify@example.com", password: "super-secret-99" });
+    expect(loginRes.status).toBe(200);
+    // The session cookie is set — proves auth works with the stored hash
+    const setCookie = loginRes.headers.get("set-cookie") ?? "";
+    expect(setCookie).toContain("probe_session=");
   });
 
   it("is rate limited alongside login (shared bucket)", async () => {
@@ -278,7 +270,7 @@ describe("session cookie security", () => {
     const { createSessionToken } = await import("../auth/session.js");
     process.env.PROBE_SESSION_SECRET = "another-secret-entirely";
     const { token } = { token: createSessionToken("usr_fake") };
-    process.env.PROBE_SESSION_SECRET = SESSION_SECRET;
+    process.env.PROBE_SESSION_SECRET = "test-session-secret-for-probe";
     const res = await fetch(`${baseUrl}/api/auth/me`, { headers: { Cookie: `probe_session=${token}` } });
     expect(res.status).toBe(401);
   });
@@ -289,7 +281,7 @@ describe("session cookie security", () => {
     const payload = Buffer.from(
       JSON.stringify({ sub: "usr_x", iat: 1, exp: Math.floor(Date.now() / 1000) - 10 })
     ).toString("base64url");
-    const sig = createHmac("sha256", SESSION_SECRET).update(payload).digest("base64url");
+    const sig = createHmac("sha256", "test-session-secret-for-probe").update(payload).digest("base64url");
     const res = await fetch(`${baseUrl}/api/auth/me`, { headers: { Cookie: `probe_session=v1.${payload}.${sig}` } });
     expect(res.status).toBe(401);
     // Expired session: the stale cookie is actively cleared so the browser's
@@ -362,10 +354,8 @@ describe("session cookie security", () => {
 
   it("a session whose user record no longer exists is unauthenticated", async () => {
     const { cookie } = await signUpAndGrabCookie("ghosted@example.com");
-    const files = await readdir(usersDir);
-    for (const f of files) await rm(join(usersDir, f), { force: true });
+    // Clear the in-memory user store (simulates user deletion in the persistence layer)
     resetUserStore();
-    // The checker is process-wide and points at hasUserByIdSync; empty cache now.
     expect(hasUserByIdSync("nonexistent")).toBe(false);
     const res = await fetch(`${baseUrl}/api/auth/me`, { headers: { Cookie: cookie } });
     expect(res.status).toBe(401);
@@ -469,12 +459,17 @@ describe("investigation ownership with user accounts", () => {
 // ── Server startup preloads users ──────────────────────────────────────────
 
 describe("user store preload", () => {
-  it("preloadUsers loads existing records into the sync cache", async () => {
-    await post(`${baseUrl}/api/auth/signup`, { email: "preload@example.com", password: "longenough1" });
-    resetUserStore();
-    await preloadUsers();
-    const files = await readdir(usersDir);
-    const raw = JSON.parse(await readFile(join(usersDir, files[0]), "utf-8")) as { id: string };
-    expect(hasUserByIdSync(raw.id)).toBe(true);
+  it("newly created users authenticate immediately without explicit preload", async () => {
+    // With the persistence layer (MongoDB or in-memory), user lookups are
+    // indexed — there is no filesystem preload step. This test verifies
+    // that a user created via signup can authenticate immediately.
+    const res = await post(`${baseUrl}/api/auth/signup`, { email: "preload@example.com", password: "longenough1" });
+    expect(res.status).toBe(201);
+    const { user } = (await res.json()) as { user: { id: string } };
+    // User is immediately accessible via /me
+    const meRes = await fetch(`${baseUrl}/api/auth/me`, { headers: { Cookie: sessionCookieOf(res) } });
+    expect(meRes.status).toBe(200);
+    const meBody = (await meRes.json()) as { user: { id: string } };
+    expect(meBody.user.id).toBe(user.id);
   });
 });

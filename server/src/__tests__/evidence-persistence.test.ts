@@ -5,7 +5,8 @@ import { mkdtemp, rm, readFile, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { store } from "../store/index.js";
-import * as evidenceStore from "../evidence/store.js";
+import { getLocalIndexedArtifact } from "../evidence/artifact-store.js";
+import { deleteInvestigationArtifacts } from "../evidence/index.js";
 import type { Evidence } from "@probe/shared";
 import {
   captureScreenshot,
@@ -180,7 +181,7 @@ describe("restart recovery via on-disk artifact index", () => {
 
     // Rebuild a minimal evidence record from the on-disk index alone —
     // exactly what a restarted server could do.
-    const indexed = await evidenceStore.getArtifactFromIndex(invId, ev.id);
+    const indexed = await getLocalIndexedArtifact(invId, ev.id);
     expect(indexed).not.toBeNull();
     const reconstructed = {
       id: indexed!.evidenceId,
@@ -237,7 +238,7 @@ describe("artifact retrieval failure handling", () => {
       content: "to-be-deleted",
     });
 
-    await evidenceStore.deleteInvestigationArtifacts(invId);
+    await deleteInvestigationArtifacts(invId);
     const { buffer, hashVerified } = await getEvidenceContent(ev);
     expect(buffer).toBeNull();
     expect(hashVerified).toBe(false);
@@ -261,7 +262,7 @@ describe("artifact retrieval failure handling", () => {
     await captureEvidence({ investigationId: invA, type: "action_trace", content: "secret-A" });
 
     // Asking the index of investigation B for A's evidence yields nothing.
-    const fromB = await evidenceStore.getArtifactFromIndex(invB, "some-ev-id");
+    const fromB = await getLocalIndexedArtifact(invB, "some-ev-id");
     expect(fromB).toBeNull();
 
     // The index is scoped per investigation directory on disk and stores

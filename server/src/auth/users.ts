@@ -1,26 +1,23 @@
 /**
- * Filesystem user store for email/password accounts.
+ * User account service.
  *
- * No database: users live as one JSON file per user under
- * `server/data/users/<normalizedEmail>.json` — the same filesystem-persistence
- * convention as the evidence store (`server/data/evidence/`). Writes are
- * atomic (temp file + rename) so a crash cannot corrupt a record.
+ * Password hashing is UNCHANGED (Node scrypt, N=16384/r=8/p=1, 64-byte key,
+ * `scrypt$N$r$p$salt$hash` serialization, timing-safe verification) — only
+ * where the record lives changed: the filesystem JSON store was replaced by
+ * the persistence layer's UserRepository (in-memory in dev/tests, MongoDB in
+ * production). The repository never stores plaintext passwords and enforces
+ * a unique, case-normalized email index, so duplicate-email signup races are
+ * converted into EmailAlreadyExistsError instead of corrupting data.
  *
- * Each record holds only what auth requires:
- *   id, email (normalized), passwordHash, createdAt
- *
- * Passwords are hashed with Node's native scrypt (N=16384, r=8, p=1,
- * 64-byte key) in the standard `scrypt$N$r$p$salt$hash` serialization —
- * no custom cryptography, no plaintext, no extra dependency.
- *
- * Reads are cached in-process after first load; every auth operation
- * re-reads on a cache miss so records created by other processes
- * (or manually) are picked up.
+ * Login path = ONE indexed user lookup + scrypt verify. No collection scans,
+ * no full-collection preload (Mongo lookups are indexed; the old
+ * preloadUsers() directory scan no longer exists).
  */
 import { randomBytes, scrypt as scryptCb, timingSafeEqual } from "crypto";
 import { promisify } from "util";
-import { mkdir, readFile, rename, writeFile } from "fs/promises";
-import { join } from "path";
+import { store, users as storeUsers, activeDurableBackend, EmailAlreadyExistsError } from "../store/index.js";
+import { clearMemoryUsersForTest } from "../persistence/memory.js";
+import type { StoredUser } from "../persistence/types.js";
 
 const scrypt = promisify(scryptCb) as (
   password: string | Buffer,
@@ -28,18 +25,6 @@ const scrypt = promisify(scryptCb) as (
   keylen: number,
   options: { N: number; r: number; p: number; maxmem?: number }
 ) => Promise<Buffer>;
-
-/** Root directory for persisted users. `server/data/users/`. Overridable for tests. */
-export function usersRoot(): string {
-  return process.env.PROBE_USERS_DIR ?? join(process.cwd(), "data", "users");
-}
-
-export interface StoredUser {
-  id: string;
-  email: string;
-  passwordHash: string;
-  createdAt: string;
-}
 
 /** Normalize an email: trim + lowercase, consistently, everywhere. */
 export function normalizeEmail(email: string): string {
@@ -87,123 +72,79 @@ export async function verifyPassword(password: string, stored: string): Promise<
   }
 }
 
-/** Per-email in-process cache (records are immutable except by rewrite here). */
-const cache = new Map<string, StoredUser>();
-/** id → user cache so request-path getUserById avoids directory scans. */
-const cacheById = new Map<string, StoredUser>();
-
-function userFilePath(email: string): string {
-  // The normalized email is the filename; encode it so odd-but-valid
-  // addresses cannot escape the users directory.
-  return join(usersRoot(), `${encodeURIComponent(normalizeEmail(email))}.json`);
-}
-
 export async function getUserByEmail(email: string): Promise<StoredUser | null> {
-  const normalized = normalizeEmail(email);
-  const cached = cache.get(normalized);
-  if (cached) return cached;
-  try {
-    const raw = await readFile(userFilePath(normalized), "utf-8");
-    const user = JSON.parse(raw) as StoredUser;
-    cache.set(normalized, user);
-    cacheById.set(user.id, user);
-    return user;
-  } catch {
-    return null; // not found (or unreadable → treat as absent)
-  }
+  return storeUsers.getUserByEmail(normalizeEmail(email));
 }
 
 export async function getUserById(id: string): Promise<StoredUser | null> {
-  const cached = cacheById.get(id);
-  if (cached) return cached;
-  // The email is the storage key; scan the (small) users directory.
-  const { readdir } = await import("fs/promises");
-  let files: string[];
-  try {
-    files = await readdir(usersRoot());
-  } catch {
-    return null;
-  }
-  for (const file of files) {
-    if (!file.endsWith(".json")) continue;
-    try {
-      const raw = await readFile(join(usersRoot(), file), "utf-8");
-      const user = JSON.parse(raw) as StoredUser;
-      cache.set(normalizeEmail(user.email), user);
-      cacheById.set(user.id, user);
-      if (user.id === id) return user;
-    } catch {
-      continue;
-    }
-  }
-  return null;
-}
-
-export class EmailAlreadyExistsError extends Error {
-  constructor(email: string) {
-    super(`An account with this email already exists`);
-    this.name = "EmailAlreadyExistsError";
-  }
+  return storeUsers.getUserById(id);
 }
 
 export async function createUser(email: string, password: string): Promise<StoredUser> {
   const normalized = normalizeEmail(email);
-  const existing = await getUserByEmail(normalized);
-  if (existing) throw new EmailAlreadyExistsError(normalized);
-
-  const user: StoredUser = {
-    id: `usr_${randomBytes(16).toString("hex")}`,
-    email: normalized,
-    passwordHash: await hashPassword(password),
-    createdAt: new Date().toISOString(),
-  };
-
-  await mkdir(usersRoot(), { recursive: true });
-  const finalPath = userFilePath(normalized);
-  const tmpPath = `${finalPath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-  await writeFile(tmpPath, JSON.stringify(user, null, 2), { encoding: "utf-8" });
-  await rename(tmpPath, finalPath); // atomic on POSIX and Windows
-
-  cache.set(normalized, user);
-  cacheById.set(user.id, user);
-  return user;
+  const passwordHash = await hashPassword(password);
+  // The repository enforces the unique email index and translates a
+  // duplicate-key race into EmailAlreadyExistsError.
+  return storeUsers.createUser(normalized, passwordHash);
 }
 
-/** Test helper: point the store at an empty dir and drop the cache. */
-export function resetUserStore(): void {
-  cache.clear();
-  cacheById.clear();
+export { EmailAlreadyExistsError };
+
+/**
+ * Session-user existence cache for the request path.
+ *
+ * requireAuth must reject sessions whose `sub` refers to a user that no
+ * longer exists. That check hits the user store; a tiny positive TTL cache
+ * keeps the hot path (every authenticated request) at zero extra lookups
+ * after the first hit, while a lookup through the indexed repository keeps
+ * correctness on cache miss. Negative results are not cached (an account
+ * created moments ago must authenticate immediately).
+ */
+const idCacheTtlMs = 60_000;
+const idCache = new Map<string, { userId: string; expiresAt: number }>();
+
+function rememberUser(user: StoredUser): void {
+  idCache.set(user.id, { userId: user.id, expiresAt: Date.now() + idCacheTtlMs });
+}
+
+export async function sessionUserExists(userId: string): Promise<boolean> {
+  const cached = idCache.get(userId);
+  if (cached && cached.expiresAt > Date.now()) return true;
+  const user = await storeUsers.getUserById(userId);
+  if (user) rememberUser(user);
+  return !!user;
+}
+
+/** TTL-cache fast-path for the request hot path (no I/O). */
+export function sessionUserExistsCached(userId: string): boolean {
+  const cached = idCache.get(userId);
+  return !!cached && cached.expiresAt > Date.now();
+}
+
+/** Kept for compatibility with the sync-check call sites in tests. */
+export function hasUserByIdSync(id: string): boolean {
+  const cached = idCache.get(id);
+  return !!cached && cached.expiresAt > Date.now();
 }
 
 /**
- * Synchronous existence check backed by the id cache. Used by the request
- * path (requireAuth is sync); call preloadUsers() at server startup so
- * accounts created before a restart are visible.
+ * Warm the session-user cache for a freshly created/authenticated user
+ * so the next authenticated request resolves without a store lookup.
  */
-export function hasUserByIdSync(id: string): boolean {
-  return cacheById.has(id);
+export function warmUserCache(userId: string): void {
+  idCache.set(userId, { userId, expiresAt: Date.now() + idCacheTtlMs });
 }
 
-/** Load all user records into the id cache (called once at server startup). */
+/**
+ * Clear the existence cache (and the memory user store in dev/test mode).
+ * Replaces the old filesystem resetUserStore; used by tests for isolation.
+ */
+export function resetUserStore(): void {
+  idCache.clear();
+  if (!activeDurableBackend()) clearMemoryUsersForTest();
+}
+
+/** Startup hook: no directory preload needed anymore (indexed lookups). */
 export async function preloadUsers(): Promise<void> {
-  const { readdir } = await import("fs/promises");
-  let files: string[];
-  try {
-    files = await readdir(usersRoot());
-  } catch {
-    return; // no users yet
-  }
-  for (const file of files) {
-    if (!file.endsWith(".json")) continue;
-    try {
-      const raw = await readFile(join(usersRoot(), file), "utf-8");
-      const user = JSON.parse(raw) as StoredUser;
-      if (user.id && user.email) {
-        cache.set(normalizeEmail(user.email), user);
-        cacheById.set(user.id, user);
-      }
-    } catch {
-      continue; // skip unreadable records
-    }
-  }
+  /* no-op — MongoDB/memory lookups are indexed; nothing to warm */
 }

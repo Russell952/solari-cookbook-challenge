@@ -1,23 +1,31 @@
 /**
  * Evidence collector.
  *
- * Captures evidence from browser/sandbox operations and persists the actual
- * artifact bytes through the EvidenceStore (server/data/evidence/), then
- * records metadata with content hashes in the in-memory store.
+ * Captures evidence from browser/sandbox operations, persists the actual
+ * artifact BYTES through the ArtifactStore (local filesystem in dev/tests,
+ * Backblaze B2 in production), then records metadata — including the storage
+ * key and full SHA-256 of the persisted bytes — in the store (MongoDB in
+ * production).
  *
  * Integrity invariant: the contentHash stored on an Evidence is the full
  * SHA-256 of the persisted bytes — the artifact remains retrievable and the
- * hash can always be re-verified against it.
+ * hash can always be re-verified against it. Metadata is only written after
+ * successful artifact storage (or, when persistence fails, as an explicit
+ * `artifactAvailable: false` record so capture degrades instead of crashing
+ * an experiment and never presents a false success).
  */
 import { createHash, randomUUID } from "crypto";
+import { join } from "path";
 import { store } from "../store/index.js";
 import {
-  saveArtifact,
-  readArtifact,
-  deleteArtifact,
-  getArtifactFromIndex,
-  type EvidenceArtifact,
-} from "./store.js";
+  getArtifactStore,
+  extensionFor,
+  mimeFor,
+  fullSha256,
+  evidenceRoot,
+  getLocalIndexedArtifact,
+  type StoredArtifact,
+} from "./artifact-store.js";
 import type { EvidenceType, Evidence } from "@probe/shared";
 
 function contentHash(data: string | Buffer): string {
@@ -40,19 +48,20 @@ export interface CaptureEvidenceOpts {
 /**
  * Capture evidence from an experiment action.
  *
- * The artifact bytes are persisted first; the Evidence record then carries
- * the full SHA-256 of the persisted bytes plus retrieval metadata. If the
- * disk write fails, the metadata record is still created (marked
+ * Artifact bytes are persisted first; the Evidence record then carries the
+ * full SHA-256 of the persisted bytes plus the storage key. If artifact
+ * storage fails, the metadata record is still created (marked
  * `artifactAvailable: false`) so evidence capture degrades instead of
- * crashing an experiment.
+ * crashing an experiment — but never reports a successful artifact.
  */
 export async function captureEvidence(opts: CaptureEvidenceOpts): Promise<Evidence> {
   const evidenceId = opts.evidenceId ?? randomUUID();
-  let artifact: EvidenceArtifact | null = null;
+  const artifactStore = getArtifactStore();
+  let artifact: StoredArtifact | null = null;
 
   if (opts.content !== undefined) {
     try {
-      artifact = await saveArtifact({
+      artifact = await artifactStore.save({
         evidenceId,
         investigationId: opts.investigationId,
         experimentId: opts.experimentId ?? null,
@@ -73,12 +82,17 @@ export async function captureEvidence(opts: CaptureEvidenceOpts): Promise<Eviden
     // persistence failed — the value remains verifiable either way).
     contentHash: artifact?.sha256 ?? fullSha256Of(opts.content),
     artifactAvailable: artifact !== null,
+    artifactStore: artifactStore.kind,
     ...(artifact
       ? {
           mimeType: artifact.mimeType,
           byteSize: artifact.byteSize,
           sha256: artifact.sha256,
-          artifactPath: artifact.storagePath,
+          storageKey: artifact.storagePath,
+          // Backward-compat alias: artifactPath is the local filesystem path
+          // when using LocalArtifactStore; undefined for B2 (object keys are
+          // not filesystem paths). New code should prefer storageKey.
+          artifactPath: artifactStore.kind === "local" ? artifact.storagePath : undefined,
           artifactCreatedAt: artifact.createdAt,
         }
       : {}),
@@ -128,10 +142,9 @@ export async function captureScreenshot(
  * Capture a session replay as evidence.
  *
  * The replay is an rrweb NDJSON event stream (DOM-level recording, not video)
- * downloaded from
- * Solari AFTER the browser session is released, so retrieval does not
- * depend on the session still existing. The bytes are persisted through the
- * EvidenceStore like any other artifact.
+ * downloaded from Solari AFTER the browser session is released, so retrieval
+ * does not depend on the session still existing. The bytes are persisted
+ * through the ArtifactStore like any other artifact.
  *
  * If the replay has not been uploaded by Solari yet (it uploads
  * asynchronously and can lag the release by seconds) or the download
@@ -223,49 +236,71 @@ export async function captureRepositoryEvidence(
 
 /**
  * Retrieve the persisted bytes for an Evidence item, if the artifact is
- * still available on disk. Verifies the artifact against the stored
- * contentHash when both are present.
+ * still available in the artifact store. Verifies the artifact against the
+ * stored contentHash when both are present.
  *
- * Restart recovery: if the in-memory Evidence record lacks an artifactPath
- * (e.g. a reconstructed record), the on-disk artifact index can still
- * locate the artifact as long as the filesystem data remains.
+ * Restart recovery: the metadata record carries the storageKey, so bytes
+ * resolve from MongoDB metadata alone (local index.json remains a fallback
+ * for artifacts written by older versions).
  */
 export async function getEvidenceContent(
   evidence: Evidence
 ): Promise<{ buffer: Buffer | null; sha256: string | null; hashVerified: boolean }> {
-  let path = evidence.metadata?.artifactPath as string | undefined;
-  if (!path) {
-    const indexed = await getArtifactFromIndex(evidence.investigationId, evidence.id);
-    if (indexed) path = indexed.storagePath;
-  }
-  if (!path) return { buffer: null, sha256: null, hashVerified: false };
+  const artifactStore = getArtifactStore();
 
-  const artifact: EvidenceArtifact = {
+  let storagePath = evidence.metadata?.storageKey as string | undefined;
+  if (!storagePath) {
+    // Restart-recovery fallback: try the local index sidecar first, then the
+    // deterministic key layout.
+    const indexed = await getLocalIndexedArtifact(evidence.investigationId, evidence.id);
+    if (indexed) {
+      storagePath = indexed.storagePath;
+    } else {
+      const ext = extensionFor(evidence.type);
+      storagePath =
+        artifactStore.kind === "b2"
+          ? `evidence/${evidence.investigationId}/${evidence.id}.${ext}`
+          : `${evidence.investigationId}/${evidence.id}.${ext}`;
+    }
+  }
+
+  const artifact: StoredArtifact = {
     evidenceId: evidence.id,
     investigationId: evidence.investigationId,
     experimentId: evidence.experimentId,
     evidenceType: evidence.type,
-    mimeType: (evidence.metadata?.mimeType as string) ?? "application/octet-stream",
+    mimeType: (evidence.metadata?.mimeType as string) ?? mimeFor(evidence.type),
     byteSize: (evidence.metadata?.byteSize as number) ?? 0,
     sha256: (evidence.metadata?.sha256 as string) ?? evidence.contentHash ?? "",
-    storagePath: path,
+    storagePath: artifactStore.kind === "local" ? absoluteLocalPath(storagePath) : storagePath,
     createdAt: (evidence.metadata?.artifactCreatedAt as string) ?? evidence.createdAt,
   };
 
-  const buffer = await readArtifact(artifact);
+  const buffer = await artifactStore.read(artifact);
   if (!buffer) return { buffer: null, sha256: artifact.sha256 || null, hashVerified: false };
 
   // Re-verify the hash against the actual persisted bytes.
-  const actual = fullSha256Of(buffer);
+  const actual = fullSha256(buffer);
   const expected = artifact.sha256;
   return { buffer, sha256: actual, hashVerified: expected !== "" && actual === expected };
 }
 
+/** Local store paths are stored absolute; legacy relative → absolute. */
+function absoluteLocalPath(storagePath: string): string {
+  const root = evidenceRoot();
+  if (storagePath.startsWith("/") || /^[A-Za-z]:/.test(storagePath)) {
+    return storagePath; // already absolute
+  }
+  // Legacy relative layout: "<investigationId>/<evidenceId>.<ext>"
+  return join(root, storagePath);
+}
+
 /** Delete the persisted artifact for an Evidence item (best effort). */
 export async function deleteEvidenceArtifact(evidence: Evidence): Promise<void> {
-  const path = evidence.metadata?.artifactPath as string | undefined;
-  if (!path) return;
-  await deleteArtifact({
+  const storageKey = evidence.metadata?.storageKey as string | undefined;
+  if (!storageKey) return;
+  const artifactStore = getArtifactStore();
+  await artifactStore.delete({
     evidenceId: evidence.id,
     investigationId: evidence.investigationId,
     experimentId: evidence.experimentId,
@@ -273,9 +308,22 @@ export async function deleteEvidenceArtifact(evidence: Evidence): Promise<void> 
     mimeType: "application/octet-stream",
     byteSize: 0,
     sha256: "",
-    storagePath: path,
+    storagePath: artifactStore.kind === "local" ? storageKey : storageKey,
     createdAt: evidence.createdAt,
   });
+}
+
+/**
+ * Delete every artifact for an investigation. Resolves metadata records
+ * first (no bucket-wide listing), then deletes each artifact.
+ */
+export async function deleteInvestigationArtifacts(investigationId: string): Promise<void> {
+  const artifactStore = getArtifactStore();
+  const evidence = store.listEvidence(investigationId);
+  await Promise.all(evidence.map((ev) => deleteEvidenceArtifact(ev)));
+  if (artifactStore.kind === "local") {
+    await artifactStore.deleteInvestigation(investigationId);
+  }
 }
 
 export { contentHash };

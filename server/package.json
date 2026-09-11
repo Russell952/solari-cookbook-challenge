@@ -12,6 +12,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1130.0",
     "@probe/shared": "file:../shared",
     "@solarisdk/browser": "^0.1.1",
     "@solarisdk/sdk": "^0.1.2",
@@ -20,6 +21,7 @@
     "express": "^4.21.0",
     "express-rate-limit": "^8.7.0",
     "helmet": "^8.3.0",
+    "mongodb": "^7.6.0",
     "tsx": "^4.19.2"
   },
   "devDependencies": {

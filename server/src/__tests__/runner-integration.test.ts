@@ -155,7 +155,7 @@ beforeAll(() => {
 });
 import { buildApp } from "../app.js";
 import * as browser from "../solari/browser.js";
-import * as evidenceStore from "../evidence/store.js";
+import { getLocalIndexedArtifact } from "../evidence/artifact-store.js";
 
 // ── Harness: real HTTP server + real router ────────────────────────────────
 
@@ -378,7 +378,7 @@ describe("runInvestigation end-to-end (real runner, real API)", () => {
 
     // Wipe in-memory state, then read the artifact back purely from disk
     store.clearAll();
-    const indexed = await evidenceStore.getArtifactFromIndex(id, shot.id);
+    const indexed = await getLocalIndexedArtifact(id, shot.id);
     expect(indexed).not.toBeNull();
     const bytes = await readFile(indexed!.storagePath);
     expect(bytes.length).toBeGreaterThan(0);

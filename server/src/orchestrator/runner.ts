@@ -17,11 +17,14 @@ import type {
   Hypothesis,
   Finding,
   Evidence,
+  PhaseStat,
+  InvestigationFailureReason,
 } from "@probe/shared";
 import { transitionPhase, transitionStatus } from "@probe/shared";
 import type { ProbeBrowserSession } from "../solari/browser.js";
-import { store } from "../store/index.js";
+import { store, flushAll } from "../store/index.js";
 import { createOpenAIAdapter, type AIAdapter } from "../ai/index.js";
+import { AiBudgetExhaustedError, setAiBudgetGuards } from "../ai/openai.js";
 import * as browser from "../solari/browser.js";
 import type { ReconContext } from "../solari/browser.js";
 import * as sandbox from "../solari/sandbox.js";
@@ -38,14 +41,102 @@ import {
 } from "../evidence/index.js";
 import * as budget from "./budget.js";
 import { emit } from "../api/events.js";
-import { setAiRequestRecorder } from "../ai/openai.js";
+import { setAiRequestRecorder, estimatePromptTokens } from "../ai/openai.js";
 import { validateApplicationUrl } from "../security/url-validation.js";
+import { config } from "../config/index.js";
 
 let ai: AIAdapter | null = null;
 
 function getAI(): AIAdapter {
   if (!ai) ai = createOpenAIAdapter();
   return ai;
+}
+
+// ── Phase instrumentation (durable, per investigation) ─────────────────────
+
+interface RunState {
+  phaseStats: PhaseStat[];
+  aiCallsAtPhaseStart: number;
+  aiTokensAtPhaseStart: number;
+  browserActionsAtPhaseStart: number;
+}
+
+const runStates = new Map<string, RunState>();
+
+function runState(investigationId: string): RunState {
+  let s = runStates.get(investigationId);
+  if (!s) {
+    s = {
+      phaseStats: [],
+      aiCallsAtPhaseStart: 0,
+      aiTokensAtPhaseStart: 0,
+      browserActionsAtPhaseStart: 0,
+    };
+    runStates.set(investigationId, s);
+  }
+  return s;
+}
+
+function beginPhaseStat(investigationId: string, phase: InvestigationPhase): void {
+  const s = runState(investigationId);
+  // Close any dangling previous entry (defensive).
+  const prev = s.phaseStats[s.phaseStats.length - 1];
+  if (prev && prev.endedAt === null) {
+    prev.endedAt = new Date().toISOString();
+    prev.durationMs = new Date(prev.endedAt).getTime() - new Date(prev.startedAt).getTime();
+  }
+  const b = budget.getBudget(investigationId);
+  s.aiCallsAtPhaseStart = b.usedAiCalls;
+  s.aiTokensAtPhaseStart = b.usedAiTokens;
+  s.browserActionsAtPhaseStart = b.usedBrowserActions;
+  s.phaseStats.push({
+    phase,
+    startedAt: new Date().toISOString(),
+    endedAt: null,
+    durationMs: null,
+    aiCalls: 0,
+    aiInputTokens: 0,
+    experiments: 0,
+    browserActions: 0,
+  });
+}
+
+function endPhaseStat(investigationId: string, phase: InvestigationPhase): void {
+  const s = runState(investigationId);
+  const stat = [...s.phaseStats].reverse().find((p) => p.phase === phase && p.endedAt === null);
+  if (!stat) return;
+  stat.endedAt = new Date().toISOString();
+  stat.durationMs = new Date(stat.endedAt).getTime() - new Date(stat.startedAt).getTime();
+  const b = budget.getBudget(investigationId);
+  stat.aiCalls = b.usedAiCalls - s.aiCallsAtPhaseStart;
+  stat.aiInputTokens = b.usedAiTokens - s.aiTokensAtPhaseStart;
+  stat.browserActions = b.usedBrowserActions - s.browserActionsAtPhaseStart;
+}
+
+/** Append the current phase stats to the durable investigation record. */
+function checkpointPhaseStats(investigationId: string): void {
+  const s = runStates.get(investigationId);
+  if (!s || s.phaseStats.length === 0) return;
+  store.updateInvestigation(investigationId, {
+    phaseStats: s.phaseStats.map((p) => ({ ...p })),
+  });
+}
+
+/**
+ * Persist a structured failure. `reason` distinguishes budget exhaustion
+ * (graceful, produces a report) from genuine infrastructure errors.
+ */
+function checkpointFailure(
+  investigationId: string,
+  phase: InvestigationPhase | null,
+  reason: InvestigationFailureReason,
+  message: string
+): void {
+  const inv = store.getInvestigation(investigationId);
+  store.updateInvestigation(investigationId, {
+    failure: { reason, message, phase, at: new Date().toISOString() },
+    ...(inv?.phaseStats ? { phaseStats: inv.phaseStats } : {}),
+  });
 }
 
 /**
@@ -104,6 +195,11 @@ function isPaused(investigationId: string): boolean {
   return inv?.status === "paused";
 }
 
+/** Persist a budget usage checkpoint (restored on resume/retry). */
+function checkpointBudgetUsage(investigationId: string): void {
+  store.updateInvestigation(investigationId, { budgetUsage: budget.snapshotUsage(investigationId) });
+}
+
 /**
  * Transition the investigation to a new phase.
  * Validates the transition is allowed, then updates the store and emits an event.
@@ -111,7 +207,11 @@ function isPaused(investigationId: string): boolean {
  */
 function advancePhase(investigation: Investigation, to: InvestigationPhase): Investigation {
   transitionPhase(investigation.currentPhase, to);
+  endPhaseStat(investigation.id, investigation.currentPhase);
+  beginPhaseStat(investigation.id, to);
   const updated = store.updateInvestigation(investigation.id, { currentPhase: to });
+  checkpointPhaseStats(investigation.id);
+  checkpointBudgetUsage(investigation.id);
   emit("phase_change", investigation.id, { phase: to });
   return updated;
 }
@@ -549,6 +649,7 @@ async function runExperiment(investigation: Investigation, experiment: Experimen
 
   emit("experiment_started", investigation.id, { experimentId: experiment.id, objective: experiment.objective });
   store.updateExperiment(experiment.id, { status: "running" });
+  checkpointBudgetUsage(investigation.id);
 
   // Extract appRecon from investigation for SPA fallback resolution
   const appRecon = (investigation as Investigation & { _appRecon?: ApplicationRecon })._appRecon ?? null;
@@ -660,10 +761,12 @@ async function runExperiment(investigation: Investigation, experiment: Experimen
       result: "All actions completed successfully",
     });
     emit("experiment_completed", investigation.id, { experimentId: experiment.id, status: "completed" });
+    checkpointBudgetUsage(investigation.id);
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
     store.updateExperiment(experiment.id, { status: "failed", error: errorMsg });
     emit("experiment_completed", investigation.id, { experimentId: experiment.id, status: "failed", error: errorMsg });
+    checkpointBudgetUsage(investigation.id);
   } finally {
     if (browserSession) {
       // Persist the session replay as evidence. Solari uploads the recording
@@ -899,22 +1002,91 @@ async function runAnalysis(investigation: Investigation): Promise<{ investigatio
   }
 
   const experiments = store.listExperiments(investigation.id);
-  const allObservations: Observation[] = [];
+
+  // ── Per-experiment analysis (no massive analyze-all) ────────────────
+  // Each experiment is analyzed once, bounded. Deterministic facts are
+  // extracted from observations first, so the AI reasons over a compact
+  // fact sheet rather than re-deriving them from raw traces. If the AI or
+  // runtime budget runs out mid-way, completed analyses are kept, the rest
+  // are marked honestly, and a combined analysis is still produced so the
+  // investigation continues to hypothesis/report with what it has.
+  const analyses: string[] = [];
   for (const exp of experiments) {
-    allObservations.push(...store.listObservations(exp.id));
+    if (isPaused(investigation.id)) break;
+    try {
+      assertNotStopped(investigation.id);
+    } catch (stop) {
+      // Runtime expired: stop analyzing more experiments but keep what we
+      // already have for the combined analysis below.
+      if (stop instanceof InvestigationStoppedError && stop.reason === "runtime_expired") {
+        checkpointFailure(investigation.id, "analyze", "analysis_budget_exhausted",
+          "Analysis stopped early: investigation runtime expired");
+        break;
+      }
+      throw stop;
+    }
+
+    const observations = store.listObservations(exp.id);
+    if (observations.length === 0) continue;
+
+    // Deterministic pre-analysis (no AI): statuses, errors, expectations.
+    const deterministic = buildDeterministicFactSheet(exp);
+
+    // AI analysis for THIS experiment only (observations compacted inside
+    // the adapter; current experiment gets full per-field context).
+    try {
+      const analysis = await getAI().analyzeObservation(
+        observations,
+        exp,
+        investigation.objective
+      );
+      analyses.push(
+        `## Experiment ${exp.sequence}: ${exp.objective}\nStatus: ${exp.status}${exp.error ? ` (error: ${exp.error})` : ""}\nDeterministic facts: ${deterministic}\nAI analysis: ${analysis}`
+      );
+    } catch (err) {
+      if (err instanceof AiBudgetExhaustedError) {
+        // Budget exhausted mid-analysis: keep prior analyses, mark the rest.
+        checkpointFailure(
+          investigation.id,
+          "analyze",
+          err.reason === "ai_tokens" ? "ai_token_budget_exhausted" : "ai_call_budget_exhausted",
+          `Analysis stopped after ${analyses.length} analyzed experiment(s): ${err.message}`
+        );
+        analyses.push(
+          `## Experiment ${exp.sequence}: ${exp.objective}\nStatus: ${exp.status}${exp.error ? ` (error: ${exp.error})` : ""}\nDeterministic facts: ${deterministic}\nAI analysis: (not performed — AI budget exhausted; classified INCONCLUSIVE)`
+        );
+        continue;
+      }
+      if (err instanceof InvestigationStoppedError) throw err;
+      // Analysis failure for one experiment is not fatal — record honestly.
+      analyses.push(
+        `## Experiment ${exp.sequence}: ${exp.objective}\nStatus: ${exp.status}${exp.error ? ` (error: ${exp.error})` : ""}\nDeterministic facts: ${deterministic}\nAI analysis: (failed: ${String(err instanceof Error ? err.message : err).slice(0, 200)})`
+      );
+    }
   }
 
-  assertNotStopped(investigation.id);
-  const analysis = await getAI().analyzeObservation(
-    allObservations,
-    experiments[experiments.length - 1] ?? ({} as Experiment),
-    investigation.objective
-  );
+  const combined = analyses.join("\n\n") || "No observations were recorded for this investigation.";
+  return { investigation, analysis: combined };
+}
 
-  // NOTE: per-request AI accounting is done inside the AI adapter (each
-  // upstream model request, including retries, is counted). The legacy
-  // per-helper consumption was removed to avoid double charging.
-  return { investigation, analysis };
+/**
+ * Deterministic pre-analysis before AI: extract objective facts from an
+ * experiment's actions and observations so the model reasons over facts,
+ * not raw traces. Reduces AI token usage and grounds classification.
+ */
+function buildDeterministicFactSheet(experiment: Experiment): string {
+  const actions = store.listActions(experiment.id);
+  const lines: string[] = [];
+  lines.push(
+    `actions=${actions.length} success=${actions.filter((a) => a.status === "success").length} failures=${actions.filter((a) => a.status !== "success").length}`
+  );
+  for (const a of actions.slice(0, 12)) {
+    lines.push(
+      `  #${a.sequence} ${a.tool}.${a.action} on ${a.target.slice(0, 60)} → ${a.status}` +
+        (a.error ? ` (${a.error.slice(0, 120)})` : "")
+    );
+  }
+  return lines.join("; ");
 }
 
 // ── Hypothesis Phase ───────────────────────────────────────────────────────
@@ -1062,9 +1234,26 @@ function hypothesisForFinding(
 
 async function runReport(
   investigation: Investigation,
-  verificationByHypothesis: Map<string, string> = new Map()
+  verificationByHypothesis: Map<string, string> = new Map(),
+  opts?: { allowAfterBudgetExhaustion?: boolean }
 ): Promise<void> {
-  investigation = advancePhase(investigation, "report");
+  if (investigation.currentPhase !== "report") {
+    if (opts?.allowAfterBudgetExhaustion) {
+      // Documented exception: budget exhaustion at ANY phase jumps straight
+      // to the report phase so the investigation ends with a useful result
+      // instead of dying mid-pipeline. Cancellation is still respected.
+      const inv = store.getInvestigation(investigation.id);
+      if (!inv || inv.status === "cancelled") {
+        throw new InvestigationStoppedError("cancelled", investigation.id);
+      }
+      endPhaseStat(investigation.id, investigation.currentPhase);
+      beginPhaseStat(investigation.id, "report");
+      investigation = store.updateInvestigation(investigation.id, { currentPhase: "report" });
+      emit("phase_change", investigation.id, { phase: "report" });
+    } else {
+      investigation = advancePhase(investigation, "report");
+    }
+  }
 
   const findings = store.listFindings(investigation.id);
   const hypotheses = store.listHypotheses(investigation.id);
@@ -1073,7 +1262,17 @@ async function runReport(
 
   let reportResult;
   try {
-    assertNotStopped(investigation.id);
+    // After graceful budget exhaustion the run is intentionally finished —
+    // expiry must NOT block producing the final report. Cancellation still
+    // propagates: a cancelled investigation must not receive a report.
+    if (opts?.allowAfterBudgetExhaustion) {
+      const inv = store.getInvestigation(investigation.id);
+      if (!inv || inv.status === "cancelled") {
+        throw new InvestigationStoppedError("cancelled", investigation.id);
+      }
+    } else {
+      assertNotStopped(investigation.id);
+    }
     reportResult = await getAI().generateReport(
       investigation,
       findings,
@@ -1188,8 +1387,12 @@ export async function runInvestigation(
     throw new Error(`Investigation ${investigationId} not found`);
   }
 
-  const startTime = Date.now();
   budget.initBudget(investigationId);
+  // Restore checkpointed usage on retry/resume (does not reset the clock).
+  const priorUsage = investigation.budgetUsage;
+  if (priorUsage) {
+    budget.restoreUsage(investigationId, priorUsage);
+  }
   // Start wall-clock accounting unless a clock is already ticking (e.g. a
   // test/resume flow pinned a pre-expired origin — restarting it here would
   // silently grant a full fresh budget).
@@ -1203,6 +1406,19 @@ export async function runInvestigation(
       budget.consume(investigationId, "aiCalls");
     }
   });
+  // Bind the AI budget guards so every model request is gated by AI-call,
+  // AI-token, and runtime budgets inside the adapter's chat() choke point.
+  setAiBudgetGuards({
+    canAttempt: () => budget.canConsume(investigationId, "aiCalls"),
+    estimateTokens: (text) => estimatePromptTokens(text),
+    canSpendTokens: (estimated) => budget.canConsumeAiTokens(investigationId, estimated),
+    spendTokens: (estimated) => void budget.consumeAiTokens(investigationId, estimated),
+    remainingRuntimeMs: () => budget.remainingRuntime(investigationId),
+    callTimeoutMs: () => config.aiCallTimeoutMs,
+  });
+  // Record the initial phase entry (created → first phase is instrumented
+  // by advancePhase, but the initial phase itself needs a starting stat).
+  beginPhaseStat(investigationId, investigation.currentPhase);
 
   transitionStatus(investigation.status, "running");
   store.updateInvestigation(investigationId, { status: "running" });
@@ -1415,21 +1631,79 @@ export async function runInvestigation(
           store.updateInvestigation(investigationId, { status: "cancelled" });
         }
         emit("error", investigationId, { error: "Investigation cancelled" });
-      } else {
-        // Runtime budget exhausted: mark failed (not completed) through the
-        // state machine. running → failed is a valid transition.
+      } else if (error.reason === "runtime_expired") {
+        // ── Graceful budget exhaustion ────────────────────────────────────
+        // A budget-exhausted investigation is NOT an infrastructure
+        // failure: it still gets a report (what ran, what was observed,
+        // what remains unverified, why analysis stopped).
+        console.warn(`[${investigationId}] Runtime budget exhausted — producing graceful report`);
         const inv = store.getInvestigation(investigationId);
-        console.warn(`[${investigationId}] Runtime budget expired — stopping investigation`);
+        checkpointFailure(investigationId, inv?.currentPhase ?? null, "runtime_expired",
+          "Investigation stopped: runtime budget exhausted");
+        try {
+          // The report path has a local fallback when AI is unavailable,
+          // so the owner still gets a structured summary.
+          const current = store.getInvestigation(investigationId);
+          if (current && current.currentPhase !== "report" && current.currentPhase !== "complete") {
+            await runReport(current, new Map(), { allowAfterBudgetExhaustion: true });
+            const afterReport = store.getInvestigation(investigationId)!;
+            if (afterReport.currentPhase !== "complete") {
+              advancePhase(afterReport, "complete");
+            }
+          }
+        } catch (reportError) {
+          console.error(`[${investigationId}] Post-budget report generation failed:`, reportError);
+        }
+        const finished = store.getInvestigation(investigationId);
+        if (finished && (finished.status === "running" || finished.status === "paused")) {
+          transitionStatus(finished.status, "failed");
+          store.updateInvestigation(investigationId, { status: "failed" });
+        }
+        emit("complete", investigationId, { message: "Investigation stopped at budget limit; report available" });
+      } else {
+        // Unexpected stop reason.
+        const inv = store.getInvestigation(investigationId);
         if (inv && (inv.status === "running" || inv.status === "paused")) {
           transitionStatus(inv.status, "failed");
           store.updateInvestigation(investigationId, { status: "failed" });
         }
-        emit("error", investigationId, { error: "Runtime budget expired" });
+        emit("error", investigationId, { error: "Investigation stopped" });
       }
+    } else if (error instanceof AiBudgetExhaustedError) {
+      // AI call/token budget exhausted (or runtime expired inside the AI
+      // adapter): degrade gracefully the same way.
+      const reason: InvestigationFailureReason =
+        error.reason === "ai_tokens"
+          ? "ai_token_budget_exhausted"
+          : error.reason === "runtime"
+            ? "runtime_expired"
+            : "ai_call_budget_exhausted";
+      console.warn(`[${investigationId}] AI budget exhausted (${reason}) — producing graceful report`);
+      const inv = store.getInvestigation(investigationId);
+      checkpointFailure(investigationId, inv?.currentPhase ?? null, reason, error.message);
+      try {
+        const current = store.getInvestigation(investigationId);
+        if (current && current.currentPhase !== "report" && current.currentPhase !== "complete") {
+          await runReport(current, new Map(), { allowAfterBudgetExhaustion: true });
+          const afterReport = store.getInvestigation(investigationId)!;
+          if (afterReport.currentPhase !== "complete") {
+            advancePhase(afterReport, "complete");
+          }
+        }
+      } catch (reportError) {
+        console.error(`[${investigationId}] Post-budget report generation failed:`, reportError);
+      }
+      const finished = store.getInvestigation(investigationId);
+      if (finished && (finished.status === "running" || finished.status === "paused")) {
+        transitionStatus(finished.status, "failed");
+        store.updateInvestigation(investigationId, { status: "failed" });
+      }
+      emit("complete", investigationId, { message: "Investigation stopped at AI budget limit; report available" });
     } else {
       const errorMsg = error instanceof Error ? error.message : String(error);
       console.error(`Investigation ${investigationId} failed:`, errorMsg);
       const inv = store.getInvestigation(investigationId);
+      checkpointFailure(investigationId, inv?.currentPhase ?? null, "error", errorMsg.slice(0, 500));
       // Never overwrite a terminal status (e.g. a concurrent cancel).
       if (inv && (inv.status === "running" || inv.status === "paused")) {
         transitionStatus(inv.status, "failed");
@@ -1462,8 +1736,11 @@ export async function runInvestigation(
       }
     }
 
-    // Unbind the AI request recorder so a finished investigation's budget
-    // is never charged by later adapter usage.
+    // Unbind the AI request recorder and budget guards so a finished
+    // investigation's budget is never charged or enforced by later adapter
+    // usage, and drop the per-run phase-stat state.
     setAiRequestRecorder(null);
+    setAiBudgetGuards(null);
+    runStates.delete(investigationId);
   }
 }

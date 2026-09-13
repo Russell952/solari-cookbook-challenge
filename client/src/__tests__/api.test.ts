@@ -151,10 +151,35 @@ describe("client data flow: getSummary", () => {
 });
 
 describe("client data flow: evidence content URL", () => {
-  it("builds the content endpoint URL used for screenshots, traces, and replays", async () => {
+  it("builds the NESTED content endpoint the backend actually serves", async () => {
+    // Regression (production): the flat "/api/evidence/:id/content" URL
+    // matched no backend route — evidence content is served at
+    // "/api/investigations/:id/evidence/:evId/content". The flat URL fell
+    // through to the /api catch-all and returned {"error":"Not found"},
+    // breaking every "Download artifact" button.
     const { evidenceContentUrl } = await import("../api.js");
-    expect(evidenceContentUrl("ev_1")).toBe("/api/evidence/ev_1/content");
-    expect(evidenceContentUrl("ev-with-uuid")).toBe("/api/evidence/ev-with-uuid/content");
+    expect(evidenceContentUrl("inv_1", "ev_1")).toBe(
+      "/api/investigations/inv_1/evidence/ev_1/content"
+    );
+    expect(evidenceContentUrl("inv-with-uuid", "ev-with-uuid")).toBe(
+      "/api/investigations/inv-with-uuid/evidence/ev-with-uuid/content"
+    );
+  });
+
+  it("never builds the flat /api/evidence path that 404s in production", async () => {
+    const { evidenceContentUrl } = await import("../api.js");
+    const url = evidenceContentUrl("inv_1", "ev_1");
+    expect(url.startsWith("/api/evidence/")).toBe(false);
+    expect(url).toContain("/evidence/");
+    expect(url.endsWith("/content")).toBe(true);
+  });
+
+  it("URL-encodes path segments so ids cannot alter the route shape", async () => {
+    const { evidenceContentUrl } = await import("../api.js");
+    const url = evidenceContentUrl("inv/../../x", "ev?y");
+    expect(url).toBe(
+      "/api/investigations/inv%2F..%2F..%2Fx/evidence/ev%3Fy/content"
+    );
   });
 });
 
@@ -176,8 +201,8 @@ describe("client data flow: API base URL resolution (production deployment)", ()
     const { healthUrl, evidenceContentUrl, apiOrigin } = await import("../api.js");
     expect(apiOrigin).toBe("https://api-probe.onrender.com");
     expect(healthUrl).toBe("https://api-probe.onrender.com/api/health");
-    expect(evidenceContentUrl("ev_1")).toBe(
-      "https://api-probe.onrender.com/api/evidence/ev_1/content"
+    expect(evidenceContentUrl("inv_1", "ev_1")).toBe(
+      "https://api-probe.onrender.com/api/investigations/inv_1/evidence/ev_1/content"
     );
   });
 
@@ -246,10 +271,12 @@ describe("client authentication: cookie session flow", () => {
     const { fetchEvidence, subscribeToEvents } = await import("../api.js");
 
     fetchMock.mockResolvedValueOnce(new Response("x"));
-    await fetchEvidence("evidence/ev_1/content");
+    await fetchEvidence("inv_1", "ev_1");
     const evidenceCall = fetchMock.mock.calls[0];
     expect((evidenceCall[1] as RequestInit).credentials).toBe("include");
     expect((evidenceCall[1] as { headers: Record<string, string> }).headers.Authorization).toBeUndefined();
+    // The authenticated artifact fetch targets the nested evidence route.
+    expect(evidenceCall[0]).toBe("/api/investigations/inv_1/evidence/ev_1/content");
 
     // SSE stream fetch (cancel immediately)
     const sseResponse = {

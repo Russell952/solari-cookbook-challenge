@@ -160,9 +160,27 @@ export function validateApplicationUrl(raw: string): URL {
     throw new UrlValidationError("URL exceeds maximum length");
   }
 
+  let trimmed = raw.trim();
+
+  // ── Scheme normalization ───────────────────────────────────────────────
+  // The AI planner may extract bare hostnames (e.g. "app.rayern.com.ng" or
+  // "app.rayern.com.ng/") from recon link text or its training data. These
+  // are valid HTTP targets but `new URL()` rejects them as "Invalid URL"
+  // because they lack a scheme. This produces a spurious "URL is malformed"
+  // error that blocks a legitimate navigation target.
+  //
+  // Normalization: when the string has no scheme and looks like a hostname
+  // (contains a dot and no spaces), prepend "https://" — the only safe
+  // default for a cloud browser target. The full SSRF/port/host validation
+  // below still applies unchanged; this is input normalization, not
+  // validation loosening.
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed) && !trimmed.startsWith("//")) {
+    trimmed = "https://" + trimmed;
+  }
+
   let parsed: URL;
   try {
-    parsed = new URL(raw.trim());
+    parsed = new URL(trimmed);
   } catch {
     throw new UrlValidationError("URL is malformed");
   }

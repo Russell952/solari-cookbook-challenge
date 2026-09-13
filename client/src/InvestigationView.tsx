@@ -189,6 +189,7 @@ export function InvestigationView({ investigationId, onBack }: Props) {
       {viewingEvidence && (
         <EvidenceViewer
           evidence={viewingEvidence}
+          investigationId={investigationId}
           onClose={() => setViewingEvidence(null)}
         />
       )}
@@ -508,8 +509,16 @@ function EvidenceSection({
 
 // ── Evidence viewer modal ───────────────────────────────────────────────────
 
-function EvidenceViewer({ evidence, onClose }: { evidence: Evidence; onClose: () => void }) {
-  const url = evidenceContentUrl(evidence.id);
+function EvidenceViewer({
+  evidence,
+  investigationId,
+  onClose,
+}: {
+  evidence: Evidence;
+  investigationId: string;
+  onClose: () => void;
+}) {
+  const url = evidenceContentUrl(investigationId, evidence.id);
   const [text, setText] = useState<string | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -519,6 +528,11 @@ function EvidenceViewer({ evidence, onClose }: { evidence: Evidence; onClose: ()
   // first events readably and offer the raw artifact, never a <video> player.
   const isReplay = evidence.type === "replay";
   const isNdjsonReplay = isReplay && evidence.metadata?.format === "rrweb";
+  // Truthful availability: the summary endpoint reports whether artifact
+  // bytes were persisted at capture time. `artifactAvailable === false`
+  // means the record exists but has NO downloadable content — the download
+  // action must not be offered (nothing exists to fabricate).
+  const noArtifact = (evidence as { artifactAvailable?: boolean }).artifactAvailable === false;
 
   // All artifact fetches go through fetchEvidence so the Authorization
   // header is attached; screenshots render from a blob URL (an <img src>
@@ -526,8 +540,8 @@ function EvidenceViewer({ evidence, onClose }: { evidence: Evidence; onClose: ()
   useEffect(() => {
     let mounted = true;
     let blobUrl: string | null = null;
-    if (isImage) {
-      fetchEvidence(`evidence/${evidence.id}/content`)
+    if (isImage && !noArtifact) {
+      fetchEvidence(investigationId, evidence.id)
         .then((r) => {
           if (!r.ok) throw new Error(`HTTP ${r.status}`);
           return r.blob();
@@ -538,8 +552,8 @@ function EvidenceViewer({ evidence, onClose }: { evidence: Evidence; onClose: ()
           setImageUrl(blobUrl);
         })
         .catch((e) => { if (mounted) setError(e.message); });
-    } else if (isJson) {
-      fetchEvidence(`evidence/${evidence.id}/content`)
+    } else if (isJson && !noArtifact) {
+      fetchEvidence(investigationId, evidence.id)
         .then(async (r) => {
           if (!r.ok) throw new Error(`HTTP ${r.status}`);
           return r.json();
@@ -551,7 +565,7 @@ function EvidenceViewer({ evidence, onClose }: { evidence: Evidence; onClose: ()
       mounted = false;
       if (blobUrl) URL.revokeObjectURL(blobUrl);
     };
-  }, [evidence.id, isImage, isJson]);
+  }, [evidence.id, investigationId, isImage, isJson, noArtifact]);
 
   return (
     <div
@@ -606,11 +620,11 @@ function EvidenceViewer({ evidence, onClose }: { evidence: Evidence; onClose: ()
                 ? "rrweb session recording (NDJSON event stream — DOM-level, not video). First events shown; download for the full recording."
                 : "Session recording (NDJSON event stream). First events shown; download for the full recording."}
             </p>
-            <ReplayPreview evidenceId={evidence.id} />
+            <ReplayPreview investigationId={investigationId} evidenceId={evidence.id} />
           </div>
         )}
 
-        {!isImage && !isJson && !isReplay && (
+        {!isImage && !isJson && !isReplay && !noArtifact && (
           <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>
             This evidence type ({evidence.type}) has no inline viewer.
             <a href={url} download style={{ color: "var(--info)", marginLeft: "0.5rem" }}>
@@ -626,9 +640,20 @@ function EvidenceViewer({ evidence, onClose }: { evidence: Evidence; onClose: ()
         )}
 
         <div style={{ marginTop: "0.75rem", fontSize: "0.75rem" }}>
-          <a href={url} download style={{ color: "var(--info)" }}>
-            Download artifact
-          </a>
+          {noArtifact ? (
+            /* Truthful unavailability: evidence was recorded but no artifact
+               bytes were ever persisted (replay-unavailable, url-only, or a
+               capture that degraded). Never offer a download here — offering
+               one would imply content exists that does not. */
+            <span style={{ color: "var(--warning)" }}>
+              No artifact was stored for this evidence item — the recording was
+              unavailable or this record has no downloadable content.
+            </span>
+          ) : (
+            <a href={url} download style={{ color: "var(--info)" }}>
+              Download artifact
+            </a>
+          )}
         </div>
       </div>
     </div>
@@ -645,15 +670,22 @@ function EvidenceViewer({ evidence, onClose }: { evidence: Evidence; onClose: ()
  * path — never by string-rewriting a URL (a `.replace("/api", …)` would
  * corrupt an absolute production base like https://api-probe.onrender.com).
  */
-function ReplayPreview({ evidenceId }: { evidenceId: string }) {
+function ReplayPreview({
+  investigationId,
+  evidenceId,
+}: {
+  investigationId: string;
+  evidenceId: string;
+}) {
   const [preview, setPreview] = useState<string | null>(null);
   const [eventCount, setEventCount] = useState<number | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
-    // Authenticated fetch through the API layer (Authorization header attached).
-    const req = fetchEvidence(`evidence/${evidenceId}/content`);
+    // Authenticated fetch through the API layer (correct nested evidence
+    // route + session cookie attached automatically).
+    const req = fetchEvidence(investigationId, evidenceId);
     req
       .then((r) => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -679,7 +711,7 @@ function ReplayPreview({ evidenceId }: { evidenceId: string }) {
         if (alive) setErr(e instanceof Error ? e.message : String(e));
       });
     return () => { alive = false; };
-  }, [evidenceId]);
+  }, [investigationId, evidenceId]);
 
   if (err) return <p style={{ fontSize: "0.85rem", color: "var(--danger)" }}>Replay could not be loaded: {err}</p>;
   if (preview === null) return <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>Loading replay…</p>;

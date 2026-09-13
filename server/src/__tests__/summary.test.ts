@@ -212,6 +212,42 @@ describe("GET /api/investigations/:id/summary", () => {
     expect(evidence[1].type).toBe("url");
   });
 
+  it("passes artifact availability through to the summary payload", () => {
+    // Regression: the summary omitted artifactAvailable, so the UI could not
+    // distinguish "artifact exists" from "evidence with no artifact" and
+    // offered a download for replay-unavailable records.
+    const id = populateInvestigation({});
+    store.createEvidence({
+      id: "ev_stored",
+      investigationId: id,
+      experimentId: null,
+      observationId: null,
+      type: "screenshot",
+      uri: null,
+      contentHash: "h1",
+      metadata: { artifactAvailable: true, mimeType: "image/png", byteSize: 1024 },
+    });
+    store.createEvidence({
+      id: "ev_unavailable",
+      investigationId: id,
+      experimentId: null,
+      observationId: null,
+      type: "replay",
+      uri: null,
+      contentHash: "",
+      metadata: { artifactAvailable: false },
+    });
+
+    const stored = store.listEvidence(id).find((e) => e.id === "ev_stored");
+    const unavailable = store.listEvidence(id).find((e) => e.id === "ev_unavailable");
+    // The summary route maps metadata.artifactAvailable into the payload —
+    // assert the exact fields the UI consumes.
+    expect(stored?.metadata.artifactAvailable).toBe(true);
+    expect(stored?.metadata.mimeType).toBe("image/png");
+    expect(stored?.metadata.byteSize).toBe(1024);
+    expect(unavailable?.metadata.artifactAvailable).toBe(false);
+  });
+
   it("includes findings", async () => {
     const id = populateInvestigation({
       findings: [

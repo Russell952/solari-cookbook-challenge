@@ -77,6 +77,10 @@ interface SummaryResponse {
     contentHash: string | null;
     /** How the evidence was produced: recon | experiment | verification. */
     provenance: EvidenceProvenance;
+    /** Whether persisted artifact bytes exist (absent = legacy record). */
+    artifactAvailable?: boolean;
+    mimeType?: string;
+    byteSize?: number;
     createdAt: string;
   }>;
   evidenceCount: number;
@@ -251,6 +255,13 @@ summaryRouter.get("/", (req: Request, res: Response) => {
       uri: e.uri,
       contentHash: e.contentHash,
       provenance: provenanceOf(e),
+      // Truthful artifact availability from the collector's capture-time
+      // record (metadata.artifactAvailable). Passed through as-is: absent for
+      // legacy records, false for replay-unavailable/url evidence — the UI
+      // must never offer a download for bytes that were never stored.
+      artifactAvailable: e.metadata?.artifactAvailable as boolean | undefined,
+      mimeType: e.metadata?.mimeType as string | undefined,
+      byteSize: e.metadata?.byteSize as number | undefined,
       createdAt: e.createdAt,
     })),
     evidenceCount: evidence.length,

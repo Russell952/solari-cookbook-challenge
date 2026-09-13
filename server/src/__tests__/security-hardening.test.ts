@@ -296,6 +296,10 @@ describe("SSRF validation (validateApplicationUrl)", () => {
     ["https://example.com:22/", "blocked port"],
     ["not a url at all", "malformed"],
     ["", "empty"],
+    // Scheme-less hostnames that look like private infra must still be blocked
+    // after normalization (https:// prefix).
+    ["localhost", "scheme-less localhost"],
+    ["127.0.0.1", "scheme-less loopback IP"],
   ];
 
   for (const [url, label] of blocked) {
@@ -310,6 +314,12 @@ describe("SSRF validation (validateApplicationUrl)", () => {
     "https://astonishing-alpaca-12a6ed.netlify.app",
     "https://example.com:8443/app",
     "https://example.com:8080/app",
+    // Scheme-less hostnames: the AI planner may extract bare hostnames from
+    // recon link text. These are valid HTTP targets; the validator normalizes
+    // them to https:// before applying the full SSRF/port/host checks.
+    "app.rayern.com.ng",
+    "app.rayern.com.ng/",
+    "example.com",
   ];
   for (const url of allowed) {
     it(`allows ${url}`, () => {

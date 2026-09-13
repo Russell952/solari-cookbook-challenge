@@ -123,8 +123,14 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 /** Authorized fetch for evidence artifacts (returns the raw Response). */
-export async function fetchEvidence(path: string): Promise<Response> {
-  const res = await fetch(`${BASE}${path}`, { credentials: FETCH_CREDENTIALS, headers: authHeaders() });
+export async function fetchEvidence(
+  investigationId: string,
+  evidenceId: string
+): Promise<Response> {
+  const res = await fetch(
+    evidenceContentUrl(investigationId, evidenceId),
+    { credentials: FETCH_CREDENTIALS, headers: authHeaders() }
+  );
   if (res.status === 401) notifySessionExpired();
   return res;
 }
@@ -389,11 +395,24 @@ export function getSummary(investigationId: string): Promise<InvestigationSummar
 
 /**
  * URL of the persisted artifact bytes for an evidence item.
+ *
+ * The backend serves evidence content NESTED under its investigation —
+ * `/api/investigations/:id/evidence/:evId/content` (see server/src/api/index.ts:
+ * the evidence router is mounted at "/investigations/:id/evidence"). A flat
+ * `/api/evidence/:id/content` URL matches NO backend route and falls through
+ * to the /api catch-all 404 (`{"error":"Not found"}`) — the exact production
+ * bug this fixes. The investigationId is required, not optional: every
+ * evidence record carries it, so constructing the URL without one was the
+ * root defect.
+ *
  * NOTE: an <img src> cannot carry Authorization headers — evidence viewers
  * must fetch via fetchEvidence() and render blobs, not raw URLs.
  */
-export function evidenceContentUrl(evidenceId: string): string {
-  return `${BASE}/evidence/${evidenceId}/content`;
+export function evidenceContentUrl(
+  investigationId: string,
+  evidenceId: string
+): string {
+  return `${BASE}/investigations/${encodeURIComponent(investigationId)}/evidence/${encodeURIComponent(evidenceId)}/content`;
 }
 
 export function listExperiments(investigationId: string): Promise<Experiment[]> {

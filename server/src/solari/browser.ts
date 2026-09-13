@@ -18,6 +18,7 @@ import { BrowserSession as SolariBrowserSession } from "@solarisdk/browser";
 import { getBrowserSolari, trackBrowserSession, untrackBrowserSession } from "./client.js";
 import { store } from "../store/index.js";
 import { isPubliclyRoutableHost } from "../security/url-validation.js";
+import { assertNavigationAllowed, NavigationPolicyError } from "../security/navigation-policy.js";
 import { profiler } from "../profiler/index.js";
 
 // ── Connection-time network policy (DNS-rebinding / SSRF enforcement) ──────
@@ -93,6 +94,8 @@ export interface ProbeBrowserSession {
   solariSessionId: string;
   /** Whether recording was enabled at creation. */
   recordingEnabled: boolean;
+  /** The investigation this session belongs to (canonical-target binding). */
+  investigationId: string;
 }
 
 /**
@@ -229,6 +232,7 @@ export async function createBrowserSession(
     session,
     solariSessionId: session.id,
     recordingEnabled: opts?.recording ?? true,
+    investigationId,
   };
 }
 
@@ -248,11 +252,33 @@ async function getDefaultPage(session: ProbeBrowserSession): Promise<ReturnType<
 /**
  * Navigate to a URL.
  * Detects downloads and returns them as a distinct result.
+ *
+ * ── Canonical-target choke point ────────────────────────────────────
+ * This is the ONLY path through which Probe drives page.goto, so the
+ * canonical-target policy is enforced HERE (fail closed) — not merely at
+ * the orchestrator's dispatch. The canonical URL is read from the store
+ * (the investigation owning this session); enforcement therefore holds
+ * for normal experiments, verification experiments, adaptive retries,
+ * and recon alike, and cannot be bypassed by any planner path. The
+ * orchestrator ALSO checks at dispatch to fail the action with a clean,
+ * classified error before any browser work happens.
  */
 export async function navigate(
   session: ProbeBrowserSession,
   url: string
 ): Promise<{ title: string; url: string; downloaded?: boolean; downloadUrl?: string }> {
+  const investigation = store.getInvestigation(session.investigationId);
+  try {
+    assertNavigationAllowed(url, investigation?.applicationUrl);
+  } catch (err) {
+    if (err instanceof NavigationPolicyError) {
+      console.warn(
+        `[browser] Navigation policy rejected ${url} for investigation ${session.investigationId}`
+      );
+    }
+    throw err;
+  }
+
   const page = await getDefaultPage(session);
 
   // Listen for download events
@@ -476,7 +502,10 @@ export async function readText(
 ): Promise<string> {
   const page = await getDefaultPage(session);
   const resolved = await resolveTarget(page, selector, reconContext);
-  return page.locator(resolved).innerText();
+  // Bounded read: an explicit timeout keeps a missing element from hitting
+  // Playwright's 30s default innerText wait (regression: an unresolvable
+  // target like "page" stalled an experiment for 30s before failing).
+  return page.locator(resolved).innerText({ timeout: INTERACTION_TIMEOUT_MS });
 }
 
 /**
@@ -681,7 +710,7 @@ async function reconResolve(
             return tag + '[name="' + (el as HTMLInputElement).name + '"]';
           }
           return null;
-        });
+        }, undefined, { timeout: INTERACTION_TIMEOUT_MS });
         if (resolved) return resolved;
         // Fallback: use getByText directly (not a CSS selector, but Playwright handles it)
         return `text="${recon.text}"`;
@@ -699,7 +728,7 @@ async function reconResolve(
  * This distinguishes "hidden by CSS" from "off-screen but visible".
  */
 async function isHidden(
-  locator: { evaluate: (fn: (el: HTMLElement) => boolean) => Promise<boolean> }
+  locator: { evaluate: (fn: (el: HTMLElement) => boolean, arg?: unknown, options?: { timeout?: number }) => Promise<boolean> }
 ): Promise<boolean> {
   try {
     return await locator.evaluate((el: HTMLElement) => {
@@ -717,7 +746,7 @@ async function isHidden(
         parent = parent.parentElement;
       }
       return false;
-    });
+    }, undefined, { timeout: INTERACTION_TIMEOUT_MS });
   } catch {
     return false; // if we can't check, assume visible (safe default)
   }
@@ -740,7 +769,11 @@ async function resolveTarget(
   const looksLikeSelector =
     (/^[#.\[a-zA-Z]/.test(normalized) && !/\s/.test(normalized)) ||
     (/^[#.\[a-zA-Z]/.test(normalized) && /[>~+]|\[[^\]]+\]/.test(normalized));
-  if (looksLikeSelector) {
+  // A bare word (no selector syntax) is not a CSS selector — it is a
+  // natural-language target. Passing it to locator() made Playwright wait
+  // for a nonexistent element (e.g. `locator("page")` → 30s timeout).
+  const looksLikeBareWord = /^[a-zA-Z][a-zA-Z0-9_-]*$/.test(normalized);
+  if (looksLikeSelector && !looksLikeBareWord) {
     try {
       const count = await page.locator(normalized).count();
       if (count === 1) return normalized;
@@ -789,7 +822,7 @@ async function resolveTarget(
         }
         // Fallback: tag with exact text (Playwright supports this)
         return tag + ':has-text("' + el.textContent.trim().replace(/"/g, '\\"') + '")';
-      });
+      }, undefined, { timeout: INTERACTION_TIMEOUT_MS });
       return resolved;
     }
     if (count > 1) {
@@ -815,7 +848,7 @@ async function resolveTarget(
           if (href) return 'a[href="' + href + '"]';
         }
         return tag + ':has-text("' + el.textContent.trim().slice(0, 50).replace(/"/g, '\\"') + '")';
-      });
+      }, undefined, { timeout: INTERACTION_TIMEOUT_MS });
       return resolved;
     }
   } catch {
@@ -860,6 +893,15 @@ const TYPE_MAX_RETRIES = 2;
 const TYPE_RETRY_DELAYS_MS = [800, 2000];
 
 /**
+ * Hard ceiling for any single element wait/interaction. Playwright's default
+ * (30s) is far beyond what an investigation can afford per action: a missing
+ * element should fail in seconds so the experiment records the failure and
+ * the orchestrator moves on. Also bounds getByText/getByLabel/getByRole
+ * polling inside resolveTarget.
+ */
+export const INTERACTION_TIMEOUT_MS = 8_000;
+
+/**
  * Wait for an element to appear in the DOM with a reasonable timeout.
  * Uses Playwright's built-in waitForSelector which is more reliable
  * than polling count() for SPA-rendered content.
@@ -890,12 +932,12 @@ async function waitForElement(
  * Check if an element is a fixed/sticky positioned control.
  * These elements don't need scroll-into-view and may fail if we try.
  */
-async function isFixedOrSticky(locator: { evaluate: (fn: (el: HTMLElement) => string) => Promise<string> }): Promise<boolean> {
+async function isFixedOrSticky(locator: { evaluate: (fn: (el: HTMLElement) => string, arg?: unknown, options?: { timeout?: number }) => Promise<string> }): Promise<boolean> {
   try {
     const position = await locator.evaluate((el: HTMLElement) => {
       const style = window.getComputedStyle(el);
       return style.position;
-    });
+    }, undefined, { timeout: INTERACTION_TIMEOUT_MS });
     return position === "fixed" || position === "sticky";
   } catch {
     return false;
@@ -1117,7 +1159,7 @@ export async function type(
       // Focus the element first to ensure it's interactable
       try { await locator.first().focus({ timeout: 2_000 }); } catch { /* best effort */ }
       await profiler.span("browser", "type.fill", { selector, attempt }, () =>
-        locator.first().fill(text)
+        locator.first().fill(text, { timeout: INTERACTION_TIMEOUT_MS })
       );
       return; // success
     } catch (typeErr) {
@@ -1146,7 +1188,7 @@ export async function screenshot(
 ): Promise<Buffer> {
   const page = await getDefaultPage(session);
   return profiler.span("browser", "screenshot", undefined, () =>
-    page.screenshot({ type: "png" })
+    page.screenshot({ type: "png", timeout: INTERACTION_TIMEOUT_MS })
   );
 }
 
@@ -1157,7 +1199,9 @@ export async function getDomContent(
   session: ProbeBrowserSession
 ): Promise<string> {
   const page = await getDefaultPage(session);
-  return profiler.span("browser", "dom.content", undefined, () => page.content());
+  return profiler.span("browser", "dom.content", undefined, () =>
+    page.content()
+  );
 }
 
 /**

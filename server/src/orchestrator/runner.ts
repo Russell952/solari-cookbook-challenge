@@ -44,6 +44,8 @@ import * as budget from "./budget.js";
 import { emit } from "../api/events.js";
 import { setAiRequestRecorder, estimatePromptTokens } from "../ai/openai.js";
 import { validateApplicationUrl } from "../security/url-validation.js";
+import { assertNavigationAllowed } from "../security/navigation-policy.js";
+import { classifyActionError, isProbeLimitationError } from "../security/error-classification.js";
 import { config } from "../config/index.js";
 import { profiler, isProfilingEnabled } from "../profiler/index.js";
 
@@ -90,6 +92,15 @@ interface RunState {
 }
 
 const runStates = new Map<string, RunState>();
+
+/**
+ * Whether an in-process runner currently owns this investigation's lifecycle
+ * (run state registered). The server startup reconciliation uses this to
+ * distinguish a live run from an orphan left by a previous process.
+ */
+export function hasActiveRunner(investigationId: string): boolean {
+  return runStates.has(investigationId);
+}
 
 function runState(investigationId: string): RunState {
   let s = runStates.get(investigationId);
@@ -149,6 +160,14 @@ function checkpointPhaseStats(investigationId: string): void {
     phaseStats: s.phaseStats.map((p) => ({ ...p })),
   });
 }
+
+/**
+ * Grace margin added on top of the runtime budget for the terminal watchdog.
+ * The watchdog must never fire before the pipeline's own cooperative expiry
+ * checks have had a fair chance to terminate the run gracefully; it exists
+ * only for promises that never settle.
+ */
+const WATCHDOG_GRACE_MS = 30_000;
 
 /**
  * Persist a structured failure. `reason` distinguishes budget exhaustion
@@ -773,7 +792,7 @@ async function runExperiment(investigation: Investigation, experiment: Experimen
       emit("action_started", investigation.id, { actionId: action.id, action: planned.action });
 
       try {
-        const result = await executeAction(planned, browserSession, investigation.id, appRecon);
+        const result = await executeAction(planned, browserSession, investigation.id, appRecon, investigation.applicationUrl);
 
         // If this was a browser launch, track the session
         if (planned.action === "launch" && result.session) {
@@ -813,14 +832,18 @@ async function runExperiment(investigation: Investigation, experiment: Experimen
           })
         );
       } catch (error) {
-        const errorMsg = error instanceof Error ? error.message : String(error);
+        const rawMsg = error instanceof Error ? error.message : String(error);
+        // Honest failure classification: a bounded timeout or a navigation-
+        // policy rejection on a target we never proved broken is a PROBE
+        // limitation, not evidence about the application under test.
+        const errorMsg = isProbeLimitationError(rawMsg) ? classifyActionError(rawMsg) : rawMsg;
         store.updateAction(action.id, {
           status: "non_retryable_failure",
           error: errorMsg,
           completedAt: new Date().toISOString(),
         });
         emit("action_completed", investigation.id, { actionId: action.id, status: "failed", error: errorMsg });
-        actionHandle.end(false, { error: errorMsg, timedOut: /timeout|timed out/i.test(errorMsg) });
+        actionHandle.end(false, { error: errorMsg, timedOut: /timeout|timed out/i.test(rawMsg) });
         throw error;
       }
       actionHandle.end(true);
@@ -947,7 +970,8 @@ async function executeAction(
   planned: { tool: string; action: string; target: string; input?: Record<string, unknown>; viewport?: { width: number; height: number; preset?: string } },
   currentSession: ProbeBrowserSession | null,
   investigationId: string,
-  appRecon?: ApplicationRecon | null
+  appRecon?: ApplicationRecon | null,
+  currentApplicationUrl?: string
 ): Promise<ActionResult> {
   // ── Security: validate tool and action before dispatching ────────────
   // The AI must not introduce new tools or actions that the orchestrator
@@ -988,6 +1012,13 @@ async function executeAction(
             `Blocked by URL security policy: ${err instanceof Error ? err.message : "invalid URL"}`
           );
         }
+        // ── Canonical-target boundary ────────────────────────────
+        // SSRF validation only proves a host is public — it does not prove
+        // the navigation belongs to THIS investigation. A model-generated
+        // target for a related-but-different site (observed live: the
+        // verified target was app.rayern.com.ng but a plan navigated to
+        // rayern.com) must not escape the verified investigation context.
+        assertNavigationAllowed(planned.target, currentApplicationUrl);
         const result = await browser.navigate(currentSession, planned.target);
         const screenshot = result.downloaded ? null : await browser.screenshot(currentSession);
         const data: Record<string, unknown> = {
@@ -1230,7 +1261,41 @@ async function runVerification(
   for (const hypothesis of hypotheses) {
     if (hypothesis.status !== "investigating") continue;
 
+    // Per-hypothesis isolation: one failed verification (invalid target,
+    // policy rejection, browser/AI error, budget expiry) must never abort
+    // the whole verification phase and must NEVER leave the investigation
+    // non-terminal (live regression: a stuck verification awaited one
+    // unsettled promise for ~128 minutes). The loop continues with the next
+    // hypothesis; the failed one is marked honestly.
+    try {
+      await verifyHypothesis(investigation, hypothesis, verificationByHypothesis);
+    } catch (verificationExperimentError) {
+      if (verificationExperimentError instanceof InvestigationStoppedError) {
+        throw verificationExperimentError; // cancelled/expired — propagate
+      }
+      console.error(
+        `[${investigation.id}] Verification of hypothesis ${hypothesis.id} failed — marking inconclusive:`,
+        verificationExperimentError instanceof Error ? verificationExperimentError.message : verificationExperimentError
+      );
+      store.updateHypothesis(hypothesis.id, { status: "inconclusive" });
+    }
+  }
+
+  return investigation;
+}
+
+/** Verify a single hypothesis end-to-end. Throws on failure; the caller isolates. */
+async function verifyHypothesis(
+  investigation: Investigation,
+  hypothesis: Hypothesis,
+  verificationByHypothesis: Map<string, string>
+): Promise<void> {
+  {
     const evidence = store.listEvidence(investigation.id);
+    // Budget enforcement BEFORE the AI call: a never-settling provider call
+    // is the pathology that left a real investigation running for ~128
+    // minutes. If the deadline has already passed, stop here instead of
+    // starting another awaited operation.
     assertNotStopped(investigation.id);
     const verification = await getAI().designVerification(hypothesis, evidence);
 
@@ -1245,14 +1310,14 @@ async function runVerification(
       if (invalidActions.length > 0) {
         console.warn(`Verification experiment has ${invalidActions.length} invalid actions, marking hypothesis inconclusive`);
         store.updateHypothesis(hypothesis.id, { status: "inconclusive" });
-        continue;
+        return;
       }
 
       // Check verification reserve capacity
       if (!budget.canConsumeVerification(investigation.id)) {
         console.warn(`Verification budget exhausted, marking hypothesis inconclusive`);
         store.updateHypothesis(hypothesis.id, { status: "inconclusive" });
-        continue;
+        return;
       }
 
       // Consume verification experiment slot
@@ -1295,8 +1360,6 @@ async function runVerification(
       store.updateHypothesis(hypothesis.id, { status: "inconclusive" });
     }
   }
-
-  return investigation;
 }
 
 // ── Report Phase ───────────────────────────────────────────────────────────
@@ -1548,6 +1611,66 @@ export async function runInvestigation(
   // usedRuntime (that double-counting expired investigations at ~half the
   // configured budget, killing runs inside "Preparing experiments" before
   // the first browser action could execute).
+
+  // ── Guaranteed-terminal watchdog ──────────────────────────────────────
+  // Live regression: a real verification phase hung for ~128 minutes (over
+  // 12× its 600s budget) because a single awaited provider call never
+  // settled — the cooperative budget checks (assertNotStopped between
+  // phases/actions) never ran again, so the investigation stayed `running`
+  // forever. Cooperative checks are necessary but not sufficient: they can
+  // only fire BETWEEN awaits. This watchdog is the non-cooperative backstop
+  // that makes terminal state a GUARANTEE: when the remaining runtime
+  // budget is exhausted, the durable record is transitioned to `failed`
+  // (honest reason, resumable via resume/retry) and an SSE event is
+  // emitted — no matter what the in-flight pipeline promise is doing. A
+  // wedged pipeline promise may still be pending afterwards (that is
+  // logged); the VISIBLE system (persistence, SSE, UI polling) is terminal
+  // either way. The clock origin (not this run's start) is used so a
+  // resumed investigation keeps its original deadline.
+
+  // Slot handoff: if the watchdog has to release the concurrency slot, the
+  // pipeline's own finally must not release it a second time.
+  let slotReleasedByWatchdog = false;
+
+  const watchdogDeadlineMs =
+    budget.remainingRuntime(investigationId) + WATCHDOG_GRACE_MS;
+  const watchdog: NodeJS.Timeout = setTimeout(() => {
+    console.error(
+      `[${investigationId}] WATCHDOG: runtime budget exhausted without pipeline termination — forcing terminal state (a phase promise likely never settled)`
+    );
+    try {
+      const inv = store.getInvestigation(investigationId);
+      if (!inv) return;
+      if (inv.status === "running" || inv.status === "paused") {
+        transitionStatus(inv.status, "failed");
+        store.updateInvestigation(investigationId, {
+          status: "failed",
+          failure: {
+            reason: "runtime_expired",
+            message:
+              "Investigation was terminated by the runtime watchdog after exceeding its configured budget — an internal operation never completed.",
+            phase: inv.currentPhase,
+            at: new Date().toISOString(),
+          },
+        });
+        emit("error", investigationId, {
+          error: "Investigation terminated: runtime budget exceeded",
+        });
+      }
+    } catch (watchdogErr) {
+      // Never mask the underlying problem with a watchdog failure.
+      console.error(
+        `[${investigationId}] Watchdog forced-termination error:`,
+        watchdogErr instanceof Error ? watchdogErr.message : watchdogErr
+      );
+    }
+    if (opts?.releaseSlotOnFinish && !slotReleasedByWatchdog) {
+      slotReleasedByWatchdog = true;
+      releaseSlot();
+    }
+  }, watchdogDeadlineMs);
+  // Never keep the process alive just for the watchdog.
+  watchdog.unref();
 
   try {
     // Resume from current phase — do not restart completed phases.
@@ -1834,12 +1957,16 @@ export async function runInvestigation(
     // Stop wall-clock accounting — do not also add elapsed time into
     // usedRuntime (the clock already covers the entire run; adding the
     // elapsed span again double-counted runtime).
+    // The pipeline promise settled — the watchdog backstop is no longer needed.
+    clearTimeout(watchdog);
+
     budget.stopRuntimeClock(investigationId);
 
     // Release the HTTP-layer concurrency slot in EVERY termination path —
     // completion, failure, cancellation, runtime expiry, or unexpected
     // throw — so a wedged run can never permanently consume capacity.
-    if (opts?.releaseSlotOnFinish) releaseSlot();
+    // (If the watchdog already released it, the slot was handed off — do not double-release.)
+    if (opts?.releaseSlotOnFinish && !slotReleasedByWatchdog) releaseSlot();
 
     // Cleanup any active Solari sessions
     const activeSessions = store.getActiveSessions(investigationId);

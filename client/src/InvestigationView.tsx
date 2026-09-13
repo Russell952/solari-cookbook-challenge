@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   getSummary, subscribeToEvents, cancelInvestigation,
   evidenceContentUrl, fetchEvidence,
@@ -33,6 +33,7 @@ export function InvestigationView({ investigationId, onBack }: Props) {
   const [events, setEvents] = useState<SSEEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [viewingEvidence, setViewingEvidence] = useState<Evidence | null>(null);
+  const [eventsLive, setEventsLive] = useState(true);
 
   const refresh = useCallback(async () => {
     try {
@@ -43,6 +44,19 @@ export function InvestigationView({ investigationId, onBack }: Props) {
       setLoadError(e instanceof Error ? e.message : "Failed to load investigation");
     }
   }, [investigationId]);
+
+  // Poll the authoritative summary while the investigation is running so a
+  // silent SSE stream — or a backend run that stopped without reaching a
+  // terminal status — can never leave the UI stuck on Running. The elapsed
+  // timer ticks independently at 1s; this only refreshes real state.
+  const isRunning = summary?.investigation.status === "running";
+  useEffect(() => {
+    if (!isRunning) return;
+    const id = setInterval(() => {
+      refresh().catch(() => {});
+    }, 5000);
+    return () => clearInterval(id);
+  }, [isRunning, refresh]);
 
   // Load initial data — one consolidated request
   useEffect(() => {
@@ -56,24 +70,30 @@ export function InvestigationView({ investigationId, onBack }: Props) {
 
   // Subscribe to SSE events; every relevant event re-pulls the summary so
   // progress always reflects actual backend state (no fake progress bar).
+  // Connection liveness is surfaced so a dropped stream shows Reconnecting
+  // instead of a truthful-looking Live indicator.
   useEffect(() => {
-    const unsub = subscribeToEvents(investigationId, (event) => {
-      setEvents((prev) => [...prev.slice(-199), event]);
-      if (
-        event.type === "phase_change" ||
-        event.type === "experiment_started" ||
-        event.type === "experiment_completed" ||
-        event.type === "action_completed" ||
-        event.type === "hypothesis_proposed" ||
-        event.type === "hypothesis_updated" ||
-        event.type === "finding_created" ||
-        event.type === "evidence_captured" ||
-        event.type === "error" ||
-        event.type === "complete"
-      ) {
-        refresh().catch(() => {});
-      }
-    });
+    const unsub = subscribeToEvents(
+      investigationId,
+      (event) => {
+        setEvents((prev) => [...prev.slice(-199), event]);
+        if (
+          event.type === "phase_change" ||
+          event.type === "experiment_started" ||
+          event.type === "experiment_completed" ||
+          event.type === "action_completed" ||
+          event.type === "hypothesis_proposed" ||
+          event.type === "hypothesis_updated" ||
+          event.type === "finding_created" ||
+          event.type === "evidence_captured" ||
+          event.type === "error" ||
+          event.type === "complete"
+        ) {
+          refresh().catch(() => {});
+        }
+      },
+      setEventsLive
+    );
     return unsub;
   }, [investigationId, refresh]);
 
@@ -144,7 +164,7 @@ export function InvestigationView({ investigationId, onBack }: Props) {
 
       {/* Live progress experience — real phases, counters, and events */}
       <TerminalBanner model={progressModel} />
-      <InvestigationProgress summary={summary} events={events} />
+      <InvestigationProgress summary={summary} events={events} connectionLive={eventsLive} />
 
       {/* Findings — with evidence provenance */}
       <FindingsSection

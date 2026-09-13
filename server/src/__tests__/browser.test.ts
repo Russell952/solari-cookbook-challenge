@@ -108,6 +108,7 @@ describe("Browser Adapter", () => {
       expect(session.probeSessionId).toMatch(/^bsess_/);
       expect(session.solariSessionId).toBe("solari-session-123");
       expect(session.recordingEnabled).toBe(true);
+      expect(session.investigationId).toBe("inv_1");
     });
 
     it("creates a session with recording disabled when opted out", async () => {
@@ -165,7 +166,15 @@ describe("Browser Adapter", () => {
 
   describe("navigate", () => {
     it("navigates and returns title/url", async () => {
-      const session = await browser.createBrowserSession("inv_1");
+      // The canonical-target policy is enforced inside navigate(); establish
+      // the investigation's verified target first.
+      const inv = store.createInvestigation({
+        repositoryUrl: "",
+        applicationUrl: "http://example.com",
+        objective: "test",
+      });
+      store.setOwner(inv.id, "tester");
+      const session = await browser.createBrowserSession(inv.id);
       const result = await browser.navigate(session, "http://example.com");
 
       expect(mockPage.goto).toHaveBeenCalledWith(
@@ -199,7 +208,12 @@ describe("Browser Adapter", () => {
       const session = await browser.createBrowserSession("inv_1");
       await browser.type(session, "input#email", "test@example.com");
       const locator = mockPage.locator("input#email");
-      expect(locator.fill).toHaveBeenCalledWith("test@example.com");
+      // Bounded fill: an explicit timeout replaces Playwright's 30s default
+      // so a missing element fails in seconds, not half a minute.
+      expect(locator.fill).toHaveBeenCalledWith(
+        "test@example.com",
+        { timeout: browser.INTERACTION_TIMEOUT_MS }
+      );
     });
   });
 
@@ -208,7 +222,7 @@ describe("Browser Adapter", () => {
       const session = await browser.createBrowserSession("inv_1");
       const buf = await browser.screenshot(session);
       expect(buf).toBeInstanceOf(Buffer);
-      expect(mockPage.screenshot).toHaveBeenCalledWith({ type: "png" });
+      expect(mockPage.screenshot).toHaveBeenCalledWith({ type: "png", timeout: 8_000 });
     });
   });
 

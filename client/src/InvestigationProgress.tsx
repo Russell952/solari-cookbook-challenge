@@ -11,6 +11,7 @@
  * render once, in the sections below the progress grid. The activity card's
  * current-experiment line covers "what is running right now".
  */
+import { useEffect, useState } from "react";
 import { CheckIcon, CrossIcon, DotIcon, CircleIcon, BanIcon, AlertIcon } from "./icons";
 import {
   buildProgressModel,
@@ -20,14 +21,39 @@ import {
 } from "./progress";
 import type { InvestigationSummary, SSEEvent } from "./api";
 
+/**
+ * Ticks a wall-clock timestamp roughly once per second while `active`.
+ *
+ * The elapsed-runtime metric is `now - startedAt` (see buildProgressModel);
+ * without this tick the value only changed when an SSE event happened to
+ * re-render the component, so the timer jumped in multi-minute steps.
+ * `Date.now()` is re-read every tick — never accumulated — so the counter
+ * cannot drift, and the interval is created once per mount (not recreated
+ * when summary/events state changes).
+ */
+function useNowTick(active: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [active]);
+  return now;
+}
+
 interface Props {
   summary: InvestigationSummary;
   /** Live events from the existing SSE subscription (display only). */
   events: SSEEvent[];
+  /** False while the SSE stream is down/reconnecting (defaults true). */
+  connectionLive?: boolean;
 }
 
-export function InvestigationProgress({ summary, events }: Props) {
-  const model = buildProgressModel(summary);
+export function InvestigationProgress({ summary, events, connectionLive = true }: Props) {
+  // Tick only while the investigation is actually running; terminal states
+  // render a fixed runtime so the interval is torn down.
+  const now = useNowTick(summary.investigation.status === "running");
+  const model = buildProgressModel(summary, now);
   return (
     <div className="progress-grid">
       <div className="card progress-stages" aria-label="Investigation progress">
@@ -35,8 +61,12 @@ export function InvestigationProgress({ summary, events }: Props) {
           <h2>Progress</h2>
           {model.isRunning && (
             <span className="progress-live" role="status">
-              <span className="conn-dot conn-dot-ok progress-live-dot" aria-hidden="true" />
-              Live
+              <span
+ className={`conn-dot ${connectionLive ? "conn-dot-ok" : "progress-live-dot"} progress-live-dot`}
+                aria-hidden="true"
+                style={connectionLive ? undefined : { background: "var(--warning)" }}
+              />
+              {connectionLive ? "Live" : "Reconnecting…"}
             </span>
           )}
         </div>

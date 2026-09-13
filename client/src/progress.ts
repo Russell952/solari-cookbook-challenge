@@ -192,8 +192,17 @@ function formatRuntime(ms: number): string {
  * Derives the full progress model from a real summary. No synthetic numbers:
  * counts come straight from experimentCounts/evidence/hypotheses, and there is
  * deliberately no percentage anywhere.
+ *
+ * `now` is the wall-clock instant the model is derived for. The running
+ * runtime is always `now - startedAt` (never accumulated) — callers tick
+ * `now` roughly once a second so the runtime counter advances every second
+ * independently of SSE events (regression: the timer only updated when an
+ * SSE event happened to trigger a re-render, so it jumped in ~2-3 min steps).
  */
-export function buildProgressModel(summary: InvestigationSummary): ProgressModel {
+export function buildProgressModel(
+  summary: InvestigationSummary,
+  now: number = Date.now()
+): ProgressModel {
   const inv = summary.investigation;
   const status = inv.status;
   const phase = inv.currentPhase;
@@ -268,7 +277,7 @@ export function buildProgressModel(summary: InvestigationSummary): ProgressModel
     summary.runtime?.durationMs != null
       ? summary.runtime.durationMs
       : isRunning && summary.runtime?.startedAt
-        ? Date.now() - new Date(summary.runtime.startedAt).getTime()
+        ? now - new Date(summary.runtime.startedAt).getTime()
         : null;
   const runtime = runtimeMs != null ? formatRuntime(runtimeMs) : null;
   if (runtime) metrics.push({ label: "Runtime", value: runtime });

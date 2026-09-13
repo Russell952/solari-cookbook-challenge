@@ -19,6 +19,7 @@ import { closeAllClients } from "./solari/index.js";
 import { preloadUsers } from "./auth/users.js";
 import { createDurableBackend } from "./persistence/index.js";
 import { useDurableBackend, hydrate, flushAll } from "./store/index.js";
+import { terminalizeOrphanedInvestigations } from "./orchestrator/recovery.js";
 
 const app = buildApp();
 
@@ -53,6 +54,10 @@ async function main() {
   // Load existing accounts into the session-lookup cache before listening
   // (requireAuth verifies a session's user exists, synchronously).
   await preloadUsers();
+
+  // No runner exists yet at startup — anything still running/paused is an
+  // orphan from a previous process. Reconcile before accepting requests.
+  terminalizeOrphanedInvestigations();
 
   app.listen(config.port, "0.0.0.0", () => {
     console.log(`🔍 Probe server running on http://0.0.0.0:${config.port}`);

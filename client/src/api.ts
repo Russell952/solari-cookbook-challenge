@@ -412,46 +412,83 @@ export function listEvidence(investigationId: string): Promise<Evidence[]> {
  * Subscribe to SSE events for an investigation via fetch-streaming —
  * EventSource cannot send an Authorization header, and the events endpoint
  * is authenticated. Returns a cleanup function.
+ *
+ * Reconnects with bounded backoff when the stream ends (server restart,
+ * network hiccup) until the cleanup is called. Regression: a closed stream
+ * previously left the UI permanently silent while the backend kept (or had
+ * finished) running — the view showed stale Running with no recovery.
+ * `onConnectionChange` reports liveness so the UI can show a truthful
+ * Live/Reconnecting state instead of pretending events are flowing.
  */
 export function subscribeToEvents(
   investigationId: string,
-  onEvent: (event: SSEEvent) => void
+  onEvent: (event: SSEEvent) => void,
+  onConnectionChange?: (connected: boolean) => void
 ): () => void {
   const controller = new AbortController();
-  (async () => {
-    try {
-      const res = await fetch(`${BASE}/investigations/${investigationId}/events`, {
-        credentials: FETCH_CREDENTIALS,
-        headers: authHeaders(),
-        signal: controller.signal,
-      });
-      if (res.status === 401) notifySessionExpired();
-      if (!res.ok || !res.body) return;
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const chunks = buffer.split("\n\n");
-        buffer = chunks.pop() ?? "";
-        for (const chunk of chunks) {
-          const line = chunk.split("\n").find((l) => l.startsWith("data: "));
-          if (!line) continue;
-          try {
-            onEvent(JSON.parse(line.slice(6)) as SSEEvent);
-          } catch {
-            // ignore malformed events
-          }
-        }
-      }
-    } catch {
-      // aborted or network failure — cleanup handles the rest
-    }
-  })();
+  let stopped = false;
+  let connected = false;
+  let attempt = 0;
 
-  return () => controller.abort();
+  const setConnected = (value: boolean) => {
+    if (stopped || connected === value) return;
+    connected = value;
+    onConnectionChange?.(value);
+  };
+
+  const connect = async () => {
+    while (!stopped) {
+      try {
+        const res = await fetch(`${BASE}/investigations/${investigationId}/events`, {
+          credentials: FETCH_CREDENTIALS,
+          headers: authHeaders(),
+          signal: controller.signal,
+        });
+        if (res.status === 401) notifySessionExpired();
+        if (!res.ok || !res.body) {
+          setConnected(false);
+        } else {
+          setConnected(true);
+          attempt = 0; // a healthy connection resets the backoff
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const chunks = buffer.split("\n\n");
+            buffer = chunks.pop() ?? "";
+            for (const chunk of chunks) {
+              const line = chunk.split("\n").find((l) => l.startsWith("data: "));
+              if (!line) continue;
+              try {
+                onEvent(JSON.parse(line.slice(6)) as SSEEvent);
+              } catch {
+                // ignore malformed events
+              }
+            }
+          }
+          setConnected(false);
+        }
+      } catch {
+        // aborted or network failure
+        setConnected(false);
+      }
+      if (stopped) break;
+      // Bounded backoff — do not hammer a downed server, do not give up.
+      await new Promise((r) => setTimeout(r, Math.min(1000 * 2 ** attempt, 10_000)));
+      attempt += 1;
+    }
+  };
+
+  void connect();
+
+  return () => {
+    stopped = true;
+    controller.abort();
+    setConnected(false);
+  };
 }
 
 // ── Phase display helpers ──────────────────────────────────────────────────

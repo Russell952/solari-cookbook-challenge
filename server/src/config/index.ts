@@ -21,6 +21,17 @@ export const config = {
   aiApiKey: process.env.AI_API_KEY || "",
   aiBaseUrl: process.env.AI_BASE_URL || "https://api.openai.com/v1",
   aiModel: process.env.AI_MODEL || "gpt-4o",
+  /**
+   * Optional cap on AI output tokens sent with every model request. When
+   * unset, no max_tokens field is sent and the provider applies its own
+   * default (prior behavior). Set it when the provider account cannot cover
+   * the model's default output maximum — e.g. OpenRouter rejects requests
+   * whose max_tokens exceeds the credits available (HTTP 402, "You requested
+   * up to N tokens, but can only afford M").
+   */
+  aiMaxOutputTokens: process.env.AI_MAX_OUTPUT_TOKENS
+    ? parseInt(process.env.AI_MAX_OUTPUT_TOKENS, 10) || undefined
+    : undefined,
   corsOrigin: process.env.CORS_ORIGIN || "http://localhost:5173",
 
   /**

@@ -740,6 +740,11 @@ function aiOpLabel(systemPrompt: string): string {
 }
 
 async function chat(systemPrompt: string, userPrompt: string): Promise<string> {
+  return chatInternal(systemPrompt, userPrompt);
+}
+
+/** Exported for regression tests: the raw provider-bound chat path. */
+export async function chatInternal(systemPrompt: string, userPrompt: string): Promise<string> {
   // ── Budget gate (before ANY request) ──────────────────────────────────
   // No model request may start when the AI-call budget, the AI-token
   // budget, or the investigation runtime is already exhausted.
@@ -813,6 +818,11 @@ async function chat(systemPrompt: string, userPrompt: string): Promise<string> {
             { role: "user", content: boundedUserPrompt },
           ],
           temperature: 0.2,
+          // Optional provider-account output cap: some gateways (e.g.
+          // OpenRouter) reject requests whose implied max_tokens exceeds the
+          // credits available. Only sent when configured — providers keep
+          // their own default otherwise.
+          ...(config.aiMaxOutputTokens ? { max_tokens: config.aiMaxOutputTokens } : {}),
         }),
       });
     } catch (err) {
@@ -837,7 +847,35 @@ async function chat(systemPrompt: string, userPrompt: string): Promise<string> {
       guard.spendTokens(guard.estimateTokens(systemPrompt) + guard.estimateTokens(boundedUserPrompt));
     }
 
-    const rawBody = await res.json();
+    // ── Body-read deadline ────────────────────────────────────────────
+    // The AbortController above only covers reaching response HEADERS; a
+    // stalled/slow response BODY (degraded gateway, dead keep-alive socket)
+    // would otherwise await res.json() forever — the exact unbounded await
+    // that left a real verification phase pending for ~128 minutes while
+    // its investigation stayed 'Running'. The abort signal is still attached
+    // to the fetch, so re-arming the same timer bounds the body read too.
+    const bodyReadMs = guard
+      ? Math.min(config.aiCallTimeoutMs, Math.max(1_000, guard.remainingRuntimeMs()))
+      : 120_000;
+    const bodyTimer = setTimeout(() => abort.abort(), bodyReadMs);
+    let rawBody: unknown;
+    try {
+      rawBody = await res.json();
+    } catch (err) {
+      if (abort.signal.aborted) {
+        const remaining = guard ? guard.remainingRuntimeMs() : 0;
+        if (remaining <= 0) {
+          handle.end(false, { retries, error: "Investigation runtime expired during AI response read", timedOut: true });
+          throw new AiBudgetExhaustedError("runtime", "Investigation runtime expired during AI response read");
+        }
+        handle.end(false, { retries, error: `AI API response read timeout after ${bodyReadMs}ms`, timedOut: true });
+        throw new Error(`AI API response read timeout after ${bodyReadMs}ms (bounded by investigation deadline)`);
+      }
+      handle.end(false, { retries, error: err instanceof Error ? err.message.slice(0, 300) : String(err) });
+      throw err;
+    } finally {
+      clearTimeout(bodyTimer);
+    }
 
     // Gemini sometimes returns HTTP 200 with an error object/array in the body.
     // Detect and treat as retryable alongside HTTP 503.

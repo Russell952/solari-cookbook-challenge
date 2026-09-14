@@ -349,6 +349,13 @@ export interface InvestigationSummary {
     durationMs: number | null;
   } | null;
   incomplete: boolean;
+  /** Structured stop reason when the run ended without completing cleanly. */
+  failure: {
+    reason: string;
+    message: string;
+    phase: string | null;
+    at: string;
+  } | null;
 }
 
 // ── API Functions ──────────────────────────────────────────────────────────

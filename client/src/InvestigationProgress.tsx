@@ -111,6 +111,14 @@ export function InvestigationProgress({ summary, events, connectionLive = true }
               </div>
             ))}
           </div>
+
+          {model.noExperimentsPlanned && (
+            <p className="progress-no-experiments" role="status">
+              No executable experiments were planned — the application was not
+              tested. This is a Probe execution limitation, not an application
+              result.
+            </p>
+          )}
         </div>
 
         {events.length > 0 && (
@@ -165,6 +173,10 @@ function StageRow({ stage }: { stage: StageViewState }) {
  */
 export function TerminalBanner({ model }: { model: ProgressModel }) {
   if (model.terminal !== "failed" && model.terminal !== "cancelled") return null;
+  const noExperiments =
+    model.terminal === "failed" &&
+    model.noExperimentsPlanned &&
+    model.activity.includes("No executable experiments");
   return (
     <div
       className={`card progress-terminal progress-terminal-${model.terminal}`}
@@ -173,7 +185,7 @@ export function TerminalBanner({ model }: { model: ProgressModel }) {
       <h3>
         {model.terminal === "failed" ? (
           <>
-            <AlertIcon aria-hidden="true" /> Investigation failed
+            <AlertIcon aria-hidden="true" /> {noExperiments ? "No experiments were executed" : "Investigation failed"}
           </>
         ) : (
           <>
@@ -182,7 +194,9 @@ export function TerminalBanner({ model }: { model: ProgressModel }) {
         )}
       </h3>
       <p>
-        {model.terminal === "failed"
+        {noExperiments
+          ? "Planning produced no executable experiment, so the application behavior was never tested. This is a Probe execution limitation, not an application finding. Nothing here should be read as a test result."
+          : model.terminal === "failed"
           ? "The investigation ended with an execution error before a report could be produced. This is a Probe infrastructure failure, not an application finding."
           : "This investigation was cancelled before completion. Partial data below is not a confirmed result — no report exists."}
       </p>

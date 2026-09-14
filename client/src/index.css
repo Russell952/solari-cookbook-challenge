@@ -678,6 +678,18 @@ body {
   color: var(--text-muted);
 }
 
+/* Honest zero-experiment notice (planning produced nothing executable) */
+.progress-no-experiments {
+  margin: 0.75rem 0 0;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--warning);
+  border-radius: 8px;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+}
+
 /* Evidence breakdown */
 .progress-evidence-list {
   list-style: none;

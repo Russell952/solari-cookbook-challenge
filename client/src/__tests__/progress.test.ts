@@ -74,6 +74,7 @@ function makeSummary(overrides: {
     probeFailures: [],
     runtime: overrides.runtime ?? { startedAt: null, completedAt: null, durationMs: null },
     incomplete: status === "running",
+    failure: null,
   };
 }
 
@@ -201,9 +202,11 @@ describe("progress metrics: real data only", () => {
     expect(serialized).not.toMatch(/"progress":/);
   });
 
-  it("formats runtime from real durationMs", () => {
+  it("formats runtime from real durationMs (terminal run)", () => {
+    // Terminal summaries carry the final frozen durationMs; running ones
+    // carry durationMs: null (the client derives live runtime from startedAt).
     const model = buildProgressModel(
-      makeSummary({ phase: "execute", runtime: { startedAt: "t", completedAt: null, durationMs: 161000 } })
+      makeSummary({ phase: "complete", status: "completed", runtime: { startedAt: "t", completedAt: "t", durationMs: 161000 } })
     );
     expect(model.runtime).toBe("02:41");
     const runtimeMetric = model.metrics.find((m) => m.label === "Runtime");
@@ -216,6 +219,37 @@ describe("progress metrics: real data only", () => {
       makeSummary({ phase: "execute", runtime: { startedAt, completedAt: null, durationMs: null } })
     );
     expect(model.runtime).toMatch(/^\d{2}:\d{2}$/);
+  });
+
+  it("NEVER uses the server's fetch-time durationMs while running — the timer must tick from startedAt", () => {
+    // Live regression: the backend sent a stale durationMs snapshot even
+    // while running, and the client preferred it, so the timer only moved on
+    // refetch (a run showed 01:54 frozen while actually still going).
+    const startedAt = new Date(Date.now() - 5 * 60_000).toISOString(); // 5 min real runtime
+    const staleFetchDurationMs = 114_000; // 01:54 — the frozen value from the bug
+    const model = buildProgressModel(
+      makeSummary({
+        phase: "execute",
+        status: "running",
+        runtime: { startedAt, completedAt: null, durationMs: staleFetchDurationMs },
+      })
+    );
+    expect(model.runtime).not.toBe("01:54");
+    // ~5 minutes, well above the stale snapshot.
+    const [mm, ss] = model.runtime!.split(":").map(Number);
+    expect(mm).toBeGreaterThanOrEqual(4);
+    expect(ss).toBeLessThanOrEqual(59);
+  });
+
+  it("uses durationMs only for terminal investigations (frozen runtime)", () => {
+    const model = buildProgressModel(
+      makeSummary({
+        phase: "complete",
+        status: "completed",
+        runtime: { startedAt: "t", completedAt: "t", durationMs: 161_000 },
+      })
+    );
+    expect(model.runtime).toBe("02:41");
   });
 });
 
@@ -247,6 +281,65 @@ describe("experiment-level progress", () => {
     );
     const states = model.experimentList.map((e) => e.state);
     expect(states).toEqual(["completed", "completed", "running", "pending", "pending", "pending"]);
+  });
+
+  it("shows 0/3 when three experiments are planned and none has reached a terminal state", () => {
+    const planned3: InvestigationSummary["experiments"] = [
+      { id: "e1", sequence: 1, objective: "A", status: "planned", result: null, error: null },
+      { id: "e2", sequence: 2, objective: "B", status: "planned", result: null, error: null },
+      { id: "e3", sequence: 3, objective: "C", status: "planned", result: null, error: null },
+    ];
+    const model = buildProgressModel(
+      makeSummary({ phase: "execute", experiments: planned3 })
+    );
+    expect(model.metrics.find((m) => m.label === "Experiments")?.value).toBe("0/3");
+  });
+
+  it("shows 1/3 after the first experiment reaches a terminal state", () => {
+    const mixed: InvestigationSummary["experiments"] = [
+      { id: "e1", sequence: 1, objective: "A", status: "completed", result: "ok", error: null },
+      { id: "e2", sequence: 2, objective: "B", status: "running", result: null, error: null },
+      { id: "e3", sequence: 3, objective: "C", status: "planned", result: null, error: null },
+    ];
+    const model = buildProgressModel(
+      makeSummary({ phase: "execute", experiments: mixed })
+    );
+    expect(model.metrics.find((m) => m.label === "Experiments")?.value).toBe("1/3");
+  });
+
+  it("shows 3/3 once all experiments reached a terminal state (failed counts too)", () => {
+    const done: InvestigationSummary["experiments"] = [
+      { id: "e1", sequence: 1, objective: "A", status: "completed", result: "ok", error: null },
+      { id: "e2", sequence: 2, objective: "B", status: "failed", result: null, error: "boom" },
+      { id: "e3", sequence: 3, objective: "C", status: "inconclusive", result: null, error: null },
+    ];
+    const model = buildProgressModel(
+      makeSummary({ phase: "analyze", experiments: done })
+    );
+    expect(model.metrics.find((m) => m.label === "Experiments")?.value).toBe("3/3");
+  });
+
+  it("withholds the Experiments metric and flags noExperimentsPlanned when planning produced nothing", () => {
+    // Live regression: the zero-experiment run rendered a normal-looking
+    // 0/0 as though the counter were merely waiting for experiments.
+    const model = buildProgressModel(
+      makeSummary({ phase: "report", status: "failed", experiments: [] })
+    );
+    expect(model.noExperimentsPlanned).toBe(true);
+    expect(model.metrics.find((m) => m.label === "Experiments")).toBeUndefined();
+  });
+
+  it("does not flag noExperimentsPlanned for a created investigation that has not planned yet", () => {
+    const model = buildProgressModel(
+      makeSummary({ phase: "recon", status: "running", experiments: [] })
+    );
+    // status is running (post-created): the phase gate uses investigation
+    // status "created" — recon has started so planning simply has not run.
+    // The gate treats any non-created status with zero experiments as the
+    // honest no-experiments state ONLY after planning could have run;
+    // during recon the metric is withheld the same way without claiming
+    // failure.
+    expect(model.metrics.find((m) => m.label === "Experiments")).toBeUndefined();
   });
 });
 

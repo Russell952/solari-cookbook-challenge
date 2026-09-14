@@ -187,6 +187,23 @@ function checkpointFailure(
 }
 
 /**
+ * Thrown when the planner produced zero executable experiments.
+ *
+ * The pipeline has already persisted a truthful inconclusive report and a
+ * structured failure record (see runPlan); the run-loop finalizer must
+ * record the `failed` terminal status WITHOUT running the report again or
+ * treating this as an unexpected crash.
+ */
+class EmptyPlanError extends Error {
+  constructor(
+    public readonly investigationId: string
+  ) {
+    super(`Investigation ${investigationId} ended without executable experiments`);
+    this.name = "EmptyPlanError";
+  }
+}
+
+/**
  * Thrown when an investigation is cancelled or its runtime budget expires
  * mid-run. Propagates out of phase functions to the main run loop, which
  * finalizes the investigation with the correct terminal status while
@@ -674,6 +691,40 @@ async function runPlan(investigation: Investigation): Promise<Investigation> {
   // Expensive AI call: stop at this boundary if cancelled/expired.
   assertNotStopped(investigation.id);
   const planResult = await getAI().plan(investigation.objective, repoRecon, appRecon);
+
+  // ── Empty-plan integrity gate ─────────────────────────────────────────
+  // Live regression: for "Can a user sign up?" against app.rayern.com.ng the
+  // planner returned `experiments: []` (its RULE 4 tells it to skip an
+  // experiment when no recon element fits). The plan validator accepted the
+  // empty array, runExperiments iterated nothing, and the pipeline marched
+  // through execute → observe → analyze → hypothesis → verification → report
+  // → complete — a normal Completed investigation that tested NOTHING.
+  // An empty plan is an execution problem of Probe, not an application
+  // result: fail the run honestly with a structured reason instead of
+  // letting a behavioral question end without any experiment.
+  if (planResult.experiments.length === 0) {
+    const message =
+      "Planning produced no executable experiments, so the application behavior was never tested. " +
+      "The planner may have found no interactable elements in recon, or could not map the objective to feasible actions. " +
+      "This is a Probe execution limitation, not an application finding. Retry the investigation or refine the objective.";
+    checkpointFailure(investigation.id, "plan", "no_executable_experiments", message);
+    emit("error", investigation.id, { error: message });
+    // Persist a truthful report so the UI and API still have the full context
+    // (guard against budget exhaustion is intentional here: planning is done,
+    // the runtime clock has not expired on an empty plan by construction).
+    await runReport(investigation, new Map(), { forceInconclusive: true });
+    const inv = store.getInvestigation(investigation.id);
+    if (inv) {
+      const afterReport = store.getInvestigation(investigation.id)!;
+      if (afterReport.currentPhase !== "complete") {
+        advancePhase(afterReport, "complete");
+      }
+    }
+    // Stop the pipeline with a typed stop so the run-loop finalizer records
+    // the failure status via the same path as a runtime expiry (the report
+    // above is preserved because runReport already ran).
+    throw new EmptyPlanError(investigation.id);
+  }
 
   // Create experiments from the plan — these are primary experiments
   for (const expPlan of planResult.experiments) {
@@ -1394,10 +1445,10 @@ function hypothesisForFinding(
 async function runReport(
   investigation: Investigation,
   verificationByHypothesis: Map<string, string> = new Map(),
-  opts?: { allowAfterBudgetExhaustion?: boolean }
+  opts?: { allowAfterBudgetExhaustion?: boolean; forceInconclusive?: boolean }
 ): Promise<void> {
   if (investigation.currentPhase !== "report") {
-    if (opts?.allowAfterBudgetExhaustion) {
+    if (opts?.allowAfterBudgetExhaustion || opts?.forceInconclusive) {
       // Documented exception: budget exhaustion at ANY phase jumps straight
       // to the report phase so the investigation ends with a useful result
       // instead of dying mid-pipeline. Cancellation is still respected.
@@ -1421,6 +1472,23 @@ async function runReport(
 
   let reportResult;
   try {
+    // Empty-plan termination: the report must state plainly that NO
+    // experiment ran and nothing about the application was tested. This is
+    // generated WITHOUT an AI call — the truth here is structural, not
+    // something the model should paraphrase or soften.
+    if (opts?.forceInconclusive) {
+      reportResult = {
+        summary:
+          "Investigation ended without running any experiments: planning produced no executable experiment, " +
+          "so the application behavior was NOT tested. No hypothesis was evaluated and no application finding " +
+          "was established. This is a Probe execution limitation (the planner could not map the objective to " +
+          "feasible browser actions from the captured recon), not an application result. " +
+          "Recon evidence captured before planning is listed for context.",
+        confirmedFindings: [],
+        rejectedHypotheses: [],
+        inconclusiveHypotheses: [],
+      };
+    } else {
     // After graceful budget exhaustion the run is intentionally finished —
     // expiry must NOT block producing the final report. Cancellation still
     // propagates: a cancelled investigation must not receive a report.
@@ -1439,6 +1507,7 @@ async function runReport(
       experiments,
       evidence
     );
+    }
   } catch (reportError) {
     // Cancellation/expiry must propagate — a stopped investigation must not
     // receive a fallback report.
@@ -1941,6 +2010,20 @@ export async function runInvestigation(
         store.updateInvestigation(investigationId, { status: "failed" });
       }
       emit("complete", investigationId, { message: "Investigation stopped at AI budget limit; report available" });
+    } else if (error instanceof EmptyPlanError) {
+      // Empty plan: honest, structured failure. runPlan already persisted
+      // the truthful report and the no_executable_experiments failure
+      // record; only the terminal status remains. The investigation must
+      // NOT read as a normal completion — no experiment ever ran.
+      console.warn(`[${investigationId}] Empty experiment plan — failed honestly (no behavior was tested)`);
+      const invEmpty = store.getInvestigation(investigationId);
+      if (invEmpty && (invEmpty.status === "running" || invEmpty.status === "paused")) {
+        transitionStatus(invEmpty.status, "failed");
+        store.updateInvestigation(investigationId, { status: "failed" });
+      }
+      emit("complete", investigationId, {
+        message: "Investigation ended without executable experiments — the application behavior was not tested",
+      });
     } else {
       const errorMsg = error instanceof Error ? error.message : String(error);
       console.error(`Investigation ${investigationId} failed:`, errorMsg);

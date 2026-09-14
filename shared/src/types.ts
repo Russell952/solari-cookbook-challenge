@@ -348,6 +348,7 @@ export type InvestigationFailureReason =
   | "experiment_budget_exhausted"
   | "action_budget_exhausted"
   | "analysis_budget_exhausted"
+  | "no_executable_experiments"
   | "cancelled"
   | "error";
 

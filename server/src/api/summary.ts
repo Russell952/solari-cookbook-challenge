@@ -148,6 +148,13 @@ interface SummaryResponse {
     durationMs: number | null;
   } | null;
   incomplete: boolean;
+  /** Structured stop reason when the run ended without completing cleanly. */
+  failure: {
+    reason: string;
+    message: string;
+    phase: string | null;
+    at: string;
+  } | null;
 }
 
 summaryRouter.get("/", (req: Request, res: Response) => {
@@ -220,9 +227,19 @@ summaryRouter.get("/", (req: Request, res: Response) => {
       }
     : null;
 
-  // Compute runtime info
+  // Compute runtime info. durationMs is ONLY meaningful once the run is
+  // terminal: while running, updatedAt keeps advancing (phase checkpoints),
+  // and the client prefers durationMs over its own live now−startedAt tick,
+  // so a non-null duration here froze the UI timer at the last fetch
+  // (live regression: 01:54 for a 114s run that kept ticking only on
+  // refetch). While running, duration is null and the client derives
+  // runtime from startedAt each second.
   const startTs = investigation.createdAt ? new Date(investigation.createdAt).getTime() : null;
-  const endTs = investigation.updatedAt ? new Date(investigation.updatedAt).getTime() : null;
+  const isTerminal =
+    investigation.status === "completed" ||
+    investigation.status === "failed" ||
+    investigation.status === "cancelled";
+  const endTs = isTerminal && investigation.updatedAt ? new Date(investigation.updatedAt).getTime() : null;
   const durationMs = startTs && endTs ? endTs - startTs : null;
 
   const response: SummaryResponse = {
@@ -301,12 +318,24 @@ summaryRouter.get("/", (req: Request, res: Response) => {
       verificationReserve: budgetData.verificationReserve,
     },
     probeFailures: uniqueProbeFailures,
-    runtime: durationMs !== null ? {
-      startedAt: investigation.createdAt,
-      completedAt: investigation.updatedAt,
-      durationMs,
-    } : null,
+    runtime: startTs !== null
+      ? {
+          startedAt: investigation.createdAt,
+          completedAt: isTerminal ? investigation.updatedAt : null,
+          // null while running: the client derives live runtime from
+          // startedAt each second (a fetch-time duration froze the timer).
+          durationMs,
+        }
+      : null,
     incomplete: investigation.status !== "completed" && investigation.status !== "failed",
+    failure: investigation.failure
+      ? {
+          reason: investigation.failure.reason,
+          message: investigation.failure.message,
+          phase: investigation.failure.phase ?? null,
+          at: investigation.failure.at,
+        }
+      : null,
   };
 
   res.json(response);

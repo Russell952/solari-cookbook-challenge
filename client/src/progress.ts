@@ -175,6 +175,12 @@ export interface ProgressModel {
   terminal: "completed" | "failed" | "cancelled" | null;
   /** Formatted runtime (mm:ss), when known. */
   runtime: string | null;
+  /**
+   * True when zero experiments were planned/persisted (planning produced an
+   * empty plan). The UI must render an explicit honest state — never a
+   * normal-looking 0/0 — and the Experiments metric is withheld.
+   */
+  noExperimentsPlanned: boolean;
   /** Report-generation context lines (report phase, real data only). */
   reportContext: string[];
   /** Hypothesis outcome counts for honest result communication. */
@@ -263,21 +269,42 @@ export function buildProgressModel(
     else hypothesisOutcomes.other += 1;
   }
 
-  // Metrics — real data only; Report presence is factual (available/none).
-  const metrics: Array<{ label: string; value: string }> = [
-    {
+  // Experiment counter — X/Y where Y is the number of experiments actually
+  // planned/persisted and X the number that reached a terminal execution
+  // state (completed/failed/inconclusive/cancelled). Recon evidence and
+  // hypotheses are never counted. With zero planned experiments the metric
+  // is withheld entirely and the model reports `noExperimentsPlanned`, so a
+  // planning failure can never render as a normal-looking 0/0.
+  const terminalExpStatuses = ["completed", "failed", "inconclusive", "cancelled"];
+  const experimentsTerminal = summary.experiments.filter((e) =>
+    terminalExpStatuses.includes(e.status)
+  ).length;
+  const noExperimentsPlanned =
+    summary.experimentCounts.total === 0 &&
+    summary.investigation.status !== "created";
+  const metrics: Array<{ label: string; value: string }> = [];
+  if (!noExperimentsPlanned) {
+    metrics.push({
       label: "Experiments",
-      value: `${summary.experimentCounts.completed}/${summary.experimentCounts.total}`,
-    },
+      value: `${experimentsTerminal}/${summary.experimentCounts.total}`,
+    });
+  }
+  metrics.push(
     { label: "Evidence", value: String(summary.evidenceCount) },
     { label: "Hypotheses", value: String(summary.hypothesesCount) },
-    { label: "Findings", value: String(summary.findingsCount) },
-  ];
+    { label: "Findings", value: String(summary.findingsCount) }
+  );
+
+  // Runtime: while running, ALWAYS derive from startedAt with the live tick
+  // (the server's durationMs while running is a stale fetch-time snapshot —
+  // regression: the timer only moved when the summary was refetched, e.g.
+  // 01:54 shown for a run that had been going for minutes). durationMs is
+  // used only once the investigation is terminal, then frozen.
   const runtimeMs =
-    summary.runtime?.durationMs != null
-      ? summary.runtime.durationMs
-      : isRunning && summary.runtime?.startedAt
-        ? now - new Date(summary.runtime.startedAt).getTime()
+    isRunning && summary.runtime?.startedAt
+      ? Math.max(0, now - new Date(summary.runtime.startedAt).getTime())
+      : !isRunning && summary.runtime?.durationMs != null
+        ? summary.runtime.durationMs
         : null;
   const runtime = runtimeMs != null ? formatRuntime(runtimeMs) : null;
   if (runtime) metrics.push({ label: "Runtime", value: runtime });
@@ -294,7 +321,10 @@ export function buildProgressModel(
 
   // Activity line: phase-level description, enriched only with real facts.
   let activity: string;
-  if (status === "failed") {
+  if (noExperimentsPlanned && summary.failure?.reason === "no_executable_experiments") {
+    activity =
+      "No executable experiments were produced — the application behavior was not tested.";
+  } else if (status === "failed") {
     activity = "The investigation ended with an execution error.";
   } else if (status === "cancelled") {
     activity = "This investigation was cancelled before completion.";
@@ -319,6 +349,7 @@ export function buildProgressModel(
     isRunning,
     terminal,
     runtime,
+    noExperimentsPlanned,
     reportContext,
     hypothesisOutcomes,
   };

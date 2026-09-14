@@ -73,12 +73,21 @@ let plannerExperiments: Array<{
   plannedActions: Array<{ tool: string; action: string; target: string }>;
 }> = [];
 
+// Shared planner mock: every adapter instance must expose the SAME plan
+// function so tests can capture the recon handed to the planner.
+const aiMocks = vi.hoisted(() => ({
+  plan: vi.fn(
+    async (_objective?: string, _repoRecon?: unknown, _appRecon?: unknown) =>
+      ({ experiments: [] as Array<unknown> })
+  ),
+}));
+
 /** Tracks whether the AI report generator was ever invoked. */
 let aiReportCalled = false;
 
 vi.mock("../ai/index.js", () => ({
   createOpenAIAdapter: vi.fn(() => ({
-    plan: vi.fn(async () => ({ experiments: plannerExperiments })),
+    plan: aiMocks.plan,
     decideNextStep: vi.fn(async () => ({ shouldContinue: false, reason: "nothing to do" })),
     analyzeRepository: vi.fn(async () => "repo analysis"),
     analyzeObservation: vi.fn(async () => "observation analysis"),
@@ -120,6 +129,7 @@ beforeAll(() => {
 beforeEach(async () => {
   plannerExperiments = [];
   aiReportCalled = false;
+  aiMocks.plan.mockImplementation(async () => ({ experiments: plannerExperiments }));
   evidenceDir = await mkdtemp(join(tmpdir(), "probe-empty-plan-"));
   process.env.PROBE_EVIDENCE_DIR = evidenceDir;
   store.clearAll();
@@ -253,5 +263,88 @@ describe("empty-plan lifecycle integrity", () => {
     expect(summary.failure).not.toBeNull();
     expect(summary.failure!.phase).toBe("plan");
     expect(summary.failure!.at).toBeTruthy();
+  }, 30000);
+
+  it("recon hydration gate: empty extraction on an unhydrated SPA shell recovers elements before planning", async () => {
+    // Live background: probe-challenge.vercel.app serves a 1.4KB HTML shell;
+    // on a cold cache the React bundle can execute after navigate()'s
+    // networkidle best-effort, so the first extraction sees an empty #root.
+    // The hydration gate must (a) detect the unhydrated-shell signature,
+    // (b) wait and re-extract, and (c) hand the RECOVERED elements to the
+    // planner — recon data loss must not reach the plan phase.
+    const browserMod = await import("../solari/browser.js");
+    const evaluateMock = vi.mocked(browserMod.evaluate);
+    let extractionCall = 0;
+    evaluateMock.mockImplementation(async (_session: unknown, fn: string) => {
+      if (fn.includes("el.placeholder || undefined")) {
+        // The gate's compact hydration-retry script: the DOM is hydrated by
+        // now — return the recovered controls.
+        return [
+          { selector: "#signup-email", text: "", tag: "input", type: "email" },
+          { selector: "#signup-password", text: "", tag: "input", type: "password" },
+          { selector: "button[type=submit]", text: "Create account", tag: "button" },
+        ];
+      }
+      if (fn.includes("getSelector")) {
+        // First structured extraction: pre-hydration (empty). Subsequent
+        // calls (the gate's retry poll): hydrated with real controls.
+        extractionCall += 1;
+        if (extractionCall === 1) return [];
+        return [
+          { selector: "#signup-email", text: "", tag: "input", type: "email" },
+          { selector: "#signup-password", text: "", tag: "input", type: "password" },
+          { selector: "button[type=submit]", text: "Create account", tag: "button" },
+        ];
+      }
+      if (fn.includes("getElementById('root')")) {
+        // Hydration probe: root present but essentially empty (shell).
+        return { rootChars: 31, bodyChars: 60, readyState: "complete" };
+      }
+      return [];
+    });
+
+    let receivedInteractable: unknown;
+    aiMocks.plan.mockImplementation(async (_o: unknown, _r: unknown, appRecon: unknown) => {
+      receivedInteractable = (appRecon as { interactableElements?: unknown[] })?.interactableElements;
+      return { experiments: [] }; // empty plan is fine — we assert recon handoff only
+    });
+
+    const id = await createInvestigation();
+    await runInvestigation(id);
+
+    expect(Array.isArray(receivedInteractable)).toBe(true);
+    expect((receivedInteractable as unknown[]).length).toBe(3);
+    evaluateMock.mockRestore();
+  }, 30000);
+
+  it("recon hydration gate: hydrated page with no controls does NOT trigger a wait (no latency added)", async () => {
+    // A page that genuinely has no interactive controls must not pay the
+    // hydration-wait latency: the gate fires only on the empty-shell
+    // signature (rootChars >= 0 && rootChars < 200).
+    const browserMod = await import("../solari/browser.js");
+    const evaluateMock = vi.mocked(browserMod.evaluate);
+    let structuredCalls = 0;
+    evaluateMock.mockImplementation(async (_session: unknown, fn: string) => {
+      if (fn.includes("getSelector")) {
+        structuredCalls += 1;
+        return [];
+      }
+      if (fn.includes("getElementById('root')")) {
+        return { rootChars: -1, bodyChars: 0, readyState: "complete" }; // no root at all
+      }
+      return [];
+    });
+    const aiMod = await import("../ai/index.js");
+    const planMock = vi.mocked(aiMod.createOpenAIAdapter().plan);
+
+    const id = await createInvestigation();
+    const started = Date.now();
+    await runInvestigation(id);
+    const elapsed = Date.now() - started;
+
+    expect(structuredCalls).toBe(1); // no retry when there is no shell signature
+    expect(elapsed).toBeLessThan(10_000); // gate would have added ~5s if it fired
+    evaluateMock.mockRestore();
+    planMock.mockRestore();
   }, 30000);
 });

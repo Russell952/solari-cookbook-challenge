@@ -89,6 +89,17 @@ interface RunState {
   aiCallsAtPhaseStart: number;
   aiTokensAtPhaseStart: number;
   browserActionsAtPhaseStart: number;
+  /** Recon results produced in the recon phase. The Investigation object is
+   * re-created by every store.updateInvestigation call (immutable update),
+   * so recon carried on the Investigation instance is silently dropped when
+   * a later phase re-reads the record from the store. Live regression: for
+   * SPA targets the planner received appRecon=null despite successful recon
+   * (7-19 interactable elements extracted), then — per its own RULE 4 —
+   * planned zero experiments and the run failed with
+   * no_executable_experiments. Recon must therefore live in run state,
+   * keyed by investigation id, never on the record object. */
+  repoRecon?: RepositoryRecon;
+  appRecon?: ApplicationRecon;
 }
 
 const runStates = new Map<string, RunState>();
@@ -114,6 +125,16 @@ function runState(investigationId: string): RunState {
     runStates.set(investigationId, s);
   }
   return s;
+}
+
+/** Read the application recon captured this run (null before recon). */
+function getAppRecon(investigationId: string): ApplicationRecon | null {
+  return runStates.get(investigationId)?.appRecon ?? null;
+}
+
+/** Read the repository recon captured this run (null before recon). */
+function getRepoRecon(investigationId: string): RepositoryRecon | null {
+  return runStates.get(investigationId)?.repoRecon ?? null;
 }
 
 function beginPhaseStat(investigationId: string, phase: InvestigationPhase): void {
@@ -328,9 +349,19 @@ async function runRecon(investigation: Investigation): Promise<Investigation> {
     await captureUrlEvidence(investigation.id, undefined, appRecon.initialUrl, appRecon.pageTitle);
   }
 
-  // Store recon results for later phases
-  (investigation as Investigation & { _repoRecon?: RepositoryRecon; _appRecon?: ApplicationRecon })._repoRecon = repoRecon ?? undefined;
-  (investigation as Investigation & { _repoRecon?: RepositoryRecon; _appRecon?: ApplicationRecon })._appRecon = appRecon ?? undefined;
+  // Store recon results for later phases in run state (NOT on the
+  // investigation record — the record is immutably replaced by every
+  // store.updateInvestigation call, so instance properties are dropped
+  // before the plan phase reads them).
+  const state = runState(investigation.id);
+  state.repoRecon = repoRecon ?? undefined;
+  state.appRecon = appRecon ?? undefined;
+
+  console.log(
+    `[${investigation.id}] app-recon captured: repoRecon=${repoRecon ? "set" : "null"} appRecon=${
+      appRecon ? "set(interactable=" + (appRecon.interactableElements ?? []).length + ")" : "null"
+    }`
+  );
 
   return investigation;
 }
@@ -660,7 +691,107 @@ async function performApplicationRecon(investigation: Investigation): Promise<Ap
         })()
       `)) as ApplicationRecon["interactableElements"]
     );
-    } catch { /* no interactable elements */ }
+    } catch (err) {
+      // RECON→PLAN observability: a swallowed failure here yields an empty
+      // interactableElements list while pageTitle/screenshot still look
+      // healthy — the planner then legitimately returns no executable
+      // experiments and the run fails with no_executable_experiments. Log
+      // the actual cause so the failure layer is identifiable from logs.
+      console.error(
+        `[${investigation.id}] app-recon interactableElements extraction failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+
+    if ((interactableElements ?? []).length === 0) {
+      // Empty extraction has two very different causes:
+      //  1. SPA not yet hydrated — the app root is an empty shell and the
+      //     controls render milliseconds later (networkidle can fire before
+      //     a slow bundle executes on cold caches).
+      //  2. The page genuinely has no interactive controls.
+      // Probe the DOM state: only wait-and-retry when the app shell looks
+      // unhydrated. Never delay recon for pages that simply have content
+      // but no controls (or whose state cannot be determined).
+      type HydrationProbe = { rootChars?: number; bodyChars?: number; readyState?: string } | null;
+      let probe: HydrationProbe = null;
+      try {
+        probe = (await browser.evaluate(session, `
+          (() => {
+            const root = document.getElementById('root') || document.getElementById('app') || document.getElementById('__next');
+            return {
+              rootChars: root ? root.innerHTML.length : -1,
+              bodyChars: (document.body?.innerHTML || '').length,
+              readyState: document.readyState,
+            };
+          })()
+        `)) as HydrationProbe;
+      } catch {
+        probe = null; // cannot determine — do not retry
+      }
+
+      const rootChars = typeof probe?.rootChars === "number" ? probe.rootChars : -1;
+      // Unhydrated SPA signature: the app mount point (#root/#app/#__next)
+      // EXISTS but is essentially empty — the served HTML shell before the
+      // bundle executes. If no known mount point exists at all the page is
+      // genuinely empty (not a hydrating SPA) and no wait can help.
+      const looksUnhydrated = rootChars >= 0 && rootChars < 200;
+
+      if (looksUnhydrated) {
+        console.log(
+          `[${investigation.id}] app-recon: empty extraction with unhydrated SPA shell (rootChars=${rootChars}) — waiting for hydration`
+        );
+        try {
+          // Poll briefly so a fast hydration ends early; cap at ~5s total.
+          const deadline = Date.now() + 5_000;
+          while (Date.now() < deadline && (interactableElements ?? []).length === 0) {
+            await new Promise((resolve) => setTimeout(resolve, 1_000));
+            interactableElements = await profiler.span("browser", "evaluate.interactableElements.retry", undefined, async () =>
+              (await browser.evaluate(session, `
+        (() => {
+          const results = [];
+          const els = document.querySelectorAll('a[href], button, [role="button"], input, select, textarea');
+          for (const el of els) {
+            results.push({
+              selector: (el.id ? '#' + CSS.escape(el.id) : el.tagName.toLowerCase()),
+              text: (el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 80),
+              tag: el.tagName.toLowerCase(),
+              href: el.getAttribute('href') || undefined,
+              name: el.name || undefined,
+              type: el.type || undefined,
+              placeholder: el.placeholder || undefined,
+            };
+          }
+          return results.slice(0, 50);
+        })()
+      `)) as ApplicationRecon["interactableElements"]
+            ) ?? [];
+          }
+          if ((interactableElements ?? []).length > 0) {
+            console.log(
+              `[${investigation.id}] app-recon hydration wait recovered ${(interactableElements ?? []).length} interactable elements`
+            );
+          } else {
+            console.log(
+              `[${investigation.id}] app-recon: SPA shell still empty after hydration wait — recording honest empty recon`
+            );
+          }
+        } catch (retryErr) {
+          console.error(
+            `[${investigation.id}] app-recon interactableElements hydration retry failed: ${
+              retryErr instanceof Error ? retryErr.message : String(retryErr)
+            }`
+          );
+        }
+      }
+    }
+
+    // Always-on recon summary: makes the RECON→PLAN handoff observable for
+    // every run (needed to distinguish recon failure from planner mapping
+    // failure when no_executable_experiments fires).
+    console.log(
+      `[${investigation.id}] app-recon: title="${nav.title}" nav=${navigation.length} forms=${forms.length} buttons=${buttons.length} links=${links.length} interactable=${(interactableElements ?? []).length}`
+    );
 
     return {
       pageTitle: nav.title,
@@ -685,8 +816,8 @@ async function performApplicationRecon(investigation: Investigation): Promise<Ap
 async function runPlan(investigation: Investigation): Promise<Investigation> {
   investigation = advancePhase(investigation, "plan");
 
-  const repoRecon = (investigation as Investigation & { _repoRecon?: RepositoryRecon })._repoRecon ?? null;
-  const appRecon = (investigation as Investigation & { _appRecon?: ApplicationRecon })._appRecon ?? null;
+  const repoRecon = getRepoRecon(investigation.id);
+  const appRecon = getAppRecon(investigation.id);
 
   // Expensive AI call: stop at this boundary if cancelled/expired.
   assertNotStopped(investigation.id);
@@ -779,8 +910,8 @@ async function runExperiment(investigation: Investigation, experiment: Experimen
   store.updateExperiment(experiment.id, { status: "running" });
   checkpointBudgetUsage(investigation.id);
 
-  // Extract appRecon from investigation for SPA fallback resolution
-  const appRecon = (investigation as Investigation & { _appRecon?: ApplicationRecon })._appRecon ?? null;
+  // Extract appRecon from run state for SPA fallback resolution
+  const appRecon = getAppRecon(investigation.id);
 
   let browserSession: ProbeBrowserSession | null = null;
 
@@ -1801,7 +1932,7 @@ export async function runInvestigation(
         while (adaptiveRound < MAX_ADAPTIVE_ROUNDS) {
           assertNotStopped(investigationId);
           if (isPaused(investigationId)) break;
-          const appRecon = (investigation as Investigation & { _appRecon?: ApplicationRecon })._appRecon ?? null;
+          const appRecon = getAppRecon(investigationId);
           const allExperiments = store.listExperiments(investigation.id);
           const allEvidence = store.listEvidence(investigation.id);
           const primaryBudget = budget.getPrimaryExperimentBudget(investigation.id);

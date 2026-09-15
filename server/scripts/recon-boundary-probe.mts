@@ -86,21 +86,25 @@ const RECON_EXTRACTION_VERBATIM = `
       const accessibleName = el.textContent?.trim().slice(0, 50) || '';
       if (accessibleName) return '[role="' + role + '"][aria-label="' + CSS.escape(accessibleName) + '"]';
     }
+    // Fixed nth-of-type: each segment describes its own position among
+    // same-tag siblings (old version appended the ancestor index to the
+    // immutable tail, producing selectors matching 0 elements).
+    function nthSegment(elm) {
+      const segTag = elm.tagName.toLowerCase();
+      const segParent = elm.parentElement;
+      if (!segParent || segParent === document.body) return segTag;
+      const sameTag = Array.from(segParent.children).filter(c => c.tagName === elm.tagName);
+      if (sameTag.length <= 1) return segTag;
+      return segTag + ':nth-of-type(' + (sameTag.indexOf(elm) + 1) + ')';
+    }
     let current = el;
-    let path = tag;
+    let path = nthSegment(el);
     while (current.parentElement && current.parentElement !== document.body) {
       const parent = current.parentElement;
-      const parentTag = parent.tagName.toLowerCase();
-      const siblings = Array.from(parent.children).filter(c => c.tagName === current.tagName);
-      const idx = siblings.indexOf(current);
       if (parent.id) {
         return '#' + CSS.escape(parent.id) + ' > ' + path;
       }
-      if (siblings.length === 1) {
-        path = parentTag + ' > ' + path;
-      } else {
-        path = parentTag + ' > ' + path + ':nth-of-type(' + (idx + 1) + ')';
-      }
+      path = nthSegment(parent) + ' > ' + path;
       current = parent;
       if (path.split(' > ').length >= 3) break;
     }
@@ -180,6 +184,93 @@ async function run() {
     if (process.argv.includes("--hrefs")) {
       const hrefs = (await browser.evaluate(session, `Array.from(document.querySelectorAll('a[href]')).map(a=>({href:a.getAttribute('href'),text:(a.textContent||'').trim().slice(0,40)})).slice(0,30)`)) as Array<{ href: string; text: string }>;
       console.log("HREFS:", JSON.stringify(hrefs, null, 1));
+    }
+
+    if (process.argv.includes("--structure")) {
+      // Dump each button's ancestry chain + test the generated selector.
+      const struct = (await browser.evaluate(
+        session,
+        `(() => {
+          const out = [];
+          document.querySelectorAll('button').forEach(b => {
+            const chain = [];
+            let cur = b;
+            while (cur && cur !== document.body) {
+              chain.push(cur.tagName.toLowerCase() + (cur.id ? '#' + cur.id : ''));
+              cur = cur.parentElement;
+            }
+            out.push({ text: (b.textContent || '').trim().slice(0, 30), chain: chain.reverse() });
+          });
+          return out;
+        })()`
+      )) as Array<{ text: string; chain: string[] }>;
+      console.log("BUTTON STRUCTURE:", JSON.stringify(struct, null, 1));
+      // Direct in-page test of the generated structural selector:
+      const probe = (await browser.evaluate(
+        session,
+        `(() => {
+          const sel = 'div > p > button:nth-of-type(2)';
+          const direct = document.querySelectorAll(sel).length;
+          const p = document.querySelector('div#root p');
+          const pButtons = p ? p.querySelectorAll(':scope > button') : [];
+          return {
+            directMatch: direct,
+            pExists: !!p,
+            pParentTag: p?.parentElement?.tagName.toLowerCase() ?? null,
+            pButtonCount: pButtons.length,
+            pButton2Text: (pButtons[1]?.textContent || '').trim(),
+          };
+        })()`
+      )) as Record<string, unknown>;
+      console.log("SELECTOR PROBE:", JSON.stringify(probe));
+      const rootHTML = (await browser.evaluate(session, `document.getElementById('root')?.innerHTML.slice(0, 1600)`)) as string;
+      console.log("ROOT HTML:\n" + rootHTML);
+    }
+
+    if (process.argv.includes("--flow")) {
+      // Multi-step flow probe with the VERBATIM recon extraction:
+      //   extract -> click <selector> -> extract -> diff selectors.
+      // Proves on a REAL deployed SPA that a state-changing click reveals
+      // interactables that only post-action recon can discover.
+      const flowSel = process.argv[process.argv.indexOf("--flow") + 1];
+      const extractSel = async (label: string) => {
+        const arr = (await browser.evaluate(session, RECON_EXTRACTION_VERBATIM)) as Array<{ selector: string; text?: string; tag?: string }>;
+        const list = Array.isArray(arr) ? arr : [];
+        console.log(`[${label}] ${list.length} elements:`);
+        for (const el of list) console.log(`   ${el.selector}  (${el.tag}${el.text ? ` "${el.text.slice(0, 40)}"` : ""})`);
+        return new Set(list.map((e) => e.selector));
+      };
+      const before = await extractSel("before");
+      // Does the generated selector actually match in-page DOM right now?
+      // Distinguishes "stale structural path" from "DOM churned since extract".
+      const domCount = (await browser.evaluate(
+        session,
+        `document.querySelectorAll(${JSON.stringify(flowSel)}).length`
+      )) as number;
+      console.log(`DOM querySelectorAll match count for '${flowSel}': ${domCount}`);
+      console.log(`clicking: ${flowSel}`);
+      await browser.click(session, flowSel);
+      await new Promise((r) => setTimeout(r, 1500));
+      const after = await extractSel("after");
+      const added = [...after].filter((s) => !before.has(s));
+      const removed = [...before].filter((s) => !after.has(s));
+      console.log("NEW selectors after click (post-action recon territory):", JSON.stringify(added, null, 1));
+      console.log("REMOVED selectors after click:", JSON.stringify(removed, null, 1));
+      const loc = (await browser.evaluate(session, "location.href")) as string;
+      console.log("URL after click:", loc);
+    }
+
+    if (process.argv.includes("--click-create-account")) {
+      // Multi-step flow probe: click "Create account", then re-extract.
+      // Proves (against the REAL deployed SPA) that the signup form controls
+      // only exist after a state-changing click — the exact case post-action
+      // recon was built for.
+      await browser.click(session, 'div > p > button:nth-of-type(2)');
+      await new Promise((r) => setTimeout(r, 1200));
+      const after = (await browser.evaluate(session, EXTRACTION)) as Record<string, unknown>;
+      console.log("AFTER CLICK:", JSON.stringify(after, null, 2));
+      const url = (await browser.evaluate(session, "location.href")) as string;
+      console.log("URL after click:", url);
     }
   } finally {
     await browser.closeBrowserSession(session);

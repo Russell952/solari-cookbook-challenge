@@ -356,8 +356,13 @@ function optionalArray(val: unknown, field: string): unknown[] {
  * instead of using one from recon data.
  */
 const FABRICATED_SELECTOR_PATTERNS = [
-  // Parentheses without attribute syntax — e.g. "button (submit)", "link (external)"
-  /\s*\([^)]*\)\s*$/,
+  // Parentheses without attribute syntax — e.g. "button (submit)", "link (external)".
+  // MUST NOT match real CSS pseudo-class syntax like :nth-of-type(2) or
+  // :nth-child(3): guard requires the char before "(" to NOT be part of a
+  // pseudo-class name (letter/hyphen). Live regression: probe-challenge
+  // recon produces div > p > button:nth-of-type(2), which the old regex
+  // rejected as "fabricated", blocking valid plans on its own SPA.
+  /(?<![\w-])\([^)]*\)\s*$/,
   // Natural language prefixes the AI adds to describe intent
   /^(link|button|nav\s*link|form\s*field|input|anchor|cta|section|page|text|button\/link|form\s*element|submit\s*button):\s*/i,
   // Compound word descriptions
@@ -990,6 +995,14 @@ function compactAppReconForPrompt(appRecon: ApplicationRecon | null): Record<str
     links: appRecon.links,
     primaryWorkflow: appRecon.primaryWorkflow,
     interactableElements: appRecon.interactableElements,
+    // Tells the model whether this recon reflects the CURRENT page state
+    // (post-action) or the initial landing page. Multi-step SPA flows rely
+    // on this distinction: post-action recon may contain controls that did
+    // not exist on the landing page.
+    reconSource: appRecon.source ?? "initial",
+    ...(appRecon.source === "post-action"
+      ? { capturedAfter: `${appRecon.afterAction ?? "action"} #${appRecon.afterActionSequence ?? "?"}` }
+      : {}),
     screenshot: `<omitted from prompt: full-page screenshot persisted as recon evidence (${Math.round((appRecon.screenshot ?? "").length / 1024)}KB base64)>`,
   };
 }
@@ -1267,7 +1280,7 @@ RULES:
 2. If evidence clearly shows the application works correctly, stop.
 3. If evidence clearly confirms a bug, stop.
 4. Do NOT generate redundant experiments that test the same behavior.
-5. The next experiment must use ONLY selectors from the Application Recon interactableElements.
+5. The next experiment must use ONLY selectors from the Application Recon interactableElements. The Application Recon may be a post-action snapshot: when reconSource is "post-action", its interactableElements reflect the CURRENT page state after the last executed action — controls that did not exist on the landing page (e.g. a signup form revealed by clicking "Create account") are now verified and usable.
 6. For mobile experiments, the first browser action MUST be: { "tool": "browser", "action": "setViewport", "target": "page", "input": {"viewport": {"width": 390, "height": 844}} }. Do NOT attach viewport to a navigate action as a workaround — use the dedicated setViewport action.
 7. For desktop experiments, optionally use: { "tool": "browser", "action": "setViewport", "target": "page", "input": {"viewport": {"width": 1440, "height": 900}} } on the first browser action to restore desktop.
 8. The only valid browser actions are: launch, navigate, click, type, readText, screenshot, getTitle, setViewport. Do NOT invent wait/sleep/hover/scroll actions.

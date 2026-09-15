@@ -27,7 +27,9 @@
   "devDependencies": {
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
+    "@types/jsdom": "^30.0.0",
     "@types/node": "^22.0.0",
+    "jsdom": "^30.0.1",
     "patchright-core": "1.62.2",
     "typescript": "^5.7.2",
     "vitest": "^4.1.11"

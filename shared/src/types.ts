@@ -415,4 +415,15 @@ export interface ApplicationRecon {
   primaryWorkflow: string | null;
   /** Structured interactable elements with CSS selectors for the planner */
   interactableElements?: InteractableElement[];
+  /** How this recon was produced. "initial" = the recon phase;
+   * "post-action" = fresh recon captured after a state-changing action
+   * (navigate/click) mid-experiment, enabling multi-step SPA flows where
+   * new interactables only exist after an earlier step. */
+  source?: "initial" | "post-action";
+  /** The action (index within its experiment, 1-based) that produced this
+   * recon snapshot. Only set for post-action recon. */
+  afterActionSequence?: number;
+  /** The browser action name that produced this snapshot (e.g. "click").
+   * Only set for post-action recon. */
+  afterAction?: string;
 }

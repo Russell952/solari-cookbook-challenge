@@ -13,6 +13,7 @@ import type {
   Observation,
   RepositoryRecon,
   ApplicationRecon,
+  InteractableElement,
   InvestigationPhase,
   Hypothesis,
   Finding,
@@ -29,6 +30,7 @@ import * as browser from "../solari/browser.js";
 import type { ReconContext } from "../solari/browser.js";
 import * as sandbox from "../solari/sandbox.js";
 import { resolveFindingEvidenceIds } from "./finding-evidence.js";
+import { INTERACTABLE_EXTRACTION_SCRIPT } from "../recon/extract-elements.js";
 import { releaseSlot } from "../security/rate-limit.js";
 import { VALID_ACTIONS_BY_TOOL as VALID_ACTIONS, looksLikeCssSelector } from "./action-allowlist.js";
 import {
@@ -111,6 +113,16 @@ const runStates = new Map<string, RunState>();
  */
 export function hasActiveRunner(investigationId: string): boolean {
   return runStates.has(investigationId);
+}
+
+/**
+ * Test-only: drop all per-run state (phase stats, recon). Necessary because
+ * run state deliberately outlives the store records in tests that clear the
+ * store between cases — a stale entry from a previous test would leak recon
+ * into the next test's planner calls.
+ */
+export function __clearRunStatesForTests(): void {
+  runStates.clear();
 }
 
 function runState(investigationId: string): RunState {
@@ -548,148 +560,7 @@ async function performApplicationRecon(investigation: Investigation): Promise<Ap
     let interactableElements: ApplicationRecon["interactableElements"] = [];
     try {
       interactableElements = await profiler.span("browser", "evaluate.interactableElements", undefined, async () =>
-        (await browser.evaluate(session, `
-        (() => {
-          const results = [];
-
-          // Helper: build a unique CSS selector for an element
-          function getSelector(el) {
-            if (el.id) return '#' + CSS.escape(el.id);
-            const tag = el.tagName.toLowerCase();
-
-            // Try href-based selector for links (most specific for links)
-            if (tag === 'a' && el.getAttribute('href')) {
-              const href = el.getAttribute('href');
-              if (href && (href.startsWith('#') || href.startsWith('/'))) {
-                return 'a[href="' + CSS.escape(href) + '"]';
-              }
-              if (href && !href.startsWith('javascript:')) {
-                return 'a[href="' + CSS.escape(href) + '"]';
-              }
-            }
-
-            // Try name attribute for form inputs (unique per form)
-            if (['input','select','textarea'].includes(tag) && el.name) {
-              // Check if name is unique in the document
-              const nameCount = document.querySelectorAll(tag + '[name="' + CSS.escape(el.name) + '"]').length;
-              if (nameCount === 1) return tag + '[name="' + CSS.escape(el.name) + '"]';
-              // Not unique — prefix with parent form id or class
-              const form = el.closest('form');
-              if (form && form.id) return '#' + CSS.escape(form.id) + ' ' + tag + '[name="' + CSS.escape(el.name) + '"]';
-              return tag + '[name="' + CSS.escape(el.name) + '"]';
-            }
-
-            // Try type for submit buttons
-            if (tag === 'input' && el.type) {
-              return 'input[type="' + CSS.escape(el.type) + '"]';
-            }
-
-            // Try data-testid or data-cy (test IDs are designed to be unique)
-            if (el.getAttribute('data-testid')) return '[data-testid="' + CSS.escape(el.getAttribute('data-testid')) + '"]';
-            if (el.getAttribute('data-cy')) return '[data-cy="' + CSS.escape(el.getAttribute('data-cy')) + '"]';
-
-            // Try aria-label (often unique)
-            if (el.getAttribute('aria-label')) {
-              const label = el.getAttribute('aria-label');
-              const labelCount = document.querySelectorAll('[aria-label="' + CSS.escape(label) + '"]').length;
-              if (labelCount === 1) return '[aria-label="' + CSS.escape(label) + '"]';
-            }
-
-            // Try role + accessible name (Playwright-compatible)
-            const role = el.getAttribute('role');
-            if (role) {
-              const accessibleName = el.textContent?.trim().slice(0, 50) || '';
-              if (accessibleName) return '[role="' + role + '"][aria-label="' + CSS.escape(accessibleName) + '"]';
-            }
-
-            // Build a path from the element up to a unique ancestor
-            let current = el;
-            let path = tag;
-            while (current.parentElement && current.parentElement !== document.body) {
-              const parent = current.parentElement;
-              const parentTag = parent.tagName.toLowerCase();
-              const siblings = Array.from(parent.children).filter(c => c.tagName === current.tagName);
-              const idx = siblings.indexOf(current);
-
-              if (parent.id) {
-                return '#' + CSS.escape(parent.id) + ' > ' + path;
-              }
-
-              if (siblings.length === 1) {
-                path = parentTag + ' > ' + path;
-              } else {
-                path = parentTag + ' > ' + path + ':nth-of-type(' + (idx + 1) + ')';
-              }
-
-              current = parent;
-
-              // Stop if path is already specific enough
-              if (path.split(' > ').length >= 3) break;
-            }
-
-            return path;
-          }
-
-          function getInfo(el) {
-            const text = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80);
-            const classes = Array.from(el.classList || []).slice(0, 3);
-            const info = {
-              selector: getSelector(el),
-              text,
-              tag: el.tagName.toLowerCase(),
-            };
-            if (el.href) info.href = el.getAttribute('href');
-            if (el.name) info.name = el.name;
-            if (el.type) info.type = el.type;
-            if (el.placeholder) info.placeholder = el.placeholder;
-            if (el.id) info.id = el.id;
-            if (el.getAttribute('role')) info.role = el.getAttribute('role');
-            if (el.getAttribute('aria-label')) info.ariaLabel = el.getAttribute('aria-label');
-            if (classes.length > 0) info.classes = classes;
-            return info;
-          }
-
-          // Navigation links
-          document.querySelectorAll('nav a, [role="navigation"] a').forEach(a => {
-            results.push(getInfo(a));
-          });
-
-          // All visible links with href
-          document.querySelectorAll('a[href]').forEach(a => {
-            const text = (a.textContent || '').trim();
-            if (text && text.length > 0 && text.length < 80) {
-              const sel = getSelector(a);
-              if (!results.some(r => r.selector === sel)) {
-                results.push(getInfo(a));
-              }
-            }
-          });
-
-          // Buttons
-          document.querySelectorAll('button, [role="button"], input[type="submit"]').forEach(b => {
-            results.push(getInfo(b));
-          });
-
-          // Form inputs
-          document.querySelectorAll('form input, form select, form textarea, input[name], textarea[name]').forEach(inp => {
-            results.push(getInfo(inp));
-          });
-
-          // Sections with IDs (anchor targets)
-          document.querySelectorAll('[id]').forEach(el => {
-            if (el.tagName !== 'HTML' && el.tagName !== 'BODY' && el.id) {
-              results.push({
-                selector: '#' + CSS.escape(el.id),
-                text: (el.textContent || '').trim().slice(0, 40),
-                tag: el.tagName.toLowerCase(),
-                id: el.id,
-              });
-            }
-          });
-
-          return results.slice(0, 50);
-        })()
-      `)) as ApplicationRecon["interactableElements"]
+        (await browser.evaluate(session, `${INTERACTABLE_EXTRACTION_SCRIPT}`)) as ApplicationRecon["interactableElements"]
     );
     } catch (err) {
       // RECON→PLAN observability: a swallowed failure here yields an empty
@@ -877,6 +748,180 @@ async function runPlan(investigation: Investigation): Promise<Investigation> {
 
 // ── Execute Phase ──────────────────────────────────────────────────────────
 
+// ── Recon after state-changing actions ──────────────────────────────────
+// Multi-step SPA flows (click "Create account" → signup form renders) need
+// fresh recon: a selector absent from initial recon becomes real after an
+// earlier action. Safety invariants preserved:
+//   • Only ONE cheap DOM snapshot per successful navigate/click (an
+//     evaluate + title read — no screenshot, no navigation).
+//   • A fresh ApplicationRecon is only COMMITTED when the snapshot shows a
+//     state change (URL/title/selector-set). The commit budget (≤2 per
+//     experiment) bounds the cost; committing reuses the post-action
+//     screenshot the executor already captured as evidence.
+//   • Committed recon lands in RunState (never on the investigation
+//     record), so the next adaptive-planning round and every selector
+//     resolution/validation path see the updated verified targets.
+
+/** Cheap observable page state used to detect change (no screenshots). */
+interface PageStateSnapshot {
+  url: string;
+  title: string;
+  /** Sorted selector list of the current interactable elements. */
+  selectors: string[];
+  /** Derived from recon null (no browser) or real snapshot. */
+  null?: boolean;
+}
+
+const PAGE_STATE_SNAPSHOT_JS = `
+  (() => ({
+    url: location.href,
+    title: document.title,
+    selectors: Array.from(
+      document.querySelectorAll('a[href], button, [role="button"], input[type="submit"], input, select, textarea')
+    ).slice(0, 50).map(el => {
+      if (el.id) return '#' + el.id;
+      const tag = el.tagName.toLowerCase();
+      if (el.name) return tag + '[name="' + el.name + '"]';
+      const href = el.getAttribute && el.getAttribute('href');
+      if (tag === 'a' && href) return 'a[href="' + href + '"]';
+      return tag;
+    }).sort(),
+  }))()
+`;
+
+async function takePageStateSnapshot(
+  appRecon: ApplicationRecon | null,
+  session?: ProbeBrowserSession | null
+): Promise<PageStateSnapshot> {
+  if (!session) {
+    return { url: appRecon?.initialUrl ?? "", title: appRecon?.pageTitle ?? "", selectors: [], null: true };
+  }
+  try {
+    const state = (await browser.evaluate(session, PAGE_STATE_SNAPSHOT_JS)) as {
+      url: string;
+      title: string;
+      selectors: string[];
+    };
+    return {
+      url: state?.url ?? "",
+      title: state?.title ?? "",
+      selectors: Array.isArray(state?.selectors) ? state.selectors : [],
+    };
+  } catch {
+    // A broken page must not break the experiment — treat as unchanged
+    // (the pre-action snapshot stays authoritative).
+    return {
+      url: appRecon?.initialUrl ?? "",
+      title: appRecon?.pageTitle ?? "",
+      selectors: [],
+      null: true,
+    };
+  }
+}
+
+function pageStateChanged(before: PageStateSnapshot | null, after: PageStateSnapshot): boolean {
+  if (!before || before.null || after.null) return false;
+  if (before.url !== after.url) return true; // SPA pushState or full nav
+  if (before.title !== after.title) return true;
+  if (before.selectors.length !== after.selectors.length) return true;
+  for (let i = 0; i < before.selectors.length; i++) {
+    if (before.selectors[i] !== after.selectors[i]) return true; // sorted compare
+  }
+  return false;
+}
+
+/**
+ * Perform fresh application recon against the CURRENT page state and
+ * commit it to run state so later planning/validation sees newly rendered
+ * controls. Reuses the same extraction contract as the recon phase — the
+ * produced object is the trusted ApplicationRecon, just captured later.
+ */
+async function commitPostActionRecon(
+  investigation: Investigation,
+  experiment: Experiment,
+  session: ProbeBrowserSession,
+  actionSequence: number,
+  actionName: string,
+  screenshotBuffer: Buffer | null
+): Promise<ApplicationRecon> {
+  const nav = { title: "", url: "" };
+  try {
+    const title = await browser.getTitle(session);
+    const state = (await browser.evaluate(session, "({ url: location.href })")) as { url: string };
+    nav.title = title;
+    nav.url = state.url;
+  } catch {
+    // fall through — browser session is alive (the snapshot just worked)
+  }
+
+  // Structured extraction — same evaluate script contract as initial recon
+  // (the executor calls it through the browser adapter).
+  let interactableElements: InteractableElement[] = [];
+  try {
+    const raw = (await browser.evaluate(session, `${INTERACTABLE_EXTRACTION_SCRIPT}`)) as InteractableElement[];
+    interactableElements = Array.isArray(raw) ? raw : [];
+  } catch (err) {
+    console.error(
+      `[${investigation.id}] post-action recon extraction failed: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+
+  const previous = getAppRecon(investigation.id);
+  const fresh: ApplicationRecon = {
+    pageTitle: nav.title || previous?.pageTitle || "",
+    initialUrl: nav.url || previous?.initialUrl || "",
+    navigation: [],
+    forms: [],
+    buttons: [],
+    links: [],
+    // Reuse the post-action screenshot the executor already captured as
+    // action evidence — fresh recon must not double the screenshot cost.
+    screenshot: screenshotBuffer ? screenshotBuffer.toString("base64") : (previous?.screenshot ?? ""),
+    primaryWorkflow: null,
+    interactableElements,
+    source: "post-action",
+    afterActionSequence: actionSequence,
+    afterAction: actionName,
+  };
+
+  const state = runState(investigation.id);
+  state.appRecon = fresh;
+
+  console.log(
+    `[${investigation.id}] post-action recon committed after ${actionName} #${actionSequence}: interactable=${interactableElements.length} url="${fresh.initialUrl}"`
+  );
+
+  // Evidence: the state change itself is observable. Keep it tied to the
+  // experiment that caused it; content is the same screenshot already
+  // stored as action evidence — no duplicate artifact bytes are persisted.
+  try {
+    await captureEvidence({
+      investigationId: investigation.id,
+      experimentId: experiment.id,
+      type: "url",
+      uri: fresh.initialUrl,
+      metadata: {
+        type: "post_action_recon",
+        phase: "experiment",
+        afterAction: actionName,
+        afterActionSequence: actionSequence,
+        interactableCount: interactableElements.length,
+        pageTitle: fresh.pageTitle,
+        artifactAvailable: false,
+        artifactStore: "b2",
+      },
+    });
+  } catch (err) {
+    console.error(
+      `[${investigation.id}] post-action recon evidence capture failed: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+
+  return fresh;
+}
+
+const MAX_RECON_COMMITS_PER_EXPERIMENT = 2;
+
 async function runExperiments(investigation: Investigation): Promise<void> {
   const experiments = store.listExperiments(investigation.id);
 
@@ -913,6 +958,16 @@ async function runExperiment(investigation: Investigation, experiment: Experimen
   // Extract appRecon from run state for SPA fallback resolution
   const appRecon = getAppRecon(investigation.id);
 
+  // ── Recon-after-action bookkeeping ────────────────────────────────────
+  // A state-changing action (navigate/click) can reveal new UI on SPAs —
+  // e.g. clicking "Create account" renders the signup form that initial
+  // recon never saw. After such an action we take ONE cheap DOM snapshot;
+  // if the page state changed we commit a fresh ApplicationRecon to run
+  // state so later planning/validation sees the new verified selectors.
+  // The per-experiment commit budget bounds the cost (no unbounded loop).
+  let lastSnapshot: PageStateSnapshot | null = null;
+  let reconCommits = 0;
+
   let browserSession: ProbeBrowserSession | null = null;
 
   try {
@@ -930,6 +985,8 @@ async function runExperiment(investigation: Investigation, experiment: Experimen
       if (vpAction?.viewport) {
         await browser.setViewport(browserSession, vpAction.viewport);
       }
+      // Baseline page state for post-action change detection.
+      lastSnapshot = await takePageStateSnapshot(getAppRecon(investigation.id), browserSession);
     }
 
     let sequence = 0;
@@ -974,7 +1031,7 @@ async function runExperiment(investigation: Investigation, experiment: Experimen
       emit("action_started", investigation.id, { actionId: action.id, action: planned.action });
 
       try {
-        const result = await executeAction(planned, browserSession, investigation.id, appRecon, investigation.applicationUrl);
+        const result = await executeAction(planned, browserSession, investigation.id, getAppRecon(investigation.id), investigation.applicationUrl);
 
         // If this was a browser launch, track the session
         if (planned.action === "launch" && result.session) {
@@ -1013,6 +1070,29 @@ async function runExperiment(investigation: Investigation, experiment: Experimen
             result: result.data,
           })
         );
+
+        // ── Recon after state-changing actions ──────────────────────────
+        // navigate/click can change SPA state (pushState, dynamic UI). One
+        // cheap snapshot decides whether fresh recon is worth committing.
+        if (
+          browserSession &&
+          (planned.action === "navigate" || planned.action === "click") &&
+          reconCommits < MAX_RECON_COMMITS_PER_EXPERIMENT
+        ) {
+          const snapshot = await takePageStateSnapshot(getAppRecon(investigation.id), browserSession);
+          if (pageStateChanged(lastSnapshot, snapshot)) {
+            reconCommits++;
+            await commitPostActionRecon(
+              investigation,
+              experiment,
+              browserSession,
+              sequence,
+              planned.action,
+              result.screenshot ?? null
+            );
+          }
+          lastSnapshot = snapshot;
+        }
       } catch (error) {
         const rawMsg = error instanceof Error ? error.message : String(error);
         // Honest failure classification: a bounded timeout or a navigation-

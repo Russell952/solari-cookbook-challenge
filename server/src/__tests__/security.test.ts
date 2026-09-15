@@ -125,10 +125,12 @@ describe("Host Execution Boundary", () => {
   it("runner module does not re-export child_process", async () => {
     const runner = await import("../orchestrator/runner.js");
     const exports = Object.keys(runner);
-    // The runner exports runInvestigation plus hasActiveRunner — a read-only
-    // query on the in-process run registry (used by startup recovery). No
-    // execution primitives (child_process, eval, spawn) are ever exported.
-    expect(exports.sort()).toEqual(["hasActiveRunner", "runInvestigation"]);
+    // The runner exports runInvestigation, hasActiveRunner (a read-only
+    // query on the in-process run registry, used by startup recovery), and
+    // __clearRunStatesForTests (a vitest-only registry reset — no execution
+    // primitive). No execution primitives (child_process, eval, spawn) are
+    // ever exported.
+    expect(exports.sort()).toEqual(["__clearRunStatesForTests", "hasActiveRunner", "runInvestigation"]);
   });
 });
 

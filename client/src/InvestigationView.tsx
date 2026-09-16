@@ -175,10 +175,14 @@ export function InvestigationView({ investigationId, onBack }: Props) {
         onInspectEvidence={setViewingEvidence}
       />
 
-      {/* Report — the real generated report */}
-      {inv.status === "completed" && summary.report && (
-        <ReportSection summary={summary} />
-      )}
+      {/* Report — the real generated report. Rendered for completed runs
+          AND for failed runs that stopped gracefully at a budget boundary:
+          the pipeline persisted a structured report from the work that DID
+          complete, and hiding it (while claiming "no report") misinformed
+          the user about their own investigation. */}
+      {(inv.status === "completed" ||
+        (inv.status === "failed" && progressModel.budgetExhaustionStop)) &&
+        summary.report && <ReportSection summary={summary} />}
 
       {/* Two-column: Experiments + Evidence */}
       <div className="two-col">
@@ -464,8 +468,32 @@ function EvidenceSection({
   const experimentCount = evidence.filter((ev) => ev.provenance === "experiment").length;
   const verificationCount = evidence.filter((ev) => ev.provenance === "verification").length;
 
+  // Large sets stay navigable: items are grouped by provenance and every
+  // group except the largest is collapsed by default. Item design unchanged.
+  const [openGroups, setOpenGroups] = useState<Set<string> | null>(null);
+  const groups: Array<{ key: string; label: string; items: typeof evidence }> = [
+    { key: "verification", label: "Verification", items: evidence.filter((ev) => ev.provenance === "verification") },
+    { key: "experiment", label: "Experiment", items: evidence.filter((ev) => ev.provenance === "experiment") },
+    { key: "recon", label: "Recon", items: evidence.filter((ev) => ev.provenance === "recon") },
+    { key: "other", label: "Other", items: evidence.filter((ev) => !ev.provenance) },
+  ].filter((g) => g.items.length > 0);
+  const largest = groups.reduce((best, g) => (g.items.length > best ? g.items.length : best), 0);
+  const defaultOpen = new Set(
+    groups.filter((g) => g.items.length === largest).map((g) => g.key)
+  );
+  const open = openGroups ?? defaultOpen;
+  const toggleGroup = (key: string) => {
+    setOpenGroups((prev) => {
+      const base = prev ?? defaultOpen;
+      const next = new Set(base);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
   return (
-    <div className="card">
+    <div className="card evidence-card">
       <div className="card-header">
         <h2>Evidence</h2>
         <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>
@@ -478,30 +506,61 @@ function EvidenceSection({
       {evidence.length === 0 ? (
         <p style={{ color: "var(--text-muted)", fontSize: "0.85rem" }}>No evidence yet.</p>
       ) : (
-        evidence.map((ev) => {
-          const unavailable = ev.artifactAvailable === false && ev.type !== "url";
-          return (
-            <div key={ev.id} className="evidence-item">
-              <span className="evidence-type">{ev.type}</span>
-              <ProvenanceChip provenance={ev.provenance} />
-              <span style={{ flex: 1, minWidth: 0, fontSize: "0.8rem", color: "var(--text-secondary)" }}>
-                {ev.uri || (ev.metadata?.pageTitle as string | undefined) || ev.id.slice(0, 12)}
-              </span>
-              {unavailable && (
-                <span style={{ fontSize: "0.7rem", color: "var(--warning)" }}>artifact missing</span>
-              )}
-              <button
-                className="btn btn-secondary"
-                style={{ padding: "0.2rem 0.6rem", fontSize: "0.7rem" }}
-                onClick={() => onInspect(ev)}
-                disabled={ev.type === "url"}
-                title={ev.type === "url" ? ev.uri ?? undefined : "View artifact"}
-              >
-                {ev.type === "url" ? "Link" : "View"}
-              </button>
-            </div>
-          );
-        })
+        <div className="evidence-list">
+          {groups.map((group) => {
+            const isOpen = open.has(group.key);
+            return (
+              <div key={group.key} className="evidence-group">
+                <button
+                  type="button"
+                  className="evidence-group-toggle"
+                  aria-expanded={isOpen}
+                  onClick={() => toggleGroup(group.key)}
+                >
+                  <svg
+                    className="evidence-group-chevron"
+                    aria-hidden="true"
+                    width="10"
+                    height="10"
+                    viewBox="0 0 10 10"
+                  >
+                    <path d="M2 3.5 L5 6.5 L8 3.5" stroke="currentColor" strokeWidth="1.5" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  {group.label}
+                  <span className="evidence-group-count">({group.items.length})</span>
+                </button>
+                {isOpen && (
+                  <div className="evidence-group-items">
+                    {group.items.map((ev) => {
+                      const unavailable = ev.artifactAvailable === false && ev.type !== "url";
+                      return (
+                        <div key={ev.id} className="evidence-item">
+                          <span className="evidence-type">{ev.type}</span>
+                          <ProvenanceChip provenance={ev.provenance} />
+                          <span style={{ flex: 1, minWidth: 0, fontSize: "0.8rem", color: "var(--text-secondary)" }}>
+                            {ev.uri || (ev.metadata?.pageTitle as string | undefined) || ev.id.slice(0, 12)}
+                          </span>
+                          {unavailable && (
+                            <span style={{ fontSize: "0.7rem", color: "var(--warning)" }}>artifact missing</span>
+                          )}
+                          <button
+                            className="btn btn-secondary"
+                            style={{ padding: "0.2rem 0.6rem", fontSize: "0.7rem" }}
+                            onClick={() => onInspect(ev)}
+                            disabled={ev.type === "url"}
+                            title={ev.type === "url" ? ev.uri ?? undefined : "View artifact"}
+                          >
+                            {ev.type === "url" ? "Link" : "View"}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
       )}
     </div>
   );

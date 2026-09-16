@@ -438,11 +438,89 @@ body {
   font-weight: 600;
 }
 
-/* Two column layout */
+/* Two column layout (Experiments + Evidence).
+   Each column sizes to its OWN content: `align-items: start` overrides the
+   grid's default stretch, which previously inflated the short Experiments
+   card to the Evidence card's height, leaving a large empty area inside
+   Experiments whenever Evidence held dozens of artifacts. */
 .two-col {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 1rem;
+  align-items: start;
+  margin-top: 0.5rem;
+}
+
+/* Usable evidence lists at any size: the card never grows past the
+   viewport, and long lists scroll INTERNALLY so a 49-artifact run doesn't
+   stretch the whole page. Sticky header keeps the totals visible. */
+.two-col .evidence-card {
+  max-height: calc(100vh - 6rem);
+  display: flex;
+  flex-direction: column;
+}
+
+.two-col .evidence-card .card-header {
+  flex-shrink: 0;
+}
+
+.two-col .evidence-card .evidence-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 0.25rem;
+}
+
+/* Grouped evidence presentation: one collapsible section per type so large
+   sets stay navigable without changing the item design. */
+.evidence-group + .evidence-group {
+  margin-top: 0.5rem;
+}
+
+.evidence-group-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 0.3rem 0.2rem;
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.evidence-group-toggle:hover {
+  background: var(--bg-hover);
+}
+
+.evidence-group-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.evidence-group-count {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.evidence-group-chevron {
+  transition: transform 0.15s ease;
+  flex-shrink: 0;
+}
+
+.evidence-group-chevron[aria-expanded="false"] {
+  transform: rotate(-90deg);
+}
+
+.evidence-group-items {
+  display: flex;
+  flex-direction: column;
 }
 
 /* ── Investigation progress ─────────────────────────────────────────────── */
@@ -451,6 +529,10 @@ body {
   grid-template-columns: minmax(260px, 1fr) minmax(0, 1.4fr);
   gap: 1rem;
   align-items: start;
+  /* Consistent vertical rhythm with every other page section — without this
+     margin a run with no Findings/Report card between (failed or finding-less
+     runs) left .two-col flush under Progress with no breathing room. */
+  margin-bottom: 1.5rem;
 }
 
 .progress-side {
@@ -854,6 +936,16 @@ body {
 
 .progress-terminal-failed h3 {
   color: var(--danger);
+}
+
+/* Budget-boundary stop: a graceful limit, not a failure — visually
+   distinct from both danger (failed) and muted (cancelled). */
+.progress-terminal-budget {
+  border-left: 4px solid var(--warning);
+}
+
+.progress-terminal-budget h3 {
+  color: var(--warning);
 }
 
 .progress-terminal-cancelled {

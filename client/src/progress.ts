@@ -29,6 +29,32 @@ export function formatEventType(type: string): string {
   };
   return labels[type] || type;
 }
+/**
+ * Failure reasons that are a graceful stop at a budget boundary, NOT an
+ * execution error: the pipeline detected the limit itself, produced a
+ * structured report from the work that DID complete, and terminalized
+ * honestly. A budget-exhausted run with a persisted report must never be
+ * presented as "ended before a report could be produced" (live regression:
+ * inv_1789470483431_1bpnr8 finished 4/5 experiments + 49 evidence + a
+ * persisted fallback report at the 10-minute boundary, but the UI claimed
+ * an infrastructure failure and hid the report).
+ */
+const BUDGET_EXHAUSTION_REASONS = new Set([
+  "runtime_expired",
+  "ai_call_budget_exhausted",
+  "ai_token_budget_exhausted",
+  "analysis_budget_exhausted",
+]);
+
+/** True when a failed investigation actually stopped gracefully at a budget boundary. */
+export function isBudgetExhaustionStop(summary: InvestigationSummary): boolean {
+  return (
+    summary.investigation.status === "failed" &&
+    summary.failure != null &&
+    BUDGET_EXHAUSTION_REASONS.has(summary.failure.reason)
+  );
+}
+
 /** A major presentation stage, mapped 1:1 onto the backend phase machine. */
 export interface ProgressStage {
   /** Backend phase key driving this stage (source of truth). */
@@ -185,6 +211,13 @@ export interface ProgressModel {
   reportContext: string[];
   /** Hypothesis outcome counts for honest result communication. */
   hypothesisOutcomes: { confirmed: number; rejected: number; inconclusive: number; other: number };
+  /**
+   * True when the failed run actually stopped gracefully at a runtime/budget
+   * boundary (failure.reason in BUDGET_EXHAUSTION_REASONS). Such a run has a
+   * persisted structured report and must NEVER be presented as "ended before
+   * a report could be produced".
+   */
+  budgetExhaustionStop: boolean;
 }
 
 function formatRuntime(ms: number): string {
@@ -324,6 +357,12 @@ export function buildProgressModel(
   if (noExperimentsPlanned && summary.failure?.reason === "no_executable_experiments") {
     activity =
       "No executable experiments were produced — the application behavior was not tested.";
+  } else if (isBudgetExhaustionStop(summary)) {
+    // Graceful stop at the budget boundary — the pipeline completed the
+    // experiments it could, produced a structured report from that work,
+    // and terminalized honestly. Never call this an execution error.
+    activity =
+      "Stopped at the runtime/budget limit after the experiments it could run — a structured report from that work is below.";
   } else if (status === "failed") {
     activity = "The investigation ended with an execution error.";
   } else if (status === "cancelled") {
@@ -352,5 +391,6 @@ export function buildProgressModel(
     noExperimentsPlanned,
     reportContext,
     hypothesisOutcomes,
+    budgetExhaustionStop: isBudgetExhaustionStop(summary),
   };
 }

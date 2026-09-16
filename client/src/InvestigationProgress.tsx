@@ -177,15 +177,17 @@ export function TerminalBanner({ model }: { model: ProgressModel }) {
     model.terminal === "failed" &&
     model.noExperimentsPlanned &&
     model.activity.includes("No executable experiments");
+  const budgetStop =
+    model.terminal === "failed" && model.budgetExhaustionStop === true;
   return (
     <div
-      className={`card progress-terminal progress-terminal-${model.terminal}`}
+      className={`card progress-terminal ${budgetStop ? "progress-terminal-budget" : `progress-terminal-${model.terminal}`}`}
       role="status"
     >
       <h3>
         {model.terminal === "failed" ? (
           <>
-            <AlertIcon aria-hidden="true" /> {noExperiments ? "No experiments were executed" : "Investigation failed"}
+            <AlertIcon aria-hidden="true" /> {noExperiments ? "No experiments were executed" : budgetStop ? "Stopped at the budget limit" : "Investigation failed"}
           </>
         ) : (
           <>
@@ -196,6 +198,8 @@ export function TerminalBanner({ model }: { model: ProgressModel }) {
       <p>
         {noExperiments
           ? "Planning produced no executable experiment, so the application behavior was never tested. This is a Probe execution limitation, not an application finding. Nothing here should be read as a test result."
+          : budgetStop
+          ? "The investigation reached its runtime/budget limit after completing the experiments it could. The work performed is summarized below — this is a budget boundary, not an application finding and not an infrastructure failure."
           : model.terminal === "failed"
           ? "The investigation ended with an execution error before a report could be produced. This is a Probe infrastructure failure, not an application finding."
           : "This investigation was cancelled before completion. Partial data below is not a confirmed result — no report exists."}

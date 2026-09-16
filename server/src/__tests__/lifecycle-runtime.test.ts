@@ -79,7 +79,18 @@ vi.mock("../ai/index.js", () => ({
     })),
     decideNextStep: vi.fn(async () => ({ shouldContinue: false, reason: "Enough coverage" })),
     analyzeRepository: vi.fn(async () => "Repo analysis"),
-    analyzeObservation: vi.fn(async () => "The signup CTA rendered and navigation behaved as documented."),
+    analyzeObservation: vi.fn(async () => {
+      // Regression hook (graceful-expiry test): expiry lands mid-analyze —
+      // the production failure boundary.
+      if (midRunExpiry.investigationId) {
+        budget.startRuntimeClock(
+          midRunExpiry.investigationId,
+          Date.now() - (budget.getBudget(midRunExpiry.investigationId).maxRuntimeMs + 1)
+        );
+        midRunExpiry.investigationId = null;
+      }
+      return "The signup CTA rendered and navigation behaved as documented.";
+    }),
     generateHypothesis: vi.fn(async () => ({ statement: "No application bug identified", confidence: 0.3, supportingEvidenceIds: [], contradictingEvidenceIds: [] })),
     designVerification: vi.fn(async () => ({ shouldVerify: false, verificationExperiment: null })),
     evaluateEvidence: vi.fn(async () => ({ confidence: 0.3, status: "inconclusive" })),
@@ -92,6 +103,14 @@ vi.mock("../ai/index.js", () => ({
   })),
   getAI: vi.fn(() => (requireMock())),
 }));
+
+/**
+ * Mid-run expiry pin, armed by the graceful-expiry regression test below.
+ * When set, the next analyzeObservation call rewinds the runtime clock so
+ * expiry lands exactly at the analyze phase — the production failure
+ * boundary (inv_1789470483431_1bpnr8).
+ */
+const midRunExpiry: { investigationId: string | null } = { investigationId: null };
 
 function requireMock() {
   // getAI() is called inside the runner; the vi.mock factory above already
@@ -145,6 +164,7 @@ async function api(method: string, path: string, body?: unknown) {
 beforeEach(() => {
   store.clearAll();
   vi.clearAllMocks();
+  midRunExpiry.investigationId = null;
 });
 
 describe("investigation reaches execution within the runtime budget", () => {
@@ -235,4 +255,71 @@ describe("investigation reaches execution within the runtime budget", () => {
     expect(summary.experiments.every((e) => e.status !== "completed")).toBe(true);
     expect(summary.findings).toEqual([]);
   }, 30_000);
+
+  it("runtime expiry landing mid-analyze still persists the fallback report and terminalizes honestly (production boundary)", async () => {
+    // Production failure being pinned: inv_1789470483431_1bpnr8 completed
+    // 4/5 experiments, captured 49 evidence items, and hit the 10-minute
+    // runtime budget during the analyze phase. The pipeline terminalized
+    // with status=failed and failure.reason=runtime_expired — but the
+    // client claimed "ended with an execution error before a report could
+    // be produced" and hid the persisted fallback report. The backend must
+    // (a) produce the structured fallback report from the work that DID
+    // complete, (b) record failure.reason=runtime_expired, and (c) reach a
+    // terminal status so the run never stays non-terminal.
+    const created = await api("POST", "/api/investigations", {
+      objective: "can a user sign up?",
+      applicationUrl: "https://app.rayern.com.ng/",
+    });
+    expect(created.status).toBe(201);
+    const { id } = (await created.json) as { id: string };
+
+    // Arm the pin: expiry lands exactly during the analyze phase, after the
+    // experiments have executed (the harness analyzes one experiment at a
+    // time, so the first analyzeObservation call triggers the rewind).
+    midRunExpiry.investigationId = id;
+
+    const start = await api("POST", `/api/investigations/${id}/start`);
+    expect(start.status).toBeLessThan(500);
+
+    const deadline = Date.now() + 30_000;
+    let status = "created";
+    while (Date.now() < deadline) {
+      const s = await api("GET", `/api/investigations/${id}/summary`);
+      const body = (await s.json) as { investigation?: { status?: string } };
+      status = body.investigation?.status ?? "running";
+      if (status === "failed" || status === "completed") break;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+
+    expect(status).toBe("failed");
+
+    const summary = (await (await api("GET", `/api/investigations/${id}/summary`)).json) as {
+      investigation: { currentPhase: string };
+      failure: { reason: string; phase: string | null } | null;
+      experiments: Array<{ status: string }>; 
+      evidenceCount: number;
+      report: { summary: string; totalExperiments: number; totalEvidence: number } | null;
+      findings: unknown[];
+    };
+
+    // (a) A report IS persisted from the work that completed (with the
+    // harness AI healthy, this is an AI-generated report; with a failing
+    // provider it is the runner's structured fallback — the contract under
+    // test is "a report exists", never "the AI paraphrased the failure").
+    expect(summary.report).not.toBeNull();
+    expect(summary.report!.totalExperiments).toBe(4);
+    expect(summary.report!.totalEvidence).toBeGreaterThan(0);
+    expect(summary.report!.summary.length).toBeGreaterThan(0);
+
+    // (b) The structured failure is a budget boundary, not a crash.
+    expect(summary.failure).not.toBeNull();
+    expect(summary.failure!.reason).toBe("runtime_expired");
+
+    // (c) Honest terminal state: failed (graceful), phase past analyze.
+    expect(summary.investigation.currentPhase).not.toBe("analyze");
+    // Experiments that ran are preserved as-is (no fabricated completion).
+    expect(summary.experiments.filter((e) => e.status === "completed").length).toBeGreaterThanOrEqual(1);
+    // No findings can exist: the hypothesis/verification stages never ran.
+    expect(summary.findings).toEqual([]);
+  }, 45_000);
 });

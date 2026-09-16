@@ -24,6 +24,7 @@ function makeSummary(overrides: {
   findingsCount?: number;
   runtime?: InvestigationSummary["runtime"];
   report?: InvestigationSummary["report"];
+  planningOutcome?: "planned" | "no_executable_experiments" | null;
 }): InvestigationSummary {
   const phase = overrides.phase ?? "execute";
   const status = overrides.status ?? "running";
@@ -37,6 +38,7 @@ function makeSummary(overrides: {
       currentPhase: phase,
       createdAt: "2026-09-06T00:00:00.000Z",
       updatedAt: "2026-09-06T00:01:00.000Z",
+      planningOutcome: overrides.planningOutcome ?? null,
     },
     experiments: overrides.experiments ?? [],
     experimentCounts: {
@@ -319,27 +321,32 @@ describe("experiment-level progress", () => {
     expect(model.metrics.find((m) => m.label === "Experiments")?.value).toBe("3/3");
   });
 
-  it("withholds the Experiments metric and flags noExperimentsPlanned when planning produced nothing", () => {
+  it("withholds the Experiments metric and flags noExperimentsPlanned only for the explicit completed outcome", () => {
     // Live regression: the zero-experiment run rendered a normal-looking
-    // 0/0 as though the counter were merely waiting for experiments.
+    // 0/0 as though the counter were merely waiting for experiments. The
+    // corrected contract requires the backend's explicit planningOutcome —
+    // an empty experiments array alone is the normal state DURING planning.
     const model = buildProgressModel(
-      makeSummary({ phase: "report", status: "failed", experiments: [] })
+      makeSummary({
+        phase: "report",
+        status: "failed",
+        experiments: [],
+        planningOutcome: "no_executable_experiments",
+      })
     );
     expect(model.noExperimentsPlanned).toBe(true);
     expect(model.metrics.find((m) => m.label === "Experiments")).toBeUndefined();
   });
 
-  it("does not flag noExperimentsPlanned for a created investigation that has not planned yet", () => {
+  it("does not flag noExperimentsPlanned when experiments are empty without a completed planning outcome", () => {
+    // Planning has not completed (no explicit outcome): zero experiments is
+    // NOT a planning result — the message must stay hidden (premature-verdict
+    // regression).
     const model = buildProgressModel(
       makeSummary({ phase: "recon", status: "running", experiments: [] })
     );
-    // status is running (post-created): the phase gate uses investigation
-    // status "created" — recon has started so planning simply has not run.
-    // The gate treats any non-created status with zero experiments as the
-    // honest no-experiments state ONLY after planning could have run;
-    // during recon the metric is withheld the same way without claiming
-    // failure.
-    expect(model.metrics.find((m) => m.label === "Experiments")).toBeUndefined();
+    expect(model.noExperimentsPlanned).toBe(false);
+    expect(model.activity).not.toMatch(/no executable experiments/i);
   });
 });
 

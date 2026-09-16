@@ -670,6 +670,15 @@ const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = [2000, 5000, 10000];
 
 /**
+ * Wall-clock reserved at the end of every investigation for terminalization
+ * (durable status/failure/report writes). AI calls are clamped to the
+ * remaining runtime MINUS this headroom, so a slow-but-healthy provider gets
+ * the full remaining budget for its response while the guaranteed-terminal
+ * finalizer always keeps a slice of the clock to persist state cleanly.
+ */
+const AI_TERMINALIZATION_HEADROOM_MS = 10_000;
+
+/**
  * Budget accounting hook. Set by the orchestrator so that every actual
  * upstream model request — including retries on 503/429 and
  * validation-retry loops — is counted individually against the AI budget.
@@ -796,14 +805,30 @@ export async function chatInternal(systemPrompt: string, userPrompt: string): Pr
     // (or the configured per-call ceiling): AbortController cancels the
     // fetch, preventing an unbounded AI operation from consuming the whole
     // runtime budget when the provider degrades.
-    let timeoutMs = guard ? guard.callTimeoutMs() : 120_000;
+    // Effective per-call budget = min(configured per-call ceiling, remaining
+    // investigation runtime) — never the runtime budget alone. TERMINATION
+    // HEADROOM: the last N ms of the investigation are reserved for
+    // terminalization (durable status/failure/report writes). An AI call that
+    // starts with less than that left fails fast instead of consuming the
+    // headroom the finalizer needs.
+    const configuredCeilingMs = guard ? guard.callTimeoutMs() : 120_000;
+    let timeoutMs = configuredCeilingMs;
     if (guard) {
       const remaining = guard.remainingRuntimeMs();
-      if (remaining <= 0) {
-        throw new AiBudgetExhaustedError("runtime", "Investigation runtime expired before AI request");
+      if (remaining <= AI_TERMINALIZATION_HEADROOM_MS) {
+        throw new AiBudgetExhaustedError(
+          "runtime",
+          "Investigation runtime nearly exhausted before AI request (terminalization headroom reserved)"
+        );
       }
-      timeoutMs = Math.min(timeoutMs, remaining);
+      timeoutMs = Math.min(timeoutMs, remaining - AI_TERMINALIZATION_HEADROOM_MS);
     }
+    // Which bound actually fired on a timeout: when the runtime clamp reduced
+    // the call below the configured ceiling, the investigation deadline is
+    // the binding bound; otherwise the configured ceiling fired. Precomputed
+    // once — accurate, never a guess.
+    const boundedByRuntime = timeoutMs < configuredCeilingMs;
+    const tAttemptStart = Date.now();
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(), timeoutMs);
 
@@ -833,12 +858,18 @@ export async function chatInternal(systemPrompt: string, userPrompt: string): Pr
     } catch (err) {
       if (abort.signal.aborted) {
         const remaining = guard ? guard.remainingRuntimeMs() : 0;
-        if (remaining <= 0) {
+        if (remaining <= AI_TERMINALIZATION_HEADROOM_MS) {
           handle.end(false, { retries, error: "Investigation runtime expired during AI request", timedOut: true });
           throw new AiBudgetExhaustedError("runtime", "Investigation runtime expired during AI request");
         }
         handle.end(false, { retries, error: `AI API timeout after ${timeoutMs}ms`, timedOut: true });
-        throw new Error(`AI API timeout after ${timeoutMs}ms (bounded by investigation deadline)`);
+        // Accurate classification: the abort could come from the per-call
+        // ceiling OR from the remaining-runtime clamp. Never claim "bounded
+        // by investigation deadline" when the configured ceiling fired.
+        const bound = boundedByRuntime
+          ? "the investigation's remaining runtime"
+          : "the configured per-call AI timeout";
+        throw new Error(`AI API timeout after ${timeoutMs}ms (bounded by ${bound})`);
       }
       handle.end(false, { retries, error: err instanceof Error ? err.message.slice(0, 300) : String(err) });
       throw err;
@@ -859,22 +890,35 @@ export async function chatInternal(systemPrompt: string, userPrompt: string): Pr
     // that left a real verification phase pending for ~128 minutes while
     // its investigation stayed 'Running'. The abort signal is still attached
     // to the fetch, so re-arming the same timer bounds the body read too.
+    // Timeout policy: headers and body share ONE effective deadline per call
+    // — time already spent reaching headers is deducted from the remaining
+    // body budget, so a single call can never spend 2× the per-call ceiling
+    // (headers 90s + body 90s). The body budget never exceeds the remaining
+    // investigation runtime minus the terminalization headroom.
+    const elapsedMs = Date.now() - tAttemptStart;
     const bodyReadMs = guard
-      ? Math.min(config.aiCallTimeoutMs, Math.max(1_000, guard.remainingRuntimeMs()))
+      ? Math.min(
+          Math.max(1_000, timeoutMs - elapsedMs),
+          Math.max(1_000, guard.remainingRuntimeMs() - AI_TERMINALIZATION_HEADROOM_MS)
+        )
       : 120_000;
-    const bodyTimer = setTimeout(() => abort.abort(), bodyReadMs);
+    const bodyTimer = setTimeout(() => abort.abort(), Math.max(1, bodyReadMs));
     let rawBody: unknown;
     try {
       rawBody = await res.json();
     } catch (err) {
       if (abort.signal.aborted) {
         const remaining = guard ? guard.remainingRuntimeMs() : 0;
-        if (remaining <= 0) {
+        if (remaining <= AI_TERMINALIZATION_HEADROOM_MS) {
           handle.end(false, { retries, error: "Investigation runtime expired during AI response read", timedOut: true });
           throw new AiBudgetExhaustedError("runtime", "Investigation runtime expired during AI response read");
         }
         handle.end(false, { retries, error: `AI API response read timeout after ${bodyReadMs}ms`, timedOut: true });
-        throw new Error(`AI API response read timeout after ${bodyReadMs}ms (bounded by investigation deadline)`);
+        // Accurate classification: report the actually-binding bound.
+        const bound = boundedByRuntime
+          ? "the investigation's remaining runtime"
+          : "the configured per-call AI timeout";
+        throw new Error(`AI API response read timeout after ${bodyReadMs}ms (bounded by ${bound})`);
       }
       handle.end(false, { retries, error: err instanceof Error ? err.message.slice(0, 300) : String(err) });
       throw err;

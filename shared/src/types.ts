@@ -41,6 +41,17 @@ export interface Investigation {
   failure?: InvestigationFailure | null;
   /** Last checkpointed budget usage (restored on resume/retry). */
   budgetUsage?: BudgetUsage | null;
+  /**
+   * Explicit planning outcome, set ONLY when planning has actually completed:
+   *   - "planned": at least one experiment was planned (planning succeeded)
+   *   - "no_executable_experiments": planning completed with zero experiments
+   * Absent/null while planning has not completed. The UI must never derive a
+   * final planning verdict from an empty experiments array — during the whole
+   * PLAN phase the summary legitimately has zero experiments (live regression:
+   * "No executable experiments were planned" rendered while the UI showed
+   * "Designing experiments" as the current stage).
+   */
+  planningOutcome?: "planned" | "no_executable_experiments" | null;
 }
 
 export interface CreateInvestigationInput {

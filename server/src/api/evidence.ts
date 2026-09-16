@@ -70,8 +70,26 @@ evidenceRouter.get("/:evId/content", async (req: Request, res: Response) => {
     return;
   }
 
-  const { buffer, sha256, hashVerified } = await getEvidenceContent(evidence);
+  let buffer: Buffer | null;
+  let sha256: string | null;
+  let hashVerified: boolean;
+  try {
+    ({ buffer, sha256, hashVerified } = await getEvidenceContent(evidence));
+  } catch (err) {
+    // Storage-system failure (network/auth/5xx from the artifact store):
+    // this is NOT "artifact missing" — the artifact may exist but cannot be
+    // retrieved right now. Surface 503 so clients can distinguish a storage
+    // failure from genuine absence and retry, instead of showing a false
+    // "artifact missing" state.
+    console.error(
+      `[evidence] artifact retrieval failed (storage system error) investigation=${investigationId} evidence=${evidence.id}:`,
+      err instanceof Error ? err.message : err
+    );
+    res.status(503).json({ error: "Artifact storage temporarily unavailable" });
+    return;
+  }
   if (!buffer) {
+    // Genuine absence: NoSuchKey from the store or a record without bytes.
     res.status(404).json({ error: "Evidence artifact not available" });
     return;
   }

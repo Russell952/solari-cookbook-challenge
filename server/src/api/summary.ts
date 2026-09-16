@@ -49,6 +49,12 @@ interface SummaryResponse {
     currentPhase: string;
     createdAt: string;
     updatedAt: string;
+    /**
+     * Explicit planning outcome — set only when planning has COMPLETED.
+     * Null/absent while planning is still active. Clients must never infer
+     * "no executable experiments" from an empty experiments array.
+     */
+    planningOutcome: "planned" | "no_executable_experiments" | null;
   };
   experiments: Array<{
     id: string;
@@ -252,6 +258,7 @@ summaryRouter.get("/", (req: Request, res: Response) => {
       currentPhase: investigation.currentPhase,
       createdAt: investigation.createdAt,
       updatedAt: investigation.updatedAt,
+      planningOutcome: investigation.planningOutcome ?? null,
     },
     experiments: experiments.map((e) => ({
       id: e.id,

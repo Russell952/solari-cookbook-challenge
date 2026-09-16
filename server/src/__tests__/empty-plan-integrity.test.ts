@@ -164,7 +164,7 @@ async function createInvestigation(): Promise<string> {
 }
 
 async function getSummary(id: string): Promise<{
-  investigation: { status: string; currentPhase: string };
+  investigation: { status: string; currentPhase: string; planningOutcome: string | null };
   experimentCounts: { total: number };
   report: { summary: string } | null;
   hypothesesCount: number;
@@ -188,6 +188,17 @@ describe("empty-plan lifecycle integrity", () => {
     expect(summary.investigation.status).toBe("failed");
     expect(summary.failure?.reason).toBe("no_executable_experiments");
     expect(summary.failure?.message).toContain("no executable experiments");
+  }, 30000);
+
+  it("the completed empty-planning outcome is marked explicitly for the UI", async () => {
+    // The UI may show "No executable experiments were planned" ONLY for an
+    // explicit completed planning outcome — never for a merely-empty
+    // experiments array (which is the normal state DURING planning).
+    const id = await createInvestigation();
+    await runInvestigation(id);
+
+    const summary = await getSummary(id);
+    expect(summary.investigation.planningOutcome).toBe("no_executable_experiments");
   }, 30000);
 
   it("zero experiments are persisted and the report states nothing was tested", async () => {

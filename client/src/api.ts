@@ -190,6 +190,12 @@ export interface Investigation {
   currentPhase: InvestigationPhase;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Explicit planning outcome — set only when planning has COMPLETED.
+   * Null/absent while planning is still active. The UI must never infer
+   * "no executable experiments" from an empty experiments array.
+   */
+  planningOutcome?: "planned" | "no_executable_experiments" | null;
 }
 
 export interface Experiment {

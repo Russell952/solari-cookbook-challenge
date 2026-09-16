@@ -709,6 +709,13 @@ async function runPlan(investigation: Investigation): Promise<Investigation> {
       "Planning produced no executable experiments, so the application behavior was never tested. " +
       "The planner may have found no interactable elements in recon, or could not map the objective to feasible actions. " +
       "This is a Probe execution limitation, not an application finding. Retry the investigation or refine the objective.";
+    // Planning has COMPLETED with zero executable experiments. Mark the
+    // record explicitly so clients can distinguish this final outcome from
+    // "planning is still running and simply has no experiments yet" — the
+    // summary's experiments array is empty during the whole PLAN phase, and
+    // deriving a terminal message from that emptiness presented a final
+    // planning verdict while planning was still active (live UI bug).
+    store.updateInvestigation(investigation.id, { planningOutcome: "no_executable_experiments" });
     checkpointFailure(investigation.id, "plan", "no_executable_experiments", message);
     emit("error", investigation.id, { error: message });
     // Persist a truthful report so the UI and API still have the full context
@@ -742,6 +749,11 @@ async function runPlan(investigation: Investigation): Promise<Investigation> {
       plannedActions: expPlan.plannedActions,
     });
   }
+
+  // Planning completed successfully — at least one experiment was planned.
+  // Persist the outcome so the UI can show planning-state truthfully at any
+  // moment (including before the experiments become visible through SSE).
+  store.updateInvestigation(investigation.id, { planningOutcome: "planned" });
 
   return investigation;
 }

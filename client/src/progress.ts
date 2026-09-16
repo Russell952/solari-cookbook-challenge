@@ -312,9 +312,18 @@ export function buildProgressModel(
   const experimentsTerminal = summary.experiments.filter((e) =>
     terminalExpStatuses.includes(e.status)
   ).length;
-  const noExperimentsPlanned =
-    summary.experimentCounts.total === 0 &&
-    summary.investigation.status !== "created";
+  // ── Planning-state semantics ───────────────────────────────────────────
+  // `noExperimentsPlanned` is true ONLY when the backend has explicitly
+  // reported a COMPLETED planning outcome of zero executable experiments
+  // (investigation.planningOutcome === "no_executable_experiments"). The
+  // summary's experiments array is legitimately empty during the whole PLAN
+  // phase — deriving a terminal message from that emptiness presented a
+  // final planning verdict while planning was still active (live bug: the
+  // no-experiments warning rendered alongside "Designing experiments —
+  // current stage"). Empty experiments during active planning is NOT a
+  // planning result.
+  const planningOutcome = summary.investigation.planningOutcome ?? null;
+  const noExperimentsPlanned = planningOutcome === "no_executable_experiments";
   const metrics: Array<{ label: string; value: string }> = [];
   if (!noExperimentsPlanned) {
     metrics.push({

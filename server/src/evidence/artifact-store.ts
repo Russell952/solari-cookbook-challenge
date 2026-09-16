@@ -331,10 +331,23 @@ export class B2ArtifactStore implements ArtifactStore {
       );
       const bytes = await res.Body?.transformToByteArray();
       return bytes ? Buffer.from(bytes) : null;
-    } catch {
-      // Missing object (or transient error) → null; the metadata endpoint
-      // remains the availability source of truth.
-      return null;
+    } catch (err) {
+      // Distinguish genuine absence from Probe/storage failure. A definitive
+      // NoSuchKey/404 means the object does not exist — return null (ordinary
+      // absence, metadata stays the availability source of truth). ANY OTHER
+      // error (network, auth, 5xx, throttling) is a storage-system failure:
+      // rethrow so the evidence content API surfaces it as a 503 instead of
+      // misrepresenting a recoverable failure as "artifact missing".
+      const name = (err as { name?: string; Code?: string; code?: string }) ?? {};
+      const code = name.Code ?? name.code ?? name.name ?? "";
+      if (code === "NoSuchKey" || code === "NotFound" || code === "ENOENT") {
+        return null;
+      }
+      console.error(
+        `[artifact-store] B2 read failed (storage system failure, not absence) key=${artifact.storagePath}:`,
+        err instanceof Error ? err.message : err
+      );
+      throw err;
     }
   }
 

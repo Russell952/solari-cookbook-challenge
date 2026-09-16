@@ -60,8 +60,15 @@ export async function captureEvidence(opts: CaptureEvidenceOpts): Promise<Eviden
   const artifactStore = getArtifactStore();
   const handle = profiler.begin("evidence", "capture", { type: opts.type });
   let artifact: StoredArtifact | null = null;
+  let storageFailure: string | null = null;
 
   if (opts.content !== undefined) {
+    // Artifact lifecycle observability (no secrets, no artifact bytes).
+    console.log(
+      `[evidence] artifact_capture_started investigation=${opts.investigationId} evidence=${evidenceId} type=${opts.type} bytes=${
+        Buffer.isBuffer(opts.content) ? opts.content.length : Buffer.byteLength(opts.content)
+      }`
+    );
     try {
       const tSha0 = Date.now();
       artifact = await artifactStore.save({
@@ -75,6 +82,9 @@ export async function captureEvidence(opts: CaptureEvidenceOpts): Promise<Eviden
         storageMs: Date.now() - tSha0,
         bytes: artifact?.byteSize ?? Buffer.byteLength(opts.content),
       });
+      console.log(
+        `[evidence] artifact_upload_completed investigation=${opts.investigationId} evidence=${evidenceId} type=${opts.type} bytes=${artifact.byteSize} store=${artifactStore.kind} durationMs=${Date.now() - tSha0}`
+      );
     } catch (error) {
       handle.annotate({
         storageMs: 0,
@@ -85,6 +95,13 @@ export async function captureEvidence(opts: CaptureEvidenceOpts): Promise<Eviden
         `Evidence artifact persistence failed (${opts.type}, evidence ${evidenceId}):`,
         error instanceof Error ? error.message : error
       );
+      // Artifact-state model: an evidence WITH content whose upload failed is
+      // a capture/storage failure ("artifact lost"), NOT ordinary absence.
+      // Recording the reason keeps this distinguishable from evidence that
+      // never had an artifact at all (e.g. URL/replay-unavailable records),
+      // and the metadata stays truthful: artifactAvailable=false is asserted
+      // below, never a fabricated success.
+      storageFailure = error instanceof Error ? error.message.slice(0, 300) : String(error);
     }
   }
 
@@ -95,6 +112,10 @@ export async function captureEvidence(opts: CaptureEvidenceOpts): Promise<Eviden
     contentHash: artifact?.sha256 ?? fullSha256Of(opts.content),
     artifactAvailable: artifact !== null,
     artifactStore: artifactStore.kind,
+    // Distinguish "artifact never existed / not applicable" from "Probe
+    // captured content but failed to store it": upload failures carry the
+    // reason and never masquerade as legitimate unavailability.
+    ...(storageFailure ? { artifactUnavailableReason: "upload_failed", artifactUploadError: storageFailure } : {}),
     ...(artifact
       ? {
           mimeType: artifact.mimeType,
@@ -110,6 +131,12 @@ export async function captureEvidence(opts: CaptureEvidenceOpts): Promise<Eviden
       : {}),
   };
 
+  // Metadata is persisted only AFTER the artifact-store write settles — the
+  // store can never claim an artifact exists before its bytes are safely
+  // persisted (order preserved: artifact → metadata).
+  console.log(
+    `[evidence] artifact_persisted investigation=${opts.investigationId} evidence=${evidenceId} type=${opts.type} available=${artifact !== null}${storageFailure ? " outcome=upload_failed" : ""}`
+  );
   handle.end(true);
   return store.createEvidence({
     id: evidenceId,

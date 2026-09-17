@@ -734,6 +734,29 @@ export function setAiBudgetGuards(guards: AiBudgetGuards | null): void {
 }
 
 /**
+ * Test-only reset of the module-level provider-stall timestamp. The breaker
+ * is deliberately cross-call (it must survive between investigations to
+ * skip a doomed re-send), so tests that exercise stalled-body paths need a
+ * way to return the module to its pristine state between cases.
+ */
+export function __resetProviderStallStateForTests(): void {
+  lastProviderBodyStallAt = 0;
+}
+
+/**
+ * Timestamp of the most recent response-body abort (headers arrived, body
+ * never completed). Module-level — deliberate: it survives across chat calls
+ * within the process, so the provider-stall circuit breaker can skip a
+ * doomed re-send on a subsequent investigation when the gateway is still
+ * wedged. Used ONLY for this fail-fast gate; never surfaced as an excuse.
+ */
+let lastProviderBodyStallAt = 0;
+/** Window in which a repeated provider stall blocks a fresh request. */
+const PROVIDER_STALL_RETRY_BACKOFF_MS = 30_000;
+/** How long a body may produce no bytes before it counts as a provider stall. */
+const BODY_STALL_CHUNK_TIMEOUT_MS = 20_000;
+
+/**
  * Derive a stable per-operation label for profiling from the system prompt's
  * role opener. Every adapter method starts with a distinctive "You are a …"
  * sentence, so this maps each AI call to its logical operation (planning,
@@ -755,6 +778,95 @@ function aiOpLabel(systemPrompt: string): string {
 
 async function chat(systemPrompt: string, userPrompt: string): Promise<string> {
   return chatInternal(systemPrompt, userPrompt);
+}
+
+/** Safe per-body-read telemetry (byte counts/timings only — never content). */
+interface BodyReadTelemetry {
+  bodyBytes: number;
+  firstBodyByteMs: number;
+  /** Longest silent gap in ms between consecutive body chunks. */
+  maxChunkGapMs: number;
+  /** Set when a silent gap exceeded BODY_STALL_CHUNK_TIMEOUT_MS and more
+   * bytes eventually arrived — a real mid-body stall that recovered. */
+  stalledAfterBytes: number | null;
+  /** True when the body was drained through a real byte stream (production
+   * path). False for the res.json() fallback (stubbed test Responses, or a
+   * body with no instrumentable stream) — fallback reads carry no byte
+   * facts, so they must never feed the provider-stall breaker. */
+  instrumented: boolean;
+}
+
+/**
+ * Read the response body with byte-level stall telemetry.
+ *
+ * Why not res.json(): a plain body read sees only "the whole body eventually
+ * arrived or the deadline fired". When the deadline fires there is no way to
+ * tell a dead connection (zero bytes — gateway never routed upstream) from a
+ * mid-body hang (partial bytes then silence) from a legitimately slow
+ * completion. Draining through a reader records WHERE the wait went.
+ *
+ * Abort authority is UNCHANGED: the armed body deadline (bodyReadMs) remains
+ * the only thing that aborts the fetch — exactly the previous deadline
+ * policy. No per-chunk watchdog: a silent gap is NOT proof of a dead stream,
+ * because a non-streaming body legitimately arrives as one chunk after a
+ * long generation (headers early, body later — the chunked-encoding shape
+ * OpenRouter uses). The reader merely observes; the deadline decides. When
+ * the deadline aborts, the pending reader.read() rejects and the abort
+ * branch classifies the failure with the byte facts in hand.
+ *
+ * Fallback: when res.json() has been replaced (stubbed test Responses) or
+ * the body exposes no reader, delegate to res.json() — same deadline
+ * semantics (the armed abort timer covers the body read either way), just
+ * without byte telemetry (instrumented: false).
+ */
+async function readBodyWithTelemetry(
+  res: Response,
+  abort: AbortController,
+  tBodyStart: number,
+  /** Mutated in place as the read progresses, so byte facts survive even
+   * when the read throws (the timeout path needs them in its catch). */
+  telemetry: BodyReadTelemetry
+): Promise<string> {
+  const jsonIsNative = res.json === Response.prototype.json;
+  const reader = jsonIsNative ? res.body?.getReader?.() ?? null : null;
+  if (reader) {
+    return readByteChunks(reader, telemetry, tBodyStart);
+  }
+  // Non-native json (stub) or no instrumentable stream — delegate to the
+  // plain body read; the abort signal still enforces the shared deadline.
+  // Telemetry stays at its instrumented:false defaults (no byte facts).
+  const parsed = (await res.json()) as unknown;
+  return JSON.stringify(parsed);
+}
+
+/** Drain byte chunks with per-chunk stall telemetry (observation only —
+ * the armed body deadline remains the sole abort authority). */
+async function readByteChunks(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  telemetry: BodyReadTelemetry,
+  tBodyStart: number
+): Promise<string> {
+  telemetry.instrumented = true;
+  const chunks: Uint8Array[] = [];
+  let lastChunkAt = Date.now();
+  for (;;) {
+    // No watchdog here on purpose: a silent gap is not proof of death for a
+    // non-streaming body (see readBodyWithTelemetry). The deadline abort
+    // rejects the pending read; this loop only counts and times chunks.
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    const now = Date.now();
+    const gap = now - lastChunkAt;
+    if (telemetry.firstBodyByteMs === 0) telemetry.firstBodyByteMs = now - tBodyStart;
+    else if (gap > telemetry.maxChunkGapMs) telemetry.maxChunkGapMs = gap;
+    if (gap > BODY_STALL_CHUNK_TIMEOUT_MS && telemetry.bodyBytes > 0) {
+      telemetry.stalledAfterBytes = telemetry.bodyBytes;
+    }
+    chunks.push(chunk.value);
+    telemetry.bodyBytes += chunk.value.byteLength;
+    lastChunkAt = now;
+  }
+  return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf8");
 }
 
 /** Exported for regression tests: the raw provider-bound chat path. */
@@ -795,6 +907,22 @@ export async function chatInternal(systemPrompt: string, userPrompt: string): Pr
   });
   let retries = 0;
   let lastError: Error | undefined;
+  // ── Provider-stall circuit breaker ──────────────────────────────
+  // If a response body just stalled in this process (headers fast, body
+  // never completed), the gateway connection was hung; an immediate re-send
+  // on a fresh request historically hits the same wedge and burns another
+  // full per-call ceiling of investigation runtime. Fail fast with the
+  // honest error instead of waiting again. Deliberately BEFORE the AI-call
+  // counter: a request that is never sent is not a consumed model call.
+  if (
+    lastProviderBodyStallAt > 0 &&
+    Date.now() - lastProviderBodyStallAt < PROVIDER_STALL_RETRY_BACKOFF_MS
+  ) {
+    handle.end(false, { error: "AI provider stalled and did not recover (fail-fast gate)" });
+    throw new Error(
+      "AI provider stalled and did not recover — investigation stopped early to preserve remaining runtime"
+    );
+  }
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     // Count this actual upstream model request before sending it. Retries
     // are real model requests and are billed as such.
@@ -883,7 +1011,7 @@ export async function chatInternal(systemPrompt: string, userPrompt: string): Pr
       guard.spendTokens(guard.estimateTokens(systemPrompt) + guard.estimateTokens(boundedUserPrompt));
     }
 
-    // ── Body-read deadline ────────────────────────────────────────────
+    // ── Body-read deadline + provider stall telemetry ─────────────
     // The AbortController above only covers reaching response HEADERS; a
     // stalled/slow response BODY (degraded gateway, dead keep-alive socket)
     // would otherwise await res.json() forever — the exact unbounded await
@@ -895,6 +1023,15 @@ export async function chatInternal(systemPrompt: string, userPrompt: string): Pr
     // body budget, so a single call can never spend 2× the per-call ceiling
     // (headers 90s + body 90s). The body budget never exceeds the remaining
     // investigation runtime minus the terminalization headroom.
+    //
+    // DIAGNOSTIC TELEMETRY: the deadline policy cannot distinguish a hung
+    // gateway from a legitimately slow completion, because a plain
+    // res.json() sees only "the whole body eventually arrived or did not".
+    // Draining through a reader records WHERE the wait actually went:
+    //   zeroBytes      → no body bytes ever arrived (dead connection)
+    //   stallAfterBytes→ bytes arrived, then a long silent gap (hang)
+    //   full in <60s   → generation itself was fast; the wait was upstream
+    // Safe metadata only — byte counts and timings, never body content.
     const elapsedMs = Date.now() - tAttemptStart;
     const bodyReadMs = guard
       ? Math.min(
@@ -904,16 +1041,46 @@ export async function chatInternal(systemPrompt: string, userPrompt: string): Pr
       : 120_000;
     const bodyTimer = setTimeout(() => abort.abort(), Math.max(1, bodyReadMs));
     let rawBody: unknown;
+    // Byte-facts sink, mutated in place by the body reader so the timeout
+    // catch below can report (and react to) exactly what arrived.
+    const bodyTelemetry: BodyReadTelemetry = { bodyBytes: 0, firstBodyByteMs: 0, maxChunkGapMs: 0, stalledAfterBytes: null, instrumented: false };
     try {
-      rawBody = await res.json();
+      const tBodyStart = Date.now();
+      const text = await readBodyWithTelemetry(res, abort, tBodyStart, bodyTelemetry);
+      const { bodyBytes, firstBodyByteMs, maxChunkGapMs, stalledAfterBytes } = bodyTelemetry;
+      if (stalledAfterBytes !== null) {
+        // A mid-body stall that eventually recovered — log it so latency
+        // regressions are visible even on successful requests.
+        console.warn(
+          `AI response body stalled ${Math.round(maxChunkGapMs / 1000)}s after ${stalledAfterBytes} bytes, then recovered ` +
+            `(total ${bodyBytes} bytes in ${Date.now() - tBodyStart}ms)`
+        );
+        lastProviderBodyStallAt = Date.now();
+      }
+      rawBody = JSON.parse(text);
     } catch (err) {
       if (abort.signal.aborted) {
         const remaining = guard ? guard.remainingRuntimeMs() : 0;
+        const bodyWaitMs = Date.now() - tAttemptStart - elapsedMs;
         if (remaining <= AI_TERMINALIZATION_HEADROOM_MS) {
           handle.end(false, { retries, error: "Investigation runtime expired during AI response read", timedOut: true });
           throw new AiBudgetExhaustedError("runtime", "Investigation runtime expired during AI response read");
         }
         handle.end(false, { retries, error: `AI API response read timeout after ${bodyReadMs}ms`, timedOut: true });
+        // Stall telemetry: was ANY body byte received, and when? A 0-byte
+        // abort is a dead connection; bytes-then-silence is a mid-body hang.
+        console.warn(
+          `AI response read timed out after ${bodyReadMs}ms: ` +
+            `headers=${elapsedMs}ms bodyWait=${bodyWaitMs}ms bodyBytes=${bodyTelemetry.bodyBytes} ` +
+            `firstBodyByte=${bodyTelemetry.firstBodyByteMs || "never"} maxChunkGap=${bodyTelemetry.maxChunkGapMs}ms` +
+            (bodyTelemetry.stalledAfterBytes !== null ? ` stalledAfterBytes=${bodyTelemetry.stalledAfterBytes}` : "")
+        );
+        // Zero bytes in the whole body window = the connection was dead —
+        // arm the circuit breaker so the next request fails fast instead of
+        // burning another ceiling on the same wedged gateway. Only real byte
+        // telemetry may arm it: the res.json() fallback (test stubs, or a
+        // body without a reader) carries no byte facts at all.
+        if (bodyTelemetry.bodyBytes === 0 && bodyTelemetry.instrumented) lastProviderBodyStallAt = Date.now();
         // Accurate classification: report the actually-binding bound.
         const bound = boundedByRuntime
           ? "the investigation's remaining runtime"
@@ -927,7 +1094,9 @@ export async function chatInternal(systemPrompt: string, userPrompt: string): Pr
     }
 
     // Gemini sometimes returns HTTP 200 with an error object/array in the body.
-    // Detect and treat as retryable alongside HTTP 503.
+    // Detect and treat as retryable alongside HTTP 503 — BUT only for errors
+    // that are actually transient (a 402 in a 200-body is a payment failure,
+    // NOT a transient unavailability; see the 402 handling below).
     const bodyStr = JSON.stringify(rawBody);
     const isBodyError = (
       Array.isArray(rawBody) && rawBody[0]?.error?.status === "UNAVAILABLE"
@@ -946,6 +1115,35 @@ export async function chatInternal(systemPrompt: string, userPrompt: string): Pr
         usageCompletionTokens: usage?.completion_tokens,
       });
       return content;
+    }
+
+    // ── Provider payment/account failure (HTTP 402) — FAIL FAST ─────
+    // OpenRouter (and any gateway billing per-request max_tokens) returns 402
+    // "This request requires more credits, or fewer max_tokens" when the
+    // account balance cannot cover the request's implied output cost. It can
+    // also return 402 with "...given your current in-flight requests" while a
+    // marginal balance sits at the overdraw edge. Retrying a 402 can NEVER
+    // succeed — the balance does not recover within an investigation — so the
+    // request must not consume another attempt, and the adapter must fail the
+    // investigation immediately so the orchestrator's graceful path (failure
+    // checkpoint + fallback report) runs while the runtime budget is intact.
+    // Live evidence: production re-sent the identical doomed request after a
+    // 402 and burned 90s of the plan phase on a guaranteed-timeout read.
+    // Some gateways deliver the payment error inside an HTTP 200 body (the
+    // same Gemini-envelope shape handled above), so the check must run before
+    // the 200-body error mapping — otherwise a 402 would be retried as 503.
+    const is402 =
+      res.status === 402 ||
+      (isBodyError &&
+        typeof rawBody === "object" &&
+        !Array.isArray(rawBody) &&
+        (rawBody as { error?: { code?: unknown } }).error?.code === 402);
+    if (is402) {
+      handle.end(false, { retries, error: "AI API error 402: provider account out of credits (fail-fast, no retry)" });
+      throw new AiBudgetExhaustedError(
+        "ai_calls",
+        "AI provider account cannot cover this request (HTTP 402: out of credits) — no retry can succeed; stopping early to preserve the remaining runtime budget"
+      );
     }
 
     // Determine the effective error status: body-level errors override HTTP 200

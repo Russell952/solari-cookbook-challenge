@@ -395,6 +395,25 @@ describe("terminal states", () => {
     expect(model.stageLabel).toBe("Investigation complete");
   });
 
+  it("an AI provider timeout failure is presented honestly (infrastructure, not a bug)", () => {
+    // Production failure: "AI API response read timeout after 89349ms". The
+    // banner must be truthful — stopped early because the AI provider did
+    // not complete its response — not a generic "execution error", not a
+    // budget claim, and never a success.
+    const summary = makeSummary({ status: "failed", phase: "plan" });
+    summary.failure = {
+      reason: "error",
+      message: "AI API response read timeout after 89349ms (bounded by the configured per-call AI timeout)",
+      phase: "plan",
+      at: "2026-09-16T15:28:46.388Z",
+    };
+    const model = buildProgressModel(summary);
+    expect(model.terminal).toBe("failed");
+    expect(model.activity).toMatch(/AI provider did not complete its response/i);
+    expect(model.activity).not.toMatch(/budget limit/i);
+    expect(model.activity).not.toMatch(/application bug/i);
+  });
+
   it("failed investigations mark the failure point and never present success", () => {
     const states = stageStates("failed", "execute");
     const labels = Object.fromEntries(states.map((s) => [s.phase, s.state]));

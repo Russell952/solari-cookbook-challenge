@@ -372,6 +372,15 @@ export function buildProgressModel(
     // and terminalized honestly. Never call this an execution error.
     activity =
       "Stopped at the runtime/budget limit after the experiments it could run — a structured report from that work is below.";
+  } else if (
+    status === "failed" &&
+    /AI API (response read )?timeout/i.test(summary.failure?.message ?? "")
+  ) {
+    // AI provider timeout: the model provider accepted the request but the
+    // response never completed within the per-call deadline. This is an
+    // infrastructure failure — not a budget stop, not an application bug.
+    activity =
+      "Stopped early: the AI provider did not complete its response in time. No findings can be drawn from this run.";
   } else if (status === "failed") {
     activity = "The investigation ended with an execution error.";
   } else if (status === "cancelled") {

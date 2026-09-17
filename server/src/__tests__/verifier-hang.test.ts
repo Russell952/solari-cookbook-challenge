@@ -22,7 +22,7 @@ vi.hoisted(() => {
 });
 import { isProbeLimitationError, classifyActionError } from "../security/error-classification.js";
 import { assertNavigationAllowed, NavigationPolicyError } from "../security/navigation-policy.js";
-import { createOpenAIAdapter, chatInternal, setAiBudgetGuards, estimatePromptTokens } from "../ai/openai.js";
+import { createOpenAIAdapter, chatInternal, setAiBudgetGuards, estimatePromptTokens, __resetProviderStallStateForTests } from "../ai/openai.js";
 import * as budget from "../orchestrator/budget.js";
 
 // ── Error classification ──────────────────────────────────────────────────
@@ -76,6 +76,9 @@ describe("AI adapter body-read deadline", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     setAiBudgetGuards(null);
+    // The dead-body test arms the cross-call provider-stall breaker; reset
+    // it so the success-path test in this file starts pristine.
+    __resetProviderStallStateForTests();
     budget.resetBudget("inv_bodytest");
     budget.stopRuntimeClock("inv_bodytest");
   });

@@ -22,7 +22,12 @@
  */
 /** @vitest-environment node */
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { createOpenAIAdapter, setAiBudgetGuards, AiBudgetExhaustedError } from "../ai/openai.js";
+import {
+  createOpenAIAdapter,
+  setAiBudgetGuards,
+  AiBudgetExhaustedError,
+  __resetProviderStallStateForTests,
+} from "../ai/openai.js";
 
 const REAL_FETCH = globalThis.fetch;
 
@@ -65,6 +70,7 @@ async function stalledBodyResponse(headerMs: number, signal: AbortSignal): Promi
 afterEach(() => {
   globalThis.fetch = REAL_FETCH;
   setAiBudgetGuards(null);
+  __resetProviderStallStateForTests();
   vi.restoreAllMocks();
 });
 
@@ -186,6 +192,74 @@ describe("AI effective deadline policy", () => {
     );
   });
 
+  it("arms a provider-stall fail-fast gate after a dead (zero-byte) body read, and the next call fails fast without consuming an AI call", async () => {
+    let fetchAttempts = 0;
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      fetchAttempts += 1;
+      const signal = init?.signal as AbortSignal;
+      // Real Response with native json and a byte stream that never produces
+      // a chunk: the production shape of a dead gateway connection (headers
+      // fast, body never routed). Like real undici, the stream reacts to the
+      // fetch abort signal — a rejected pull errors the stream and rejects
+      // the pending reader.read(), letting the armed deadline land.
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          pull() {
+            return new Promise<void>((_resolve, reject) => {
+              signal.addEventListener(
+                "abort",
+                () => reject(new DOMException("The operation was aborted.", "AbortError")),
+                { once: true }
+              );
+            });
+          },
+        }),
+        { status: 200 }
+      );
+    }) as typeof fetch;
+
+    setAiBudgetGuards({
+      ...makeGuards(600_000, 1_200),
+      estimateTokens: () => 1,
+    });
+    const adapter = createOpenAIAdapter();
+
+    // First call: body never arrives → read timeout, breaker arms.
+    await expect(adapter.plan("objective", null, null)).rejects.toThrow(/AI API response read timeout/);
+    expect(fetchAttempts).toBe(1);
+
+    // Second call within the backoff window: fails fast — no second HTTP
+    // request is ever sent (the top-of-call budget pre-check still runs —
+    // it is read-only and consumes nothing — and the breaker throws before
+    // any attempt loop, so recordAiRequest never fires either).
+    setAiBudgetGuards(makeGuards(600_000, 90_000));
+    await expect(adapter.plan("objective", null, null)).rejects.toThrow(/AI provider stalled and did not recover/);
+    expect(fetchAttempts).toBe(1);
+  });
+
+  it("a stubbed (non-instrumented) body read timeout does NOT arm the stall gate", async () => {
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      const signal = init?.signal as AbortSignal;
+      const res = new Response(completionBody(), { status: 200 });
+      (res as unknown as { json: () => Promise<unknown> }).json = () =>
+        new Promise((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+        });
+      return res;
+    }) as typeof fetch;
+
+    setAiBudgetGuards(makeGuards(600_000, 1_200));
+    const adapter = createOpenAIAdapter();
+    await expect(adapter.plan("objective", null, null)).rejects.toThrow(/AI API response read timeout/);
+
+    // The gate must not be armed: the next call goes out normally (and here
+    // succeeds — real fetch restored via closure? no: stub returns 200).
+    globalThis.fetch = (async () => new Response(completionBody(PLAN_JSON), { status: 200 })) as typeof fetch;
+    setAiBudgetGuards(makeGuards(600_000, 90_000));
+    const out = await adapter.plan("objective", null, null);
+    expect(out.experiments).toHaveLength(1);
+  });
+
   it("timeouts do not retry: one timed-out attempt consumes exactly one AI call and fails cleanly", async () => {
     let attempts = 0;
     globalThis.fetch = (async (_url: string, init?: RequestInit) => {
@@ -213,5 +287,78 @@ describe("AI effective deadline policy", () => {
     expect(attempts).toBe(1);
     // Token accounting happens only after a response was received.
     expect(charged).toBe(0);
+  });
+
+  it("a 402 (provider out of credits) fails fast with a typed budget error and never retries", async () => {
+    // Live production evidence: after a 402 the adapter re-sent the identical
+    // doomed request, which then stalled ~90s in the body-read — burning the
+    // plan phase's runtime on a request that could never succeed. A 402 is a
+    // payment/account failure; the balance cannot recover mid-investigation.
+    let attempts = 0;
+    globalThis.fetch = (async () => {
+      attempts += 1;
+      return new Response(
+        JSON.stringify({
+          error: {
+            message: "This request requires more credits, or fewer max_tokens.",
+            code: 402,
+          },
+        }),
+        { status: 402 }
+      );
+    }) as typeof fetch;
+
+    setAiBudgetGuards(makeGuards(600_000, 90_000));
+    const adapter = createOpenAIAdapter();
+    // One plan() call: the typed budget error propagates out of chat() through
+    // chatWithValidation (never validation-retried) — exactly ONE HTTP request.
+    await expect(adapter.plan("objective", null, null)).rejects.toThrow(
+      /HTTP 402: out of credits/
+    );
+    expect(attempts).toBe(1);
+
+    // A second plan() call must surface the SAME typed error class (the
+    // orchestrator's graceful AiBudgetExhaustedError handler depends on it).
+    await expect(adapter.plan("objective", null, null)).rejects.toBeInstanceOf(AiBudgetExhaustedError);
+    expect(attempts).toBe(2); // one per call — never retried within a call
+  });
+
+  it("a 402 delivered inside an HTTP 200 body (gateway envelope) also fails fast without retry", async () => {
+    let attempts = 0;
+    globalThis.fetch = (async () => {
+      attempts += 1;
+      return new Response(
+        JSON.stringify({
+          error: { message: "out of credits", code: 402 },
+        }),
+        { status: 200 }
+      );
+    }) as typeof fetch;
+
+    setAiBudgetGuards(makeGuards(600_000, 90_000));
+    const adapter = createOpenAIAdapter();
+    await expect(adapter.plan("objective", null, null)).rejects.toThrow(AiBudgetExhaustedError);
+    expect(attempts).toBe(1);
+  });
+
+  it("a Gemini 200-body UNAVAILABLE error still retries (transient), preserving the existing 503-equivalent policy", async () => {
+    let attempts = 0;
+    globalThis.fetch = (async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return new Response(
+          JSON.stringify([{ error: { status: "UNAVAILABLE", message: "overloaded" } }]),
+          { status: 200 }
+        );
+      }
+      return new Response(completionBody(PLAN_JSON), { status: 200 });
+    }) as typeof fetch;
+
+    setAiBudgetGuards(makeGuards(600_000, 90_000));
+    const adapter = createOpenAIAdapter();
+    const out = await adapter.plan("objective", null, null);
+    expect(out.experiments).toHaveLength(1);
+    // First attempt hit the transient body error; second succeeded.
+    expect(attempts).toBe(2);
   });
 });

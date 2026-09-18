@@ -50,21 +50,33 @@ const PLAN_JSON = JSON.stringify({
   ],
 });
 
-/** A Response whose headers arrive after `headerMs` but whose body
- * (res.json()) never completes — the exact stall the body-read deadline
- * exists for. The abort signal is the only way out. */
-async function stalledBodyResponse(headerMs: number, signal: AbortSignal): Promise<Response> {
-  await new Promise((r) => setTimeout(r, headerMs));
-  const res = new Response(completionBody(PLAN_JSON), { status: 200 });
-  (res as { json: () => Promise<unknown> }).json = () =>
-    new Promise((_resolve, reject) => {
-      signal.addEventListener(
-        "abort",
-        () => reject(new DOMException("The operation was aborted.", "AbortError")),
-        { once: true }
-      );
-    });
-  return res;
+/** A Response whose headers arrive after `headerMs` and whose byte body
+ * emits one chunk then never completes — the streaming-transport shape of a
+ * stalled body. The abort signal is the only way out. */
+function stalledByteBodyResponse(headerMs: number, signal: AbortSignal): Promise<Response> {
+  return (async () => {
+    await new Promise((r) => setTimeout(r, headerMs));
+    let sentFirst = false;
+    return new Response(
+      new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (!sentFirst) {
+            sentFirst = true;
+            controller.enqueue(new TextEncoder().encode(": keep-alive\n\n"));
+            return;
+          }
+          return new Promise<void>((_resolve, reject) => {
+            signal.addEventListener(
+              "abort",
+              () => reject(new DOMException("The operation was aborted.", "AbortError")),
+              { once: true }
+            );
+          });
+        },
+      }),
+      { status: 200 }
+    );
+  })();
 }
 
 afterEach(() => {
@@ -108,7 +120,7 @@ describe("AI effective deadline policy", () => {
     // single 1200ms budget plus slack.
     globalThis.fetch = (async (_url: string, init?: RequestInit) => {
       const signal = init?.signal as AbortSignal;
-      return stalledBodyResponse(400, signal);
+      return stalledByteBodyResponse(400, signal);
     }) as typeof fetch;
 
     setAiBudgetGuards(makeGuards(600_000, 1_200));
@@ -117,6 +129,13 @@ describe("AI effective deadline policy", () => {
     await expect(adapter.plan("objective", null, null)).rejects.toThrow(
       /AI API response read timeout after \d+ms \(bounded by the configured per-call AI timeout\)/
     );
+    // A byte-producing body (": keep-alive" SSE comment) must NOT arm the
+    // provider-stall breaker — only a truly dead (zero-byte) connection may.
+    // The next call goes out and succeeds.
+    globalThis.fetch = (async () => new Response(completionBody(PLAN_JSON), { status: 200 })) as typeof fetch;
+    setAiBudgetGuards(makeGuards(600_000, 90_000));
+    const out = await adapter.plan("objective", null, null);
+    expect(out.experiments).toHaveLength(1);
     const elapsed = Date.now() - t0;
     // 400ms headers + ~800ms body budget ≈ 1200ms. If the body got a FRESH
     // 1200ms budget this would be ≈1600ms — the shared budget forbids that.
@@ -240,7 +259,9 @@ describe("AI effective deadline policy", () => {
   it("a stubbed (non-instrumented) body read timeout does NOT arm the stall gate", async () => {
     globalThis.fetch = (async (_url: string, init?: RequestInit) => {
       const signal = init?.signal as AbortSignal;
-      const res = new Response(completionBody(), { status: 200 });
+      // A Response with NO byte stream (body === null) forces the res.json()
+      // fallback path — the non-instrumented shape this test exists for.
+      const res = new Response(null, { status: 200 });
       (res as unknown as { json: () => Promise<unknown> }).json = () =>
         new Promise((_resolve, reject) => {
           signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
@@ -360,5 +381,103 @@ describe("AI effective deadline policy", () => {
     expect(out.experiments).toHaveLength(1);
     // First attempt hit the transient body error; second succeeded.
     expect(attempts).toBe(2);
+  });
+});
+
+describe("AI streaming transport (default)", () => {
+  /** Build an SSE response whose body is a sequence of `data:` frames. */
+  function sseResponse(frames: unknown[], status = 200): Response {
+    const text = frames.map((f) => `data: ${JSON.stringify(f)}\n\n`).join("") + "data: [DONE]\n\n";
+    return new Response(text, { status, headers: { "content-type": "text/event-stream" } });
+  }
+
+  function planFrames(json: string): unknown[] {
+    // Split the JSON across content deltas like a real stream, interleaved
+    // with reasoning deltas (which must be discarded, never parsed).
+    const mid = Math.floor(json.length / 2);
+    return [
+      { choices: [{ delta: { reasoning: "thinking about the target..." } }] },
+      { choices: [{ delta: { content: json.slice(0, mid) } }] },
+      { choices: [{ delta: { reasoning: "more reasoning" } }] },
+      { choices: [{ delta: { content: json.slice(mid) } }] },
+      { choices: [{ delta: {} }] },
+    ];
+  }
+
+  it("requests stream:true by default and aggregates content deltas (reasoning discarded)", async () => {
+    let capturedBody: Record<string, unknown> | null = null;
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      capturedBody = JSON.parse(init?.body as string);
+      return sseResponse(planFrames(PLAN_JSON));
+    }) as typeof fetch;
+
+    setAiBudgetGuards(makeGuards(600_000, 90_000));
+    const adapter = createOpenAIAdapter();
+    const out = await adapter.plan("objective", null, null);
+    expect(out.experiments).toHaveLength(1);
+    expect(out.experiments[0].objective).toBe("Verify the page loads");
+    expect(capturedBody!.stream).toBe(true);
+    if (process.env.AI_REASONING_EFFORT) {
+      expect(capturedBody!.reasoning_effort).toBe(process.env.AI_REASONING_EFFORT);
+    } else {
+      expect(capturedBody!.reasoning_effort).toBeUndefined();
+    }
+  });
+
+  it("a 402 JSON body returned to a streaming request fails fast with the typed budget error", async () => {
+    let attempts = 0;
+    globalThis.fetch = (async () => {
+      attempts += 1;
+      // Error envelopes are plain JSON, NOT SSE — even when stream:true was
+      // requested. The adapter must classify them exactly as before.
+      return new Response(
+        JSON.stringify({ error: { message: "out of credits", code: 402 } }),
+        { status: 402 }
+      );
+    }) as typeof fetch;
+
+    setAiBudgetGuards(makeGuards(600_000, 90_000));
+    const adapter = createOpenAIAdapter();
+    await expect(adapter.plan("objective", null, null)).rejects.toBeInstanceOf(AiBudgetExhaustedError);
+    expect(attempts).toBe(1);
+  });
+
+  it("an in-stream HTTP-200 SSE error frame with code 402 fails fast without retry", async () => {
+    let attempts = 0;
+    globalThis.fetch = (async () => {
+      attempts += 1;
+      return sseResponse([{ error: { message: "out of credits", code: 402 } }]);
+    }) as typeof fetch;
+
+    setAiBudgetGuards(makeGuards(600_000, 90_000));
+    const adapter = createOpenAIAdapter();
+    await expect(adapter.plan("objective", null, null)).rejects.toBeInstanceOf(AiBudgetExhaustedError);
+    expect(attempts).toBe(1);
+  });
+
+  it("an in-stream UNAVAILABLE error frame retries, then a healthy stream succeeds", async () => {
+    let attempts = 0;
+    globalThis.fetch = (async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return sseResponse([{ error: { status: "UNAVAILABLE", message: "overloaded" } }]);
+      }
+      return sseResponse(planFrames(PLAN_JSON));
+    }) as typeof fetch;
+
+    setAiBudgetGuards(makeGuards(600_000, 90_000));
+    const adapter = createOpenAIAdapter();
+    const out = await adapter.plan("objective", null, null);
+    expect(out.experiments).toHaveLength(1);
+    expect(attempts).toBe(2);
+  });
+
+  it("a classic (non-streamed) JSON 200 body is still accepted when the gateway ignores stream:true", async () => {
+    globalThis.fetch = (async () => new Response(completionBody(PLAN_JSON), { status: 200 })) as typeof fetch;
+
+    setAiBudgetGuards(makeGuards(600_000, 90_000));
+    const adapter = createOpenAIAdapter();
+    const out = await adapter.plan("objective", null, null);
+    expect(out.experiments).toHaveLength(1);
   });
 });

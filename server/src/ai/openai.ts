@@ -780,6 +780,136 @@ async function chat(systemPrompt: string, userPrompt: string): Promise<string> {
   return chatInternal(systemPrompt, userPrompt);
 }
 
+/**
+ * Build the JSON request body sent to the chat-completions endpoint.
+ *
+ * Single source of truth for the payload shape — the streaming and
+ * non-streaming transports must send identical fields apart from `stream`.
+ * When config.aiStreaming is on, `stream:true` is sent and the response is
+ * consumed as SSE (aggregated here into the same content string the
+ * non-streaming path returns). reasoning_effort is sent only when
+ * AI_REASONING_EFFORT is configured; gateways ignore it for models that do
+ * not support reasoning.
+ */
+function buildChatRequestBody(systemPrompt: string, userPrompt: string): Record<string, unknown> {
+  return {
+    model: config.aiModel,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    temperature: 0.2,
+    ...(config.aiStreaming ? { stream: true } : {}),
+    ...(config.aiReasoningEffort ? { reasoning_effort: config.aiReasoningEffort } : {}),
+    // Optional provider-account output cap: some gateways (e.g. OpenRouter)
+    // reject requests whose implied max_tokens exceeds the credits available.
+    // Only sent when configured — providers keep their own default otherwise.
+    ...(config.aiMaxOutputTokens ? { max_tokens: config.aiMaxOutputTokens } : {}),
+  };
+}
+
+/**
+ * Result of consuming a response body in streaming mode.
+ *
+ *  content — concatenated assistant content deltas (reasoning discarded)
+ *  raw     — the raw bytes decoded as text (SSE frames OR a plain JSON body
+ *            when the provider answered a stream request without streaming,
+ *            e.g. error envelopes: 402/429/503 bodies are NOT SSE)
+ *  error   — a provider error object from an in-stream `data:` frame
+ *            (some gateways emit HTTP-200 SSE errors), else null
+ */
+interface SseReadResult {
+  content: string;
+  raw: string;
+  error: unknown;
+}
+
+/**
+ * Aggregate an OpenAI-compatible SSE body (data: {...}\n\n frames) into the
+ * final assistant content string.
+ *
+ * Strategy identical in spirit to the non-streaming byte telemetry: the
+ * reader observes; the armed deadline decides. Reasoning deltas
+ * (choices[0].delta.reasoning / reasoning_content — OpenRouter's reasoning
+ * channel) are intentionally DISCARDED: Probe prompts ask for the answer
+ * only, and reasoning content must never leak into parsed AI results. The
+ * terminal [DONE] sentinel, `:` comment keep-alive lines, and usage chunks
+ * (stream_options may add a final choices-less chunk) are all handled.
+ * parseJSON sees exactly the same answer string it would have seen from a
+ * non-streaming response — only the transport changed.
+ */
+async function readSseContent(
+  res: Response,
+  telemetry: BodyReadTelemetry,
+  tBodyStart: number
+): Promise<SseReadResult> {
+  const reader = res.body?.getReader?.() ?? null;
+  if (!reader) {
+    // No instrumentable stream (stubbed test Response): fall back to the
+    // plain body read — same deadline semantics, no byte facts. The parsed
+    // body is re-serialized as `raw` so the caller's JSON-envelope dispatch
+    // (error classification) behaves identically to the non-streaming path.
+    const parsed = (await res.json()) as unknown;
+    return { content: "", raw: JSON.stringify(parsed), error: null };
+  }
+  telemetry.instrumented = true;
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let raw = "";
+  let content = "";
+  let frameError: unknown = null;
+  let lastChunkAt = Date.now();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const now = Date.now();
+    const gap = now - lastChunkAt;
+    if (telemetry.firstBodyByteMs === 0) telemetry.firstBodyByteMs = now - tBodyStart;
+    else if (gap > telemetry.maxChunkGapMs) telemetry.maxChunkGapMs = gap;
+    if (gap > BODY_STALL_CHUNK_TIMEOUT_MS && telemetry.bodyBytes > 0) {
+      telemetry.stalledAfterBytes = telemetry.bodyBytes;
+    }
+    telemetry.bodyBytes += value.byteLength;
+    lastChunkAt = now;
+
+    const decoded = decoder.decode(value, { stream: true });
+    raw += decoded;
+    buffer += decoded;
+    // SSE frames are separated by a blank line; a frame can straddle network
+    // chunks, so only consume complete frames and keep the tail in buffer.
+    let frameEnd: number;
+    while ((frameEnd = buffer.indexOf("\n\n")) !== -1) {
+      const frame = buffer.slice(0, frameEnd);
+      buffer = buffer.slice(frameEnd + 2);
+      for (const line of frame.split("\n")) {
+        const trimmed = line.trim();
+        if (trimmed === "" || trimmed.startsWith(":")) continue; // keep-alive/comment
+        if (!trimmed.startsWith("data:")) continue;
+        const payload = trimmed.slice(5).trim();
+        if (payload === "[DONE]") continue;
+        try {
+          const evt = JSON.parse(payload) as {
+            choices?: Array<{ delta?: { content?: string | null } }>;
+            error?: unknown;
+          };
+          if (evt.error !== undefined && evt.error !== null) {
+            // Remember the LAST error frame; the caller maps it through the
+            // same 402/503/429 classification as an HTTP-200 JSON envelope.
+            frameError = evt.error;
+            continue;
+          }
+          const delta = evt.choices?.[0]?.delta?.content;
+          if (typeof delta === "string" && delta.length > 0) content += delta;
+        } catch {
+          // Malformed frame: skip. A single bad keep-alive frame must not
+          // fail an otherwise healthy stream.
+        }
+      }
+    }
+  }
+  return { content, raw, error: frameError };
+}
+
 /** Safe per-body-read telemetry (byte counts/timings only — never content). */
 interface BodyReadTelemetry {
   bodyBytes: number;
@@ -969,19 +1099,7 @@ export async function chatInternal(systemPrompt: string, userPrompt: string): Pr
           Authorization: `Bearer ${config.aiApiKey}`,
         },
         signal: abort.signal,
-        body: JSON.stringify({
-          model: config.aiModel,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: boundedUserPrompt },
-          ],
-          temperature: 0.2,
-          // Optional provider-account output cap: some gateways (e.g.
-          // OpenRouter) reject requests whose implied max_tokens exceeds the
-          // credits available. Only sent when configured — providers keep
-          // their own default otherwise.
-          ...(config.aiMaxOutputTokens ? { max_tokens: config.aiMaxOutputTokens } : {}),
-        }),
+        body: JSON.stringify(buildChatRequestBody(systemPrompt, boundedUserPrompt)),
       });
     } catch (err) {
       if (abort.signal.aborted) {
@@ -1041,23 +1159,34 @@ export async function chatInternal(systemPrompt: string, userPrompt: string): Pr
       : 120_000;
     const bodyTimer = setTimeout(() => abort.abort(), Math.max(1, bodyReadMs));
     let rawBody: unknown;
+    // Streaming aggregation result — populated only when aiStreaming is on.
+    // Carries the assistant content, the raw body text (SSE frames or a
+    // plain JSON error envelope), and any in-frame provider error object.
+    let stream: SseReadResult | null = null;
     // Byte-facts sink, mutated in place by the body reader so the timeout
     // catch below can report (and react to) exactly what arrived.
     const bodyTelemetry: BodyReadTelemetry = { bodyBytes: 0, firstBodyByteMs: 0, maxChunkGapMs: 0, stalledAfterBytes: null, instrumented: false };
     try {
       const tBodyStart = Date.now();
-      const text = await readBodyWithTelemetry(res, abort, tBodyStart, bodyTelemetry);
-      const { bodyBytes, firstBodyByteMs, maxChunkGapMs, stalledAfterBytes } = bodyTelemetry;
-      if (stalledAfterBytes !== null) {
-        // A mid-body stall that eventually recovered — log it so latency
-        // regressions are visible even on successful requests.
-        console.warn(
-          `AI response body stalled ${Math.round(maxChunkGapMs / 1000)}s after ${stalledAfterBytes} bytes, then recovered ` +
-            `(total ${bodyBytes} bytes in ${Date.now() - tBodyStart}ms)`
-        );
-        lastProviderBodyStallAt = Date.now();
+      // Streaming transport: aggregate SSE content deltas into the same
+      // answer string a non-streaming read would produce. Non-streaming
+      // keeps the existing byte-telemetry reader (AI_STREAMING=false).
+      if (config.aiStreaming) {
+        stream = await readSseContent(res, bodyTelemetry, tBodyStart);
+      } else {
+        const text = await readBodyWithTelemetry(res, abort, tBodyStart, bodyTelemetry);
+        const { bodyBytes, firstBodyByteMs, maxChunkGapMs, stalledAfterBytes } = bodyTelemetry;
+        if (stalledAfterBytes !== null) {
+          // A mid-body stall that eventually recovered — log it so latency
+          // regressions are visible even on successful requests.
+          console.warn(
+            `AI response body stalled ${Math.round(maxChunkGapMs / 1000)}s after ${stalledAfterBytes} bytes, then recovered ` +
+              `(total ${bodyBytes} bytes in ${Date.now() - tBodyStart}ms)`
+          );
+          lastProviderBodyStallAt = Date.now();
+        }
+        rawBody = JSON.parse(text);
       }
-      rawBody = JSON.parse(text);
     } catch (err) {
       if (abort.signal.aborted) {
         const remaining = guard ? guard.remainingRuntimeMs() : 0;
@@ -1093,18 +1222,52 @@ export async function chatInternal(systemPrompt: string, userPrompt: string): Pr
       clearTimeout(bodyTimer);
     }
 
+    // Streaming mode bookkeeping: the body text is either SSE frames or a
+    // plain JSON envelope (error bodies such as 402/429/503 are NOT SSE), so
+    // parse the raw text when it looks like JSON and let the envelope
+    // classification below apply unchanged to both transports.
+    if (stream) {
+      const rawText = stream.raw.trim();
+      if (rawText.startsWith("{") || rawText.startsWith("[")) {
+        try {
+          rawBody = JSON.parse(rawText);
+        } catch {
+          rawBody = undefined; // truncated/malformed — classified as a body error below
+        }
+      }
+    }
+
     // Gemini sometimes returns HTTP 200 with an error object/array in the body.
     // Detect and treat as retryable alongside HTTP 503 — BUT only for errors
     // that are actually transient (a 402 in a 200-body is a payment failure,
     // NOT a transient unavailability; see the 402 handling below).
-    const bodyStr = JSON.stringify(rawBody);
+    const bodyStr = stream ? stream.raw.slice(0, 4000) : JSON.stringify(rawBody);
     const isBodyError = (
       Array.isArray(rawBody) && rawBody[0]?.error?.status === "UNAVAILABLE"
     ) || (
       typeof rawBody === "object" && rawBody !== null && !Array.isArray(rawBody) && (rawBody as Record<string,unknown>).error
-    );
+    ) || stream?.error != null;
 
     if (res.ok && !isBodyError) {
+      if (stream) {
+        // Aggregate the streamed answer. If the gateway ignored stream:true
+        // and returned a classic JSON body, fall back to message.content.
+        let answer = stream.content;
+        if (answer === "") {
+          const legacy = (rawBody as { choices?: Array<{ message?: { content?: string } }> } | undefined)?.choices?.[0]?.message?.content;
+          if (typeof legacy === "string") answer = legacy;
+        }
+        const usage = (rawBody as { usage?: { prompt_tokens?: number; completion_tokens?: number } } | undefined)?.usage;
+        handle.end(true, {
+          retries,
+          estOutputTokens: estimatePromptTokens(answer),
+          usagePromptTokens: usage?.prompt_tokens,
+          usageCompletionTokens: usage?.completion_tokens,
+          streamed: true,
+          streamBytes: bodyTelemetry.bodyBytes,
+        });
+        return answer;
+      }
       const data = rawBody as { choices: { message: { content: string } }[] };
       const content = data.choices[0].message.content;
       const usage = (rawBody as { usage?: { prompt_tokens?: number; completion_tokens?: number } }).usage;
@@ -1132,12 +1295,14 @@ export async function chatInternal(systemPrompt: string, userPrompt: string): Pr
     // Some gateways deliver the payment error inside an HTTP 200 body (the
     // same Gemini-envelope shape handled above), so the check must run before
     // the 200-body error mapping — otherwise a 402 would be retried as 503.
+    const errObj = (stream?.error ??
+      (typeof rawBody === "object" && rawBody !== null && !Array.isArray(rawBody)
+        ? (rawBody as { error?: unknown }).error
+        : undefined)) as { code?: unknown } | undefined;
     const is402 =
       res.status === 402 ||
       (isBodyError &&
-        typeof rawBody === "object" &&
-        !Array.isArray(rawBody) &&
-        (rawBody as { error?: { code?: unknown } }).error?.code === 402);
+        errObj?.code === 402);
     if (is402) {
       handle.end(false, { retries, error: "AI API error 402: provider account out of credits (fail-fast, no retry)" });
       throw new AiBudgetExhaustedError(

@@ -32,6 +32,29 @@ export const config = {
   aiMaxOutputTokens: process.env.AI_MAX_OUTPUT_TOKENS
     ? parseInt(process.env.AI_MAX_OUTPUT_TOKENS, 10) || undefined
     : undefined,
+  /**
+   * Consume model responses as SSE streams (stream:true). Default ON.
+   *
+   * Why streaming is the default: reasoning models (e.g. free OpenRouter
+   * reasoning tiers) can spend 90s+ thinking before the first answer token.
+   * A non-streaming request receives NOTHING during that phase — production
+   * saw fast headers followed by a dead ~89s body wait that hit the per-call
+   * ceiling even though the provider was actively generating. With SSE the
+   * same single-deadline policy observes continuous progress (reasoning
+   * deltas), byte/liveness telemetry stays accurate, and the provider-stall
+   * breaker still fires only on genuinely dead (zero-byte) connections.
+   * The deadline policy is unchanged; only the transport is. Opt out with
+   * AI_STREAMING=false for a provider without OpenAI-compatible SSE support.
+   */
+  aiStreaming: process.env.AI_STREAMING !== "false",
+  /**
+   * Optional reasoning-effort hint sent as `reasoning_effort` with every
+   * request (low|medium|high; unset = provider default). Reasoning models
+   * left at their default effort can exceed the per-call AI ceiling during
+   * their thinking phase alone; "low" keeps planning-scale prompts inside
+   * it. Gateways normalize/ignore the parameter for non-reasoning models.
+   */
+  aiReasoningEffort: parseReasoningEffort(process.env.AI_REASONING_EFFORT),
   corsOrigin: process.env.CORS_ORIGIN || "http://localhost:5173",
 
   /**
@@ -192,6 +215,18 @@ export function validateConfig(): void {
   if (Number.isNaN(config.maxAiTokens) || config.maxAiTokens < 1000) {
     throw new Error(`PROBE_MAX_AI_TOKENS must be a positive integer; got "${process.env.PROBE_MAX_AI_TOKENS ?? "(unset)"}"`);
   }
+}
+
+/**
+ * Parse AI_REASONING_EFFORT into a provider-safe value. Unset/empty =
+ * undefined (no reasoning_effort field is sent). Anything else fails closed
+ * at boot rather than sending a malformed parameter to the provider.
+ */
+function parseReasoningEffort(raw: string | undefined): "low" | "medium" | "high" | undefined {
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const v = raw.trim().toLowerCase();
+  if (v === "low" || v === "medium" || v === "high") return v;
+  throw new Error(`AI_REASONING_EFFORT must be one of low|medium|high (or unset); got "${raw}"`);
 }
 
 /**

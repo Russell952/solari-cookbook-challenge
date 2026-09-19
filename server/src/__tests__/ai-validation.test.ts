@@ -9,6 +9,10 @@
  * 5. The orchestrator (not the AI) is authoritative
  */
 import { describe, it, expect } from "vitest";
+import {
+  validatePlanResult,
+  validatePlanSelectors,
+} from "../ai/openai.js";
 
 // ── parseJSON helper (extracted from openai.ts for testability) ────────────
 // We test the actual parsing logic without needing an AI API key.
@@ -442,5 +446,188 @@ describe("AI Report Validation", () => {
     const finding = result.confirmedFindings[0];
     expect(finding).not.toHaveProperty("id");
     expect(finding).not.toHaveProperty("investigationId");
+  });
+});
+
+// ── Type-action text requirement (regression: silent empty-input typing) ────
+//
+// Root cause of the ambiguous contact-form evidence: a browser type action
+// without input.text fell through plan validation, executed as a SUCCESSFUL
+// empty fill (typed: ""), and the resulting evidence could not distinguish a
+// deliberate empty-input submission from a planning defect. Validation now
+// rejects it so the plan never reaches the browser.
+//
+// Reproduces the exact production shape: type actions on #name/#email/#message
+// with no input field at all (the malformed plan that produced typed: ""),
+// plus every legitimate neighbor (valid text, input present but text missing,
+// whitespace-only text, sandbox actions, other browser actions).
+describe("AI Plan Validation: browser type requires input.text", () => {
+  const contactFormSelectors = ["#name", "#email", "#message"];
+
+  function planWithTypeActions(inputs: (Record<string, unknown> | undefined)[]) {
+    return {
+      experiments: [
+        {
+          objective: "Verify the contact form accepts and submits user input",
+          preconditions: ["Contact form is visible"],
+          plannedActions: [
+            { tool: "browser", action: "navigate", target: "https://example.com/contact" },
+            ...inputs.map((input, i) => ({
+              tool: "browser",
+              action: "type",
+              target: contactFormSelectors[i % contactFormSelectors.length],
+              ...(input !== undefined ? { input } : {}),
+            })),
+          ],
+        },
+      ],
+    };
+  }
+
+  it("rejects a type action with no input at all (the production defect shape)", () => {
+    expect(() => validatePlanResult(planWithTypeActions([undefined]))).toThrow(
+      /requires a non-empty trimmed string 'input.text'/
+    );
+  });
+
+  it("rejects type actions missing input.text across the whole form (production defect shape)", () => {
+    // Exactly the malformed shape observed in production: #name, #email,
+    // #message all typed empty because input was absent on every action.
+    expect(() =>
+      validatePlanResult(planWithTypeActions([undefined, undefined, undefined]))
+    ).toThrow(/plannedAction\[1\] browser type requires/);
+  });
+
+  it("rejects an input object whose text field is missing", () => {
+    expect(() => validatePlanResult(planWithTypeActions([{ other: "x" }]))).toThrow(
+      /requires a non-empty trimmed string 'input.text' \(got none\)/
+    );
+  });
+
+  it("rejects an empty-string text (indistinguishable from the silent no-op)", () => {
+    expect(() => validatePlanResult(planWithTypeActions([{ text: "" }]))).toThrow(
+      /requires a non-empty trimmed string 'input.text' \(got ""\)/
+    );
+  });
+
+  it('rejects whitespace-only text (spaces-only provides no interaction evidence)', () => {
+    expect(() => validatePlanResult(planWithTypeActions([{ text: "   " }]))).toThrow(
+      /requires a non-empty trimmed string 'input.text'/
+    );
+  });
+
+  it("rejects a non-string text value (number)", () => {
+    expect(() => validatePlanResult(planWithTypeActions([{ text: 42 }]))).toThrow(
+      /requires a non-empty trimmed string 'input.text' \(got 42\)/
+    );
+  });
+
+  it("rejects a non-string text value (object)", () => {
+    expect(() => validatePlanResult(planWithTypeActions([{ text: { nested: true } }]))).toThrow(
+      /requires a non-empty trimmed string 'input.text'/
+    );
+  });
+
+  it("rejects a non-string text value (boolean)", () => {
+    expect(() => validatePlanResult(planWithTypeActions([{ text: true }]))).toThrow(
+      /requires a non-empty trimmed string 'input.text'/
+    );
+  });
+
+  it("rejects a non-string text value (null)", () => {
+    expect(() => validatePlanResult(planWithTypeActions([{ text: null }]))).toThrow(
+      /requires a non-empty trimmed string 'input.text'/
+    );
+  });
+
+  it("accepts a type action with valid non-empty text", () => {
+    const result = validatePlanResult(planWithTypeActions([{ text: "Test User" }]));
+    expect(result.experiments[0].plannedActions[1]).toMatchObject({
+      tool: "browser",
+      action: "type",
+      target: "#name",
+      input: { text: "Test User" },
+    });
+  });
+
+  it("accepts type actions filling a complete form with real values", () => {
+    const result = validatePlanResult(
+      planWithTypeActions([{ text: "Test User" }, { text: "test@example.com" }, { text: "Hello there" }])
+    );
+    expect(result.experiments).toHaveLength(1);
+    expect(result.experiments[0].plannedActions).toHaveLength(4); // navigate + 3 type
+  });
+
+  it("rejects a mix of valid and malformed type actions (first valid, second empty)", () => {
+    // Action 0: navigate (index 0), Action 1: type #name valid (index 1), Action 2: type #email malformed (index 2)
+    expect(() =>
+      validatePlanResult(planWithTypeActions([{ text: "Test User" }, undefined]))
+    ).toThrow(/plannedAction\[2\] browser type requires/);
+  });
+
+  it("does not apply the text rule to non-type browser actions (click)", () => {
+    const plan = {
+      experiments: [{
+        objective: "Click and read",
+        preconditions: [],
+        plannedActions: [
+          { tool: "browser", action: "click", target: "a[href='#about']" },
+          { tool: "browser", action: "readText", target: "#section" },
+        ],
+      }],
+    };
+    expect(() => validatePlanResult(plan)).not.toThrow();
+  });
+
+  it("does not apply the text rule to sandbox type actions", () => {
+    const plan = {
+      experiments: [{
+        objective: "Sandbox and type",
+        preconditions: [],
+        plannedActions: [
+          { tool: "sandbox", action: "readFile", target: "src/index.ts", input: {} },
+          { tool: "browser", action: "type", target: "#name", input: { text: "Test" } },
+        ],
+      }],
+    };
+    expect(() => validatePlanResult(plan)).not.toThrow();
+  });
+});
+
+// ── validatePlanSelectors direct coverage (defense in depth) ───────────────
+//
+// The existing selector-provenance suite exercises the full validation stack
+// through the adapter; these direct calls pin the traceability contract that
+// keeps planner targets anchored to recon data.
+describe("validatePlanSelectors direct contract", () => {
+  const recon = [
+    { selector: "#name", text: "", tag: "input", id: "name" },
+    { selector: "a[href='#about']", text: "About", tag: "a", href: "#about" },
+  ];
+
+  it("accepts an exact recon selector", () => {
+    expect(() =>
+      validatePlanSelectors({
+        experiments: [{ objective: "x", preconditions: [], plannedActions: [{ tool: "browser", action: "click", target: "#name" }] }],
+      }, recon)
+    ).not.toThrow();
+  });
+
+  it("rejects a selector that cannot be traced to recon", () => {
+    expect(() =>
+      validatePlanSelectors({
+        experiments: [{ objective: "x", preconditions: [], plannedActions: [{ tool: "browser", action: "click", target: "#hallucinated" }] }],
+      }, recon)
+    ).toThrow(/cannot be traced/);
+  });
+
+  it("rejects a type action with valid text but untraced selector (provenance intact)", () => {
+    expect(() =>
+      validatePlanSelectors({
+        experiments: [{ objective: "x", preconditions: [], plannedActions: [
+          { tool: "browser", action: "type", target: "#unknown", input: { text: "Test" } },
+        ] }],
+      }, recon)
+    ).toThrow(/cannot be traced/);
   });
 });

@@ -31,7 +31,7 @@ import type { ReconContext } from "../solari/browser.js";
 import * as sandbox from "../solari/sandbox.js";
 import { resolveFindingEvidenceIds } from "./finding-evidence.js";
 import { INTERACTABLE_EXTRACTION_SCRIPT } from "../recon/extract-elements.js";
-import { releaseSlot } from "../security/rate-limit.js";
+import { releaseSlot, releaseUserSlot } from "../security/rate-limit.js";
 import { VALID_ACTIONS_BY_TOOL as VALID_ACTIONS, looksLikeCssSelector } from "./action-allowlist.js";
 import {
   captureScreenshot,
@@ -1829,12 +1829,15 @@ async function runReport(
 
 export async function runInvestigation(
   investigationId: string,
-  opts?: { releaseSlotOnFinish?: boolean }
+  opts?: { releaseSlotOnFinish?: boolean; slotOwnerId?: string }
 ): Promise<void> {
   let investigation = store.getInvestigation(investigationId);
   if (!investigation) {
     // Never leave a concurrency slot behind for an unknown investigation.
-    if (opts?.releaseSlotOnFinish) releaseSlot();
+    if (opts?.releaseSlotOnFinish) {
+      releaseSlot();
+      if (opts.slotOwnerId) releaseUserSlot(opts.slotOwnerId);
+    }
 
     if (isProfilingEnabled()) {
       try {
@@ -1924,6 +1927,12 @@ export async function runInvestigation(
   // pipeline's own finally must not release it a second time.
   let slotReleasedByWatchdog = false;
 
+  /** Release the global slot plus the owning user's slot exactly once. */
+  const releaseAllSlots = (): void => {
+    releaseSlot();
+    if (opts?.slotOwnerId) releaseUserSlot(opts.slotOwnerId);
+  };
+
   const watchdogDeadlineMs =
     budget.remainingRuntime(investigationId) + WATCHDOG_GRACE_MS;
   const watchdog: NodeJS.Timeout = setTimeout(() => {
@@ -1958,7 +1967,7 @@ export async function runInvestigation(
     }
     if (opts?.releaseSlotOnFinish && !slotReleasedByWatchdog) {
       slotReleasedByWatchdog = true;
-      releaseSlot();
+      releaseAllSlots();
     }
   }, watchdogDeadlineMs);
   // Never keep the process alive just for the watchdog.
@@ -2272,7 +2281,7 @@ export async function runInvestigation(
     // completion, failure, cancellation, runtime expiry, or unexpected
     // throw — so a wedged run can never permanently consume capacity.
     // (If the watchdog already released it, the slot was handed off — do not double-release.)
-    if (opts?.releaseSlotOnFinish && !slotReleasedByWatchdog) releaseSlot();
+    if (opts?.releaseSlotOnFinish && !slotReleasedByWatchdog) releaseAllSlots();
 
     // Cleanup any active Solari sessions
     const activeSessions = store.getActiveSessions(investigationId);

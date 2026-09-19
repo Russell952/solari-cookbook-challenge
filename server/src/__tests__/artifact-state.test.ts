@@ -65,6 +65,12 @@ function makeFakeStore(): ArtifactStore & {
       const hit = this.saved.find((s) => artifact.storagePath === s.key || artifact.storagePath.endsWith(`/${s.key}`));
       return hit ? hit.bytes : null;
     },
+    async exists(artifact: StoredArtifact): Promise<boolean> {
+      if (this.readError) throw this.readError;
+      if (this.readMissing) return false;
+      const hit = this.saved.find((s) => artifact.storagePath === s.key || artifact.storagePath.endsWith(`/${s.key}`));
+      return hit != null;
+    },
     async delete(): Promise<void> {},
     async deleteInvestigation(): Promise<void> {},
     async investigationBytes(): Promise<number> {

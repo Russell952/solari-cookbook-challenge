@@ -24,6 +24,12 @@ import {
   createInvestigationLimiter,
   startInvestigationLimiter,
   tryAcquireSlot,
+  releaseSlot,
+  tryConsumeInvestigationQuota,
+  investigationQuotaDenial,
+  investigationQuotaRetryAt,
+  tryAcquireUserSlot,
+  releaseUserSlot,
 } from "../security/rate-limit.js";
 import { config } from "../config/index.js";
 
@@ -46,9 +52,31 @@ function findOwned(req: Request, res: Response) {
   return investigation;
 }
 
-// Create investigation
+// Create investigation — per-IP window limiter first, then per-USER
+// creation quotas (5/hour, 20/day) so direct API calls cannot bypass them.
 investigationsRouter.post("/", createInvestigationLimiter, (req: Request, res: Response) => {
   const { repositoryUrl, applicationUrl, objective } = req.body as CreateInvestigationInput;
+
+  const ownerId = ownerIdOf(req);
+  const denial = investigationQuotaDenial(ownerId);
+  if (denial) {
+    // 429 with machine-readable shape + Retry-After hint. The rejected
+    // investigation is never created.
+    const retryAt = investigationQuotaRetryAt(ownerId, denial);
+    res.setHeader("Retry-After", String(
+      Math.max(1, Math.ceil((new Date(retryAt).getTime() - Date.now()) / 1000))
+    ));
+    res.status(429).json({
+      error:
+        denial === "hourly"
+          ? "Investigation creation limit reached (5 per hour). Try again later."
+          : "Daily investigation quota reached (20 per day). Try again tomorrow.",
+      code: "INVESTIGATION_QUOTA_EXCEEDED",
+      limit: denial,
+      retryAt,
+    });
+    return;
+  }
 
   if (!repositoryUrl && !applicationUrl) {
     res.status(400).json({ error: "At least one of repositoryUrl or applicationUrl is required" });
@@ -58,8 +86,14 @@ investigationsRouter.post("/", createInvestigationLimiter, (req: Request, res: R
     res.status(400).json({ error: "objective is required" });
     return;
   }
+  // Server-side enforcement is authoritative — the frontend counter is a
+  // usability aid, never the security boundary. Length counts EVERY
+  // character (spaces, punctuation, newlines); oversized input is rejected,
+  // never silently truncated.
   if (objective.length > config.limits.maxObjectiveLength) {
-    res.status(400).json({ error: `objective exceeds maximum length of ${config.limits.maxObjectiveLength} characters` });
+    res.status(400).json({
+      error: `objective exceeds maximum length of ${config.limits.maxObjectiveLength} characters (got ${objective.length})`,
+    });
     return;
   }
   if (repositoryUrl && (typeof repositoryUrl !== "string" || repositoryUrl.length > config.limits.maxUrlLength)) {
@@ -88,12 +122,30 @@ investigationsRouter.post("/", createInvestigationLimiter, (req: Request, res: R
     }
   }
 
+  // Quota consumed only when creation actually succeeds — validation
+  // rejections must not burn the user's allowance.
+  if (tryConsumeInvestigationQuota(ownerId)) {
+    // Lost a race between the denial check and consumption; treat as the
+    // hourly denial for honesty (the next request will report precisely).
+    const retryAt = investigationQuotaRetryAt(ownerId, "hourly");
+    res.setHeader("Retry-After", String(
+      Math.max(1, Math.ceil((new Date(retryAt).getTime() - Date.now()) / 1000))
+    ));
+    res.status(429).json({
+      error: "Investigation creation limit reached (5 per hour). Try again later.",
+      code: "INVESTIGATION_QUOTA_EXCEEDED",
+      limit: "hourly",
+      retryAt,
+    });
+    return;
+  }
+
   const investigation = store.createInvestigation({
     repositoryUrl: repositoryUrl || "",
     applicationUrl: applicationUrl || "",
     objective: objective.trim(),
   });
-  store.setOwner(investigation.id, ownerIdOf(req));
+  store.setOwner(investigation.id, ownerId);
 
   res.status(201).json(investigation);
 });
@@ -123,15 +175,32 @@ investigationsRouter.post("/:id/start", startInvestigationLimiter, async (req: R
     return;
   }
 
-  // Concurrency cap: protect Solari/AI spend from unbounded parallel runs.
+  // Concurrency caps: protect Solari/AI spend from unbounded parallel runs.
+  // Deployment-wide cap first (coarser bound), then the per-user cap.
+  const ownerId = ownerIdOf(req);
   if (!tryAcquireSlot()) {
-    res.status(429).json({ error: "Concurrent investigation limit reached. Try again when a run finishes." });
+    res.status(429).json({
+      error: "Concurrent investigation limit reached (server is at capacity). Try again when a run finishes.",
+      code: "GLOBAL_CONCURRENCY_LIMIT",
+    });
+    return;
+  }
+  if (!tryAcquireUserSlot(ownerId)) {
+    releaseSlot();
+    res.status(429).json({
+      error: `You already have ${config.maxConcurrentInvestigationsPerUser} investigations running. Wait for one to finish.`,
+      code: "USER_CONCURRENCY_LIMIT",
+    });
     return;
   }
 
-  // Start asynchronously. The runner releases the concurrency slot in its
-  // `finally` (completion, failure, cancellation, expiry, or throw).
-  runInvestigation(investigation.id, { releaseSlotOnFinish: true }).catch((err) => {
+  // Start asynchronously. The runner releases the global concurrency slot in
+  // its `finally` (completion, failure, cancellation, expiry, or throw); the
+  // per-user slot rides the same lifecycle via the released slot registry.
+  runInvestigation(investigation.id, {
+    releaseSlotOnFinish: true,
+    slotOwnerId: ownerId,
+  }).catch((err) => {
     console.error(`Investigation ${investigation.id} failed:`, err);
   });
 
@@ -168,13 +237,28 @@ investigationsRouter.post("/:id/resume", async (req: Request, res: Response) => 
     return;
   }
 
+  const ownerId = ownerIdOf(req);
   if (!tryAcquireSlot()) {
-    res.status(429).json({ error: "Concurrent investigation limit reached. Try again when a run finishes." });
+    res.status(429).json({
+      error: "Concurrent investigation limit reached (server is at capacity). Try again when a run finishes.",
+      code: "GLOBAL_CONCURRENCY_LIMIT",
+    });
+    return;
+  }
+  if (!tryAcquireUserSlot(ownerId)) {
+    releaseSlot();
+    res.status(429).json({
+      error: `You already have ${config.maxConcurrentInvestigationsPerUser} investigations running. Wait for one to finish.`,
+      code: "USER_CONCURRENCY_LIMIT",
+    });
     return;
   }
 
   store.updateInvestigation(investigation.id, { status: "running" });
-  runInvestigation(investigation.id, { releaseSlotOnFinish: true }).catch((err) => {
+  runInvestigation(investigation.id, {
+    releaseSlotOnFinish: true,
+    slotOwnerId: ownerId,
+  }).catch((err) => {
     console.error(`Investigation ${investigation.id} failed:`, err);
   });
 

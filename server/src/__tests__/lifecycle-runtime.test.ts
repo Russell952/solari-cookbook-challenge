@@ -141,6 +141,7 @@ let createOpenAIAdapterRef: () => unknown = () => ({});
 
 import { buildApp } from "../app.js";
 import { store } from "../store/index.js";
+import { resetRateLimits } from "../security/rate-limit.js";
 import { registerTokenForTesting } from "../security/auth.js";
 import * as budget from "../orchestrator/budget.js";
 
@@ -181,6 +182,7 @@ async function api(method: string, path: string, body?: unknown) {
 
 beforeEach(() => {
   store.clearAll();
+  resetRateLimits(); // per-user creation quotas reset between tests
   vi.clearAllMocks();
   midRunExpiry.investigationId = null;
   planGateRelease?.();

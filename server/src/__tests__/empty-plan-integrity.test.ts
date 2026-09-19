@@ -115,6 +115,7 @@ import { store } from "../store/index.js";
 import { buildApp } from "../app.js";
 import { registerTokenForTesting } from "../security/auth.js";
 import { runInvestigation } from "../orchestrator/runner.js";
+import { resetRateLimits } from "../security/rate-limit.js";
 
 const TEST_TOKEN = "empty-plan-test-token";
 
@@ -133,6 +134,10 @@ beforeEach(async () => {
   evidenceDir = await mkdtemp(join(tmpdir(), "probe-empty-plan-"));
   process.env.PROBE_EVIDENCE_DIR = evidenceDir;
   store.clearAll();
+  // These suites create many investigations under ONE test identity — the
+  // per-user creation quotas (5/hour) must reset between tests like the
+  // other rate-limit buckets do.
+  resetRateLimits();
   vi.clearAllMocks();
   server = buildApp().listen(0, "127.0.0.1");
   await new Promise<void>((r) => server.once("listening", r));

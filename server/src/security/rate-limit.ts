@@ -95,6 +95,107 @@ export function resetRateLimits(): void {
   for (const store of limiterStores) {
     void store.resetAll?.();
   }
+  resetInvestigationQuotas();
+}
+
+// ── Per-user investigation quotas ───────────────────────────────────────
+//
+// Free-tier protection: a single account must not be able to continuously
+// create investigations and audit arbitrary websites. The per-IP window
+// limiters above bound request-rate; these quotas bound RESOURCE CREATION
+// per identity (rolling window counts), independently of IP.
+//
+// Enforced server-side on POST /investigations — direct API calls with a
+// valid token go through exactly the same path as the UI, so there is no
+// bypass. The existing generic API limiter is untouched.
+
+/** One identity's rolling-window counters + timestamps. */
+interface UserQuotaState {
+  hourly: number[];
+  daily: number[];
+}
+
+const userQuotas = new Map<string, UserQuotaState>();
+
+function pruneOlderThan(timestamps: number[], windowMs: number, nowMs: number): number[] {
+  const cutoff = nowMs - windowMs;
+  let i = 0;
+  while (i < timestamps.length && timestamps[i] <= cutoff) i++;
+  return i === 0 ? timestamps : timestamps.slice(i);
+}
+
+/** Check + consume one creation slot for `ownerId`. Returns the denial kind, or null. */
+export function tryConsumeInvestigationQuota(ownerId: string): "hourly" | "daily" | null {
+  const nowMs = Date.now();
+  const state = userQuotas.get(ownerId) ?? { hourly: [], daily: [] };
+  state.hourly = pruneOlderThan(state.hourly, 60 * 60_000, nowMs);
+  state.daily = pruneOlderThan(state.daily, 24 * 60 * 60_000, nowMs);
+  if (state.hourly.length >= config.rateLimit.createInvestigationPerUser.hourly) {
+    return "hourly";
+  }
+  if (state.daily.length >= config.rateLimit.createInvestigationPerUser.daily) {
+    return "daily";
+  }
+  state.hourly.push(nowMs);
+  state.daily.push(nowMs);
+  userQuotas.set(ownerId, state);
+  return null;
+}
+
+/** Read-only current denial kind without consuming (diagnostics/tests). */
+export function investigationQuotaDenial(ownerId: string): "hourly" | "daily" | null {
+  const nowMs = Date.now();
+  const state = userQuotas.get(ownerId);
+  if (!state) return null;
+  if (pruneOlderThan(state.hourly, 60 * 60_000, nowMs).length >=
+      config.rateLimit.createInvestigationPerUser.hourly) return "hourly";
+  if (pruneOlderThan(state.daily, 24 * 60 * 60_000, nowMs).length >=
+      config.rateLimit.createInvestigationPerUser.daily) return "daily";
+  return null;
+}
+
+/** ISO timestamp when the given quota window frees one slot (Retry-After hint). */
+export function investigationQuotaRetryAt(ownerId: string, kind: "hourly" | "daily"): string {
+  const nowMs = Date.now();
+  const state = userQuotas.get(ownerId);
+  const windowMs = kind === "hourly" ? 60 * 60_000 : 24 * 60 * 60_000;
+  const stamps = state ? pruneOlderThan(state[kind], windowMs, nowMs) : [];
+  // The oldest still-counted hit is the first to fall out of the window.
+  const oldest = stamps.length > 0 ? stamps[0] : nowMs;
+  return new Date(oldest + windowMs).toISOString();
+}
+
+/** Test helper: clear per-user quota counters. */
+export function resetInvestigationQuotas(): void {
+  userQuotas.clear();
+}
+
+// ── Per-user concurrent investigation cap ────────────────────────────────
+
+const runningPerUser = new Map<string, number>();
+
+/**
+ * Try to acquire one of `ownerId`'s concurrent investigation slots.
+ * Call tryAcquireSlot() FIRST (deployment-wide is the coarser bound) and
+ * this second; on per-user failure the global slot must be released.
+ */
+export function tryAcquireUserSlot(ownerId: string): boolean {
+  const current = runningPerUser.get(ownerId) ?? 0;
+  if (current >= config.maxConcurrentInvestigationsPerUser) return false;
+  runningPerUser.set(ownerId, current + 1);
+  return true;
+}
+
+/** Release a per-user slot. Must be called exactly once per acquired slot. */
+export function releaseUserSlot(ownerId: string): void {
+  const current = runningPerUser.get(ownerId) ?? 0;
+  if (current <= 1) runningPerUser.delete(ownerId);
+  else runningPerUser.set(ownerId, current - 1);
+}
+
+/** Test helper. */
+export function resetUserConcurrency(): void {
+  runningPerUser.clear();
 }
 
 // ── Concurrent investigation cap ────────────────────────────────────────────

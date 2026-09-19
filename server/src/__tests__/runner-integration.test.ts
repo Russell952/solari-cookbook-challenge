@@ -147,6 +147,7 @@ vi.mock("../ai/index.js", () => ({
 
 // Import production modules AFTER mocks are registered
 import { store } from "../store/index.js";
+import { resetRateLimits } from "../security/rate-limit.js";
 import { registerTokenForTesting } from "../security/auth.js";
 
 const TEST_TOKEN = "runner-integration-token";
@@ -174,6 +175,9 @@ beforeEach(async () => {
   evidenceDir = await mkdtemp(join(tmpdir(), "probe-runner-int-"));
   process.env.PROBE_EVIDENCE_DIR = evidenceDir;
   store.clearAll();
+  // Per-user creation quotas reset between tests (suite creates many
+  // investigations under one identity) — same pattern as other rate limits.
+  resetRateLimits();
   vi.clearAllMocks();
   await startApp();
 });

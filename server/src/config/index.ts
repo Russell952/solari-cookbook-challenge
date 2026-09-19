@@ -80,8 +80,13 @@ export const config = {
   /** When true (set in dev), authentication is disabled entirely. Never set in production. */
   allowAnonymous: process.env.PROBE_ALLOW_ANONYMOUS === "true" && !isProduction,
 
-  /** Maximum investigations running concurrently (protects Solari/AI spend). */
-  maxConcurrentInvestigations: parseInt(process.env.PROBE_MAX_CONCURRENT_INVESTIGATIONS || "2", 10),
+  /** Maximum investigations running concurrently deployment-wide (protects Solari/AI spend). */
+  maxConcurrentInvestigations: parseInt(process.env.PROBE_MAX_CONCURRENT_INVESTIGATIONS || "5", 10),
+  /** Maximum concurrently running investigations per user (free-tier fairness). */
+  maxConcurrentInvestigationsPerUser: parseInt(
+    process.env.PROBE_MAX_CONCURRENT_PER_USER || "2",
+    10
+  ),
   /** Max simultaneous SSE connections, globally and per investigation. */
   maxSseConnections: parseInt(process.env.PROBE_MAX_SSE_CONNECTIONS || "50", 10),
   maxSsePerInvestigation: parseInt(process.env.PROBE_MAX_SSE_PER_INVESTIGATION || "5", 10),
@@ -90,6 +95,15 @@ export const config = {
   rateLimit: {
     general: { max: parseInt(process.env.PROBE_RATE_MAX_GENERAL || "300", 10), windowMs: 5 * 60_000 },
     createInvestigation: { max: parseInt(process.env.PROBE_RATE_MAX_CREATE || "20", 10), windowMs: 60 * 60_000 },
+    /**
+     * Per-USER creation quotas (free-tier protection; enforced on POST
+     * /investigations in addition to the per-IP limiter above — the IP limit
+     * is kept as-is). Rolling windows: 5 per hour, 20 per 24 hours.
+     */
+    createInvestigationPerUser: {
+      hourly: parseInt(process.env.PROBE_RATE_MAX_CREATE_USER_HOURLY || "5", 10),
+      daily: parseInt(process.env.PROBE_RATE_MAX_CREATE_USER_DAILY || "20", 10),
+    },
     startInvestigation: { max: parseInt(process.env.PROBE_RATE_MAX_START || "30", 10), windowMs: 60 * 60_000 },
     /** Signup + login share one bucket — bounds password guessing and account spam. */
     auth: { max: parseInt(process.env.PROBE_RATE_MAX_AUTH || "20", 10), windowMs: 15 * 60_000 },
@@ -113,7 +127,17 @@ export const config = {
   /** Input length caps for user-controlled strings. */
   limits: {
     maxUrlLength: parseInt(process.env.PROBE_MAX_URL_LENGTH || "2048", 10),
-    maxObjectiveLength: parseInt(process.env.PROBE_MAX_OBJECTIVE_LENGTH || "2000", 10),
+    /** Investigation objective is a SHORT instruction, not a prompt box. */
+    maxObjectiveLength: parseInt(process.env.PROBE_MAX_OBJECTIVE_LENGTH || "1000", 10),
+    /**
+     * User-visible evidence records retained per investigation. Internal
+     * execution telemetry (per-action captures) is dropped beyond this cap;
+     * integrity-required evidence (verification runs, replays, recon) is not.
+     */
+    maxEvidencePerInvestigation: parseInt(
+      process.env.PROBE_MAX_EVIDENCE_PER_INVESTIGATION || "50",
+      10
+    ),
   },  /** Evidence artifact caps: per-artifact bytes and per-investigation total. */
   maxArtifactBytes: parseInt(process.env.PROBE_MAX_ARTIFACT_BYTES || String(20 * 1024 * 1024), 10),
   maxInvestigationArtifactBytes: parseInt(

@@ -431,7 +431,7 @@ function validateSelectorQuality(target: string, action: string, index: number):
  * 2. Fabricated natural-language selectors are always rejected.
  * 3. Navigate targets are always URLs — no provenance check needed.
  */
-function validatePlanSelectors(
+export function validatePlanSelectors(
   plan: AIPlanResult,
   interactableElements?: Array<{ selector: string; text: string; tag: string; href?: string; id?: string; name?: string; type?: string }>
 ): void {
@@ -517,6 +517,31 @@ function validatePlannedActions(actions: unknown): AIPlanResult["experiments"][0
       );
     }
 
+    // A browser type action must carry meaningful text to type. Missing,
+    // empty, or whitespace-only `input.text` previously fell through as
+    // `text: ""` and executed as a SUCCESSFUL empty fill — the action
+    // result then read `typed: ""`, which the analyzer cannot distinguish
+    // from a real empty-input submission and which looks like executed
+    // interaction in the evidence trail. Requiring non-empty trimmed text
+    // here fails the plan at validation time (bounded re-prompt), never
+    // at execution time. Clearing an existing field value is expressed
+    // with a dedicated fill-clear action — a type without meaningful text
+    // is malformed, not a no-op.
+    if (tool === "browser" && action === "type") {
+      const input = obj.input;
+      const text =
+        typeof input === "object" && input !== null
+          ? (input as Record<string, unknown>).text
+          : undefined;
+      if (typeof text !== "string" || text.trim().length === 0) {
+        throw new Error(
+          `AI response: plannedAction[${i}] browser type requires a non-empty trimmed string 'input.text' (got ${
+            text === undefined ? "none" : JSON.stringify(text)
+          }). Without it the action silently types an empty string.`
+        );
+      }
+    }
+
     return {
       tool: tool as typeof VALID_TOOLS[number],
       action,
@@ -526,7 +551,7 @@ function validatePlannedActions(actions: unknown): AIPlanResult["experiments"][0
   });
 }
 
-function validatePlanResult(data: unknown, interactableElements?: Array<{ selector: string; text: string; tag: string; href?: string; id?: string; name?: string; type?: string }>): AIPlanResult {
+export function validatePlanResult(data: unknown, interactableElements?: Array<{ selector: string; text: string; tag: string; href?: string; id?: string; name?: string; type?: string }>): AIPlanResult {
   if (typeof data !== "object" || data === null) {
     throw new Error("AI response is not an object");
   }

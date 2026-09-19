@@ -17,6 +17,7 @@
 import { createHash, randomUUID } from "crypto";
 import { join } from "path";
 import { store } from "../store/index.js";
+import { config } from "../config/index.js";
 import { profiler } from "../profiler/index.js";
 import {
   getArtifactStore,
@@ -57,6 +58,40 @@ export interface CaptureEvidenceOpts {
  */
 export async function captureEvidence(opts: CaptureEvidenceOpts): Promise<Evidence> {
   const evidenceId = opts.evidenceId ?? randomUUID();
+  // ── User-visible evidence cap ─────────────────────────────────
+  // Each experiment generates per-action screenshot/trace/url records —
+  // internal execution telemetry, not each individually meaningful to the
+  // user. Past the cap those are logged and dropped (capture degrades, the
+  // investigation continues); integrity-required evidence (verification
+  // runs, session replays, recon) is exempt. Once at/over the cap, every
+  // dropped telemetry record is also recorded in run state (throttled) so
+  // the investigation can honestly surface "evidence limit reached".
+  const visibleCount = store.listEvidence(opts.investigationId).length;
+  const atCap = visibleCount >= config.limits.maxEvidencePerInvestigation;
+  const telemetryExempt = opts.experimentId !== undefined &&
+    (store.getExperiment(opts.experimentId)?.hypothesisId != null ||
+      opts.type === "replay");
+  if (atCap && !telemetryExempt && opts.type !== "url") {
+    evidenceCapDropped(opts.investigationId, opts.type);
+    handlelessSkip(opts.type, visibleCount);
+    return store.createEvidence({
+      id: evidenceId,
+      investigationId: opts.investigationId,
+      experimentId: opts.experimentId ?? null,
+      observationId: opts.observationId ?? null,
+      type: opts.type,
+      uri: opts.uri ?? null,
+      contentHash: fullSha256Of(opts.content),
+      metadata: {
+        ...opts.metadata,
+        userVisible: false,
+        evidenceCapReached: true,
+        capDroppedReason: "user_visible_evidence_cap",
+        artifactAvailable: false,
+        contentHash: fullSha256Of(opts.content),
+      },
+    });
+  }
   const artifactStore = getArtifactStore();
   const handle = profiler.begin("evidence", "capture", { type: opts.type });
   let artifact: StoredArtifact | null = null;
@@ -153,6 +188,28 @@ export async function captureEvidence(opts: CaptureEvidenceOpts): Promise<Eviden
 function fullSha256Of(content: string | Buffer | undefined): string {
   if (content === undefined) return "";
   return createHash("sha256").update(content).digest("hex");
+}
+
+/**
+ * Internal record-keeping when a telemetry capture is dropped at the cap:
+ * throttled logging (no spam) + a run-state flag so the investigation can
+ * honestly report that the evidence limit was reached. Never crashes the
+ * capture path.
+ */
+const capWarnedAt = new Map<string, number>();
+function evidenceCapDropped(investigationId: string, type: string): void {
+  const now = Date.now();
+  const last = capWarnedAt.get(investigationId) ?? 0;
+  if (now - last > 30_000) {
+    capWarnedAt.set(investigationId, now);
+    console.warn(
+      `[evidence] user-visible evidence cap (${config.limits.maxEvidencePerInvestigation}) reached for ${investigationId} — further ${type} telemetry is recorded as metadata only`
+    );
+  }
+}
+
+function handlelessSkip(type: string, count: number): void {
+  profiler.span("evidence", "capture.cap_skipped", { type, visibleCount: count }, async () => null);
 }
 
 /**
@@ -356,6 +413,59 @@ export async function getEvidenceContent(
   const actual = fullSha256(buffer);
   const expected = artifact.sha256;
   return { buffer, sha256: actual, hashVerified: expected !== "" && actual === expected };
+}
+
+/**
+ * Build the storage descriptor for an Evidence item — the exact shape
+ * getEvidenceContent uses for retrieval. Shared with the availability
+ * verifier so "does this artifact exist?" probes the same key the content
+ * endpoint would read.
+ */
+function artifactDescriptorFor(evidence: Evidence): StoredArtifact {
+  const artifactStore = getArtifactStore();
+  let storagePath = evidence.metadata?.storageKey as string | undefined;
+  if (!storagePath) {
+    const ext = extensionFor(evidence.type);
+    storagePath =
+      artifactStore.kind === "b2"
+        ? `evidence/${evidence.investigationId}/${evidence.id}.${ext}`
+        : `${evidence.investigationId}/${evidence.id}.${ext}`;
+  }
+  return {
+    evidenceId: evidence.id,
+    investigationId: evidence.investigationId,
+    experimentId: evidence.experimentId,
+    evidenceType: evidence.type,
+    mimeType: (evidence.metadata?.mimeType as string) ?? mimeFor(evidence.type),
+    byteSize: (evidence.metadata?.byteSize as number) ?? 0,
+    sha256: (evidence.metadata?.sha256 as string) ?? evidence.contentHash ?? "",
+    storagePath: artifactStore.kind === "local" ? absoluteLocalPath(storagePath) : storagePath,
+    createdAt: (evidence.metadata?.artifactCreatedAt as string) ?? evidence.createdAt,
+  };
+}
+
+/**
+ * Authoritative availability check for one evidence artifact.
+ *
+ * Used by the summary endpoint for records that do NOT carry a capture-time
+ * `artifactAvailable` assertion (legacy records): the only proof that counts
+ * is "the artifact store can serve this exact object right now". A probe
+ * failure (storage outage) is NOT absence — those surface as
+ * `artifactAvailable: undefined` so the UI renders no artifact controls
+ * rather than a false yes.
+ */
+export async function verifyArtifactAvailable(evidence: Evidence): Promise<boolean | undefined> {
+  const artifactStore = getArtifactStore();
+  const descriptor = artifactDescriptorFor(evidence);
+  try {
+    return await artifactStore.exists(descriptor);
+  } catch (err) {
+    console.error(
+      `[evidence] availability probe failed (storage system error) investigation=${evidence.investigationId} evidence=${evidence.id}:`,
+      err instanceof Error ? err.message : err
+    );
+    return undefined;
+  }
 }
 
 /** Local store paths are stored absolute; legacy relative → absolute. */

@@ -20,6 +20,7 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   DeleteObjectCommand,
+  HeadObjectCommand,
 } from "@aws-sdk/client-s3";
 import { config, isB2Configured } from "../config/index.js";
 import { profiler } from "../profiler/index.js";
@@ -84,6 +85,13 @@ export interface ArtifactStore {
   }): Promise<StoredArtifact>;
   /** Retrieve bytes, or null when the artifact does not exist. */
   read(artifact: StoredArtifact): Promise<Buffer | null>;
+  /**
+   * Cheap availability probe: does the artifact exist in this store?
+   * Must never throw for an object that is simply absent (return false);
+   * a storage-system failure (network/auth/5xx) may rethrow so callers can
+   * distinguish absence from a temporary outage.
+   */
+  exists(artifact: StoredArtifact): Promise<boolean>;
   delete(artifact: StoredArtifact): Promise<void>;
   deleteInvestigation(investigationId: string): Promise<void>;
   /** Per-investigation stored bytes (for the storage-cap check). */
@@ -153,6 +161,15 @@ export class LocalArtifactStore implements ArtifactStore {
       return await readFile(artifact.storagePath);
     } catch {
       return null;
+    }
+  }
+
+  async exists(artifact: StoredArtifact): Promise<boolean> {
+    try {
+      await readFile(artifact.storagePath);
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -347,6 +364,33 @@ export class B2ArtifactStore implements ArtifactStore {
         `[artifact-store] B2 read failed (storage system failure, not absence) key=${artifact.storagePath}:`,
         err instanceof Error ? err.message : err
       );
+      throw err;
+    }
+  }
+
+  async exists(artifact: StoredArtifact): Promise<boolean> {
+    try {
+      await profiler.span("evidence", "artifact.exists.b2", { key: artifact.storagePath }, () =>
+        this.client.send(
+          new HeadObjectCommand({ Bucket: this.bucketName, Key: artifact.storagePath })
+        )
+      );
+      return true;
+    } catch (err) {
+      const name = (err as { name?: string; Code?: string; code?: string }) ?? {};
+      const code = name.Code ?? name.code ?? name.name ?? "";
+      // Definitive absence: the object does not exist. A 404/403-shaped
+      // HeadObject response carries no body, so S3 surfaces it as 403 —
+      // treat both as absence.
+      if (code === "NoSuchKey" || code === "NotFound" || code === "404" || code === "403" || code === "ENOENT" || code === "AccessDenied") {
+        return false;
+      }
+      console.error(
+        `[artifact-store] B2 exists failed (storage system failure, not absence) key=${artifact.storagePath}:`,
+        err instanceof Error ? err.message : err
+      );
+      // Storage-system failure: rethrow so availability stays truthful —
+      // an outage must not be misrepresented as a missing artifact.
       throw err;
     }
   }

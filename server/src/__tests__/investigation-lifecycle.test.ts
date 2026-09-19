@@ -187,6 +187,7 @@ vi.mock("../ai/index.js", () => ({
 
 // Import production modules after mocks
 import { store } from "../store/index.js";
+import { resetRateLimits } from "../security/rate-limit.js";
 import { buildApp } from "../app.js";
 import { registerTokenForTesting } from "../security/auth.js";
 import * as browser from "../solari/browser.js";
@@ -206,6 +207,9 @@ beforeEach(async () => {
   evidenceDir = await mkdtemp(join(tmpdir(), "probe-lifecycle-"));
   process.env.PROBE_EVIDENCE_DIR = evidenceDir;
   store.clearAll();
+  // Per-user creation quotas reset between tests (suite creates several
+  // investigations under one identity) — same pattern as other rate limits.
+  resetRateLimits();
   vi.clearAllMocks();
   server = buildApp().listen(0, "127.0.0.1");
   await new Promise<void>((r) => server.once("listening", r));

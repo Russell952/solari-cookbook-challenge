@@ -141,6 +141,7 @@ vi.mock("../ai/index.js", () => ({
 }));
 
 import { store } from "../store/index.js";
+import { resetRateLimits } from "../security/rate-limit.js";
 import { buildApp } from "../app.js";
 import { registerTokenForTesting } from "../security/auth.js";
 import { runInvestigation, __clearRunStatesForTests } from "../orchestrator/runner.js";
@@ -159,6 +160,7 @@ beforeEach(async () => {
   evidenceDir = await mkdtemp(join(tmpdir(), "probe-post-action-"));
   process.env.PROBE_EVIDENCE_DIR = evidenceDir;
   store.clearAll();
+  resetRateLimits(); // per-user creation quotas reset between tests
   __clearRunStatesForTests();
   vi.clearAllMocks();
   scriptedExperiments = [];

@@ -10,6 +10,7 @@ import { Router, type Request, type Response } from "express";
 import { store } from "../store/index.js";
 import { param } from "./helpers.js";
 import { getBudget } from "../orchestrator/budget.js";
+import { verifyArtifactAvailable } from "../evidence/collector.js";
 
 export const summaryRouter = Router({ mergeParams: true });
 
@@ -83,8 +84,13 @@ interface SummaryResponse {
     contentHash: string | null;
     /** How the evidence was produced: recon | experiment | verification. */
     provenance: EvidenceProvenance;
-    /** Whether persisted artifact bytes exist (absent = legacy record). */
-    artifactAvailable?: boolean;
+    /**
+     * Whether persisted artifact bytes exist and are retrievable. Always
+     * defined in summary responses: capture-time records pass through;
+     * legacy records (no assertion) are probed against the artifact store
+     * right now. Only `true` authorizes artifact UI controls.
+     */
+    artifactAvailable: boolean;
     mimeType?: string;
     byteSize?: number;
     createdAt: string;
@@ -163,7 +169,7 @@ interface SummaryResponse {
   } | null;
 }
 
-summaryRouter.get("/", (req: Request, res: Response) => {
+summaryRouter.get("/", async (req: Request, res: Response) => {
   const id = param(req, "id");
   const investigation = store.getInvestigation(id);
 
@@ -171,6 +177,8 @@ summaryRouter.get("/", (req: Request, res: Response) => {
     res.status(404).json({ error: "Investigation not found" });
     return;
   }
+
+  try {
 
   const experiments = store.listExperiments(id);
   const evidence = store.listEvidence(id);
@@ -184,6 +192,24 @@ summaryRouter.get("/", (req: Request, res: Response) => {
   );
   const provenanceOf = (ev: { experimentId: string | null }): EvidenceProvenance =>
     evidenceProvenance(ev, experimentsById);
+
+  // Artifact availability, per evidence item:
+  //  - capture-time assertion (metadata.artifactAvailable) is authoritative
+  //    and passed through as-is.
+  //  - legacy records without an assertion are probed against the artifact
+  //    store NOW: true only when the exact object the content endpoint would
+  //    read is retrievable. A probe failure (storage outage) yields false —
+  //    the UI must never offer a control that could 404/503.
+  //  - URL evidence has no artifact by design and is never probed.
+  const evidenceWithAvailability = await Promise.all(
+    evidence.map(async (e): Promise<{ ev: (typeof evidence)[number]; available: boolean }> => {
+      const asserted = e.metadata?.artifactAvailable;
+      if (typeof asserted === "boolean") return { ev: e, available: asserted };
+      if (e.type === "url") return { ev: e, available: false };
+      const verified = await verifyArtifactAvailable(e);
+      return { ev: e, available: verified === true };
+    })
+  );
 
   const experimentCounts = {
     total: experiments.length,
@@ -270,7 +296,7 @@ summaryRouter.get("/", (req: Request, res: Response) => {
       hypothesisId: e.hypothesisId ?? null,
     })),
     experimentCounts,
-    evidence: evidence.map((e) => ({
+    evidence: evidenceWithAvailability.map(({ ev: e, available }) => ({
       id: e.id,
       type: e.type,
       investigationId: e.investigationId,
@@ -279,11 +305,10 @@ summaryRouter.get("/", (req: Request, res: Response) => {
       uri: e.uri,
       contentHash: e.contentHash,
       provenance: provenanceOf(e),
-      // Truthful artifact availability from the collector's capture-time
-      // record (metadata.artifactAvailable). Passed through as-is: absent for
-      // legacy records, false for replay-unavailable/url evidence — the UI
-      // must never offer a download for bytes that were never stored.
-      artifactAvailable: e.metadata?.artifactAvailable as boolean | undefined,
+      // Availability source of truth: capture-time assertion when present,
+      // otherwise a live probe of the artifact store (legacy records).
+      // Only `true` may ever drive artifact UI controls.
+      artifactAvailable: available,
       mimeType: e.metadata?.mimeType as string | undefined,
       byteSize: e.metadata?.byteSize as number | undefined,
       createdAt: e.createdAt,
@@ -346,4 +371,14 @@ summaryRouter.get("/", (req: Request, res: Response) => {
   };
 
   res.json(response);
+  } catch (err) {
+    // The availability probe can surface storage-system failures; a summary
+    // request must not crash the server on them. Treat as unavailable state
+    // honesty: respond 503 so the client can retry.
+    console.error(
+      `[summary] failed investigation=${id}:`,
+      err instanceof Error ? err.message : err
+    );
+    res.status(503).json({ error: "Summary temporarily unavailable" });
+  }
 });

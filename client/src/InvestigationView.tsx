@@ -22,9 +22,97 @@ function ProvenanceChip({ provenance }: { provenance?: EvidenceProvenance }) {
   return <span className={`prov-chip prov-${provenance}`}>{label}</span>;
 }
 
+/**
+ * Authoritative artifact availability for UI controls.
+ *
+ * ONLY an explicit backend `artifactAvailable: true` authorizes artifact
+ * controls. The rule is strict on purpose:
+ *
+ * - `true`  = verified persisted bytes (capture-time assertion, or a legacy
+ *             record the backend probed against the artifact store).
+ * - `false` = no usable artifact (never stored, degraded capture, or failed
+ *             the backend's live availability probe). Render NOTHING for the
+ *             artifact — no button, no label, no placeholder.
+ * - undefined = legacy record with no availability information. The backend
+ *             summary always defines the flag; an undefined one here means
+ *             the data did not come from the summary (or predates the
+ *             probe). Availability cannot be established, so render NOTHING
+ *             rather than risk a control that 404s.
+ *
+ * A rendered View/Download/Inspect control must never be able to produce a
+ * `GET .../content` response of {"error":"Not found"}.
+ */
+function artifactUsable(ev: Evidence): boolean {
+  return ev.artifactAvailable === true;
+}
+
 interface Props {
   investigationId: string;
   onBack: () => void;
+}
+
+/**
+ * Test hook: renders the view with a pre-loaded summary and no loading
+ * gate. Production always mounts InvestigationView (which loads via its
+ * own effect); this wrapper exists so server-render test harnesses (which
+ * do not run effects) can exercise the loaded markup through the SAME
+ * component body. It renders nothing on its own and is not routed.
+ */
+export function InvestigationViewPreloaded({ summary }: { summary: InvestigationSummary }) {
+  const [viewingEvidence, setViewingEvidence] = useState<Evidence | null>(null);
+  const inv = summary.investigation;
+  const isTerminal = inv.status === "completed" || inv.status === "failed" || inv.status === "cancelled";
+  const evidenceById = new Map(summary.evidence.map((e) => [e.id, e]));
+  const experimentById = new Map(summary.experiments.map((e) => [e.id, e]));
+  const reportFindings = summary.report?.confirmedFindings ?? [];
+  const reportFindingIds = new Set(
+    reportFindings.map((f) => f.id).filter((id): id is string => id != null)
+  );
+  const progressModel = buildProgressModel(summary);
+
+  return (
+    <div>
+      <div className="view-header">
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <h2 style={{ fontSize: "1.1rem", fontWeight: 600 }}>Investigation</h2>
+          <p style={{ fontSize: "0.8rem", color: "var(--text-muted)", margin: 0 }}>
+            {inv.objective}
+          </p>
+        </div>
+        <span className={`status-${inv.status}`} style={{ fontWeight: 500 }}>
+          {statusLabel(inv.status as Parameters<typeof statusLabel>[0])}
+        </span>
+      </div>
+
+      <TerminalBanner model={progressModel} />
+      <InvestigationProgress summary={summary} events={[]} connectionLive />
+
+      <FindingsSection
+        findings={summary.findings}
+        evidenceById={evidenceById}
+        experimentById={experimentById}
+        reportFindingIds={reportFindingIds}
+        onInspectEvidence={setViewingEvidence}
+      />
+
+      {(inv.status === "completed" ||
+        (inv.status === "failed" && progressModel.budgetExhaustionStop)) &&
+        summary.report && <ReportSection summary={summary} />}
+
+      <div className="two-col">
+        <ExperimentsSection experiments={summary.experiments} probeFailures={summary.probeFailures} />
+        <EvidenceSection evidence={summary.evidence} onInspect={setViewingEvidence} />
+      </div>
+
+      {viewingEvidence && (
+        <EvidenceViewer
+          evidence={viewingEvidence}
+          investigationId={inv.id}
+          onClose={() => setViewingEvidence(null)}
+        />
+      )}
+    </div>
+  );
 }
 
 export function InvestigationView({ investigationId, onBack }: Props) {
@@ -283,6 +371,7 @@ function FindingsSection({
                   );
                 }
                 const exp = ev.experimentId ? experimentById.get(ev.experimentId) : null;
+                const usable = artifactUsable(ev) || ev.type === "url";
                 return (
                   <div key={evId} className="evidence-item">
                     <span className="evidence-type">{ev.type}</span>
@@ -294,13 +383,15 @@ function FindingsSection({
                         ev.uri || "Reconnaissance"
                       )}
                     </span>
-                    <button
-                      className="btn btn-secondary"
-                      style={{ padding: "0.2rem 0.6rem", fontSize: "0.7rem" }}
-                      onClick={() => onInspectEvidence(ev)}
-                    >
-                      Inspect
-                    </button>
+                    {usable && (
+                      <button
+                        className="btn btn-secondary"
+                        style={{ padding: "0.2rem 0.6rem", fontSize: "0.7rem" }}
+                        onClick={() => onInspectEvidence(ev)}
+                      >
+                        Inspect
+                      </button>
+                    )}
                   </div>
                 );
               })
@@ -532,7 +623,36 @@ function EvidenceSection({
                 {isOpen && (
                   <div className="evidence-group-items">
                     {group.items.map((ev) => {
-                      const unavailable = ev.artifactAvailable === false && ev.type !== "url";
+                      // URL "evidence" is the URI itself — no artifact bytes
+                      // exist and the viewer has nothing to render. Show a
+                      // plain link instead of an unavailable-control.
+                      if (ev.type === "url") {
+                        return (
+                          <div key={ev.id} className="evidence-item">
+                            <span className="evidence-type">{ev.type}</span>
+                            <ProvenanceChip provenance={ev.provenance} />
+                            <span style={{ flex: 1, minWidth: 0, fontSize: "0.8rem", color: "var(--text-secondary)" }}>
+                              {ev.uri || (ev.metadata?.pageTitle as string | undefined) || ev.id.slice(0, 12)}
+                            </span>
+                            {ev.uri && ev.uri.startsWith("http") ? (
+                              <a
+                                className="btn btn-secondary"
+                                style={{ padding: "0.2rem 0.6rem", fontSize: "0.7rem" }}
+                                href={ev.uri}
+                                target="_blank"
+                                rel="noreferrer noopener"
+                              >
+                                Link
+                              </a>
+                            ) : null}
+                          </div>
+                        );
+                      }
+                      // Strict availability gate: the View button renders
+                      // ONLY when the backend verified usable bytes. There is
+                      // no "unavailable" placeholder — an unverified/missing
+                      // artifact contributes no artifact UI at all.
+                      const usable = artifactUsable(ev);
                       return (
                         <div key={ev.id} className="evidence-item">
                           <span className="evidence-type">{ev.type}</span>
@@ -540,18 +660,16 @@ function EvidenceSection({
                           <span style={{ flex: 1, minWidth: 0, fontSize: "0.8rem", color: "var(--text-secondary)" }}>
                             {ev.uri || (ev.metadata?.pageTitle as string | undefined) || ev.id.slice(0, 12)}
                           </span>
-                          {unavailable && (
-                            <span style={{ fontSize: "0.7rem", color: "var(--warning)" }}>artifact missing</span>
+                          {usable && (
+                            <button
+                              className="btn btn-secondary"
+                              style={{ padding: "0.2rem 0.6rem", fontSize: "0.7rem" }}
+                              onClick={() => onInspect(ev)}
+                              title="View artifact"
+                            >
+                              View
+                            </button>
                           )}
-                          <button
-                            className="btn btn-secondary"
-                            style={{ padding: "0.2rem 0.6rem", fontSize: "0.7rem" }}
-                            onClick={() => onInspect(ev)}
-                            disabled={ev.type === "url"}
-                            title={ev.type === "url" ? ev.uri ?? undefined : "View artifact"}
-                          >
-                            {ev.type === "url" ? "Link" : "View"}
-                          </button>
                         </div>
                       );
                     })}
@@ -587,11 +705,15 @@ function EvidenceViewer({
   // first events readably and offer the raw artifact, never a <video> player.
   const isReplay = evidence.type === "replay";
   const isNdjsonReplay = isReplay && evidence.metadata?.format === "rrweb";
-  // Truthful availability: the summary endpoint reports whether artifact
-  // bytes were persisted at capture time. `artifactAvailable === false`
-  // means the record exists but has NO downloadable content — the download
-  // action must not be offered (nothing exists to fabricate).
-  const noArtifact = (evidence as { artifactAvailable?: boolean }).artifactAvailable === false;
+  // Strict availability: only a backend-verified `true` may show artifact
+  // content. `false` (no usable artifact) and undefined (legacy record whose
+  // availability could not be established) render NOTHING below — no
+  // player, no download, no error card. The summary endpoint always defines
+  // the flag, so an undefined one here means availability was never
+  // verified; showing content controls would risk a dead artifact link.
+  const noArtifact = (evidence as { artifactAvailable?: boolean }).artifactAvailable !== true;
+
+  if (noArtifact) return null;
 
   // All artifact fetches go through fetchEvidence so the Authorization
   // header is attached; screenshots render from a blob URL (an <img src>
@@ -672,7 +794,7 @@ function EvidenceViewer({
           </pre>
         )}
 
-        {isReplay && (
+        {isReplay && !noArtifact && (
           <div>
             <p style={{ fontSize: "0.75rem", color: "var(--text-muted)", margin: "0 0 0.5rem 0" }}>
               {isNdjsonReplay
@@ -698,21 +820,13 @@ function EvidenceViewer({
           </p>
         )}
 
+        {/* Reaching this footer means artifactAvailable === true (the modal
+            short-circuits to null otherwise) — so this download link can
+            only ever point at a verified artifact. */}
         <div style={{ marginTop: "0.75rem", fontSize: "0.75rem" }}>
-          {noArtifact ? (
-            /* Truthful unavailability: evidence was recorded but no artifact
-               bytes were ever persisted (replay-unavailable, url-only, or a
-               capture that degraded). Never offer a download here — offering
-               one would imply content exists that does not. */
-            <span style={{ color: "var(--warning)" }}>
-              No artifact was stored for this evidence item — the recording was
-              unavailable or this record has no downloadable content.
-            </span>
-          ) : (
-            <a href={url} download style={{ color: "var(--info)" }}>
-              Download artifact
-            </a>
-          )}
+          <a href={url} download style={{ color: "var(--info)" }}>
+            Download artifact
+          </a>
         </div>
       </div>
     </div>

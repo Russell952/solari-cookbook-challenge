@@ -20,6 +20,30 @@
  */
 /** @vitest-environment node */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
+
+// ── Hermetic environment ─────────────────────────────────────────────────
+// This suite runs the REAL orchestrator/store/evidence persistence against
+// the LOCAL artifact store and the in-memory store, exactly as a dev/test
+// deployment does. A workspace .env may carry production service
+// credentials (B2 artifact storage, MongoDB durable persistence); if
+// present they silently redirect every artifact upload to B2 over the
+// network and every store write to MongoDB, making runs network-bound,
+// slow (they then exceed vitest's default 5s test timeout), and
+// non-hermetic. Clearing them BEFORE any production module (config
+// snapshot) is imported keeps the suite hermetic and independent of
+// ambient env. No production code is changed.
+vi.hoisted(() => {
+  for (const key of [
+    "MONGODB_URI",
+    "B2_KEY_ID",
+    "B2_APPLICATION_KEY",
+    "B2_BUCKET_NAME",
+    "B2_ENDPOINT",
+    "B2_REGION",
+  ]) {
+    delete process.env[key];
+  }
+});
 import { mkdtemp, rm, readFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -187,7 +211,12 @@ vi.mock("../ai/index.js", () => ({
 
 // Import production modules after mocks
 import { store } from "../store/index.js";
-import { resetRateLimits } from "../security/rate-limit.js";
+import {
+  resetRateLimits,
+  resetUserConcurrency,
+  resetConcurrency,
+  resetSse,
+} from "../security/rate-limit.js";
 import { buildApp } from "../app.js";
 import { registerTokenForTesting } from "../security/auth.js";
 import * as browser from "../solari/browser.js";
@@ -207,9 +236,15 @@ beforeEach(async () => {
   evidenceDir = await mkdtemp(join(tmpdir(), "probe-lifecycle-"));
   process.env.PROBE_EVIDENCE_DIR = evidenceDir;
   store.clearAll();
-  // Per-user creation quotas reset between tests (suite creates several
-  // investigations under one identity) — same pattern as other rate limits.
+  // Full quota-state reset between tests (the suite creates several
+  // investigations under one identity): per-user creation quotas, all
+  // per-IP limiter buckets, per-user + deployment concurrency slots, and
+  // SSE caps. A timed-out test's zombie runner can otherwise leak a slot
+  // into the next test and turn a slow run into a 429.
   resetRateLimits();
+  resetUserConcurrency();
+  resetConcurrency();
+  resetSse();
   vi.clearAllMocks();
   server = buildApp().listen(0, "127.0.0.1");
   await new Promise<void>((r) => server.once("listening", r));
@@ -279,7 +314,9 @@ async function runToCompletion(objective: string): Promise<string> {
     const inv = await getJson<{ status: string }>(`/investigations/${id}`);
     last = inv.status;
     if (["completed", "failed", "cancelled"].includes(inv.status)) return id;
-    await new Promise((r) => setTimeout(r, 20));
+    // 100ms keeps each test's request count far below the per-IP general
+    // rate limit (300/5min) even on slow runs, while staying responsive.
+    await new Promise((r) => setTimeout(r, 100));
   }
   throw new Error(`investigation stuck in status=${last}`);
 }
@@ -287,7 +324,7 @@ async function runToCompletion(objective: string): Promise<string> {
 // ════════════════════════════════════════════════════════════════════════════
 
 describe("login-form investigation lifecycle (real orchestrator + API)", () => {
-  it("CONFIRMED: objective → recon → experiment → hypothesis → independent verification → finding → report → completed, with provenance intact", async () => {
+  it("CONFIRMED: objective → recon → experiment → hypothesis → independent verification → finding → report → completed, with provenance intact", { timeout: 30_000 }, async () => {
     scenario = "confirmed";
     verificationObservation = "same";
 
@@ -352,7 +389,7 @@ describe("login-form investigation lifecycle (real orchestrator + API)", () => {
     expect(s.incomplete).toBe(false);
   });
 
-  it("REJECTED: verification that disproves the hypothesis produces no confirmed finding", async () => {
+  it("REJECTED: verification that disproves the hypothesis produces no confirmed finding", { timeout: 30_000 }, async () => {
     scenario = "rejected";
     verificationObservation = "different";
 
@@ -375,7 +412,7 @@ describe("login-form investigation lifecycle (real orchestrator + API)", () => {
     expect(s.report!.rejectedHypotheses).toContain(s.hypotheses[0].statement);
   });
 
-  it("INCONCLUSIVE: verification that yields no evidence concludes 'we don't know'", async () => {
+  it("INCONCLUSIVE: verification that yields no evidence concludes 'we don't know'", { timeout: 30_000 }, async () => {
     scenario = "inconclusive";
     verificationObservation = "nothing";
 
@@ -391,7 +428,7 @@ describe("login-form investigation lifecycle (real orchestrator + API)", () => {
     expect(s.report!.inconclusiveHypotheses.length).toBe(1);
   });
 
-  it("CANCELLED: mid-run cancel ends cancelled — no findings, no report, never completed", async () => {
+  it("CANCELLED: mid-run cancel ends cancelled — no findings, no report, never completed", { timeout: 30_000 }, async () => {
     scenario = "cancelled";
 
     const createRes = await fetch(`${baseUrl}/api/investigations`, {
@@ -431,7 +468,7 @@ describe("login-form investigation lifecycle (real orchestrator + API)", () => {
 // ── Evidence integrity spot-checks on the confirmed run ─────────────────────
 
 describe("login-form investigation: evidence integrity", () => {
-  it("verification evidence bytes persist on disk and verify against their recorded SHA-256", async () => {
+  it("verification evidence bytes persist on disk and verify against their recorded SHA-256", { timeout: 30_000 }, async () => {
     scenario = "confirmed";
     verificationObservation = "same";
 

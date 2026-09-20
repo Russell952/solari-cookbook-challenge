@@ -1,5 +1,27 @@
 /** @vitest-environment node */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+
+// ── Hermetic environment ─────────────────────────────────────────────────
+// This suite exercises the LOCAL artifact store and the in-memory store
+// exactly as a dev/test deployment does. A workspace .env may carry
+// production service credentials (B2 artifact storage, MongoDB durable
+// persistence); if present they silently redirect every artifact write to
+// B2 over the network (metadata.artifactPath is then undefined — B2 uses
+// storageKey) and every store write to MongoDB. Clearing them BEFORE any
+// production module (config snapshot) is imported keeps the suite hermetic
+// and independent of ambient env. No production code is changed.
+vi.hoisted(() => {
+  for (const key of [
+    "MONGODB_URI",
+    "B2_KEY_ID",
+    "B2_APPLICATION_KEY",
+    "B2_BUCKET_NAME",
+    "B2_ENDPOINT",
+    "B2_REGION",
+  ]) {
+    delete process.env[key];
+  }
+});
 import { createHash } from "crypto";
 import { mkdtemp, rm, readFile, writeFile } from "fs/promises";
 import { tmpdir } from "os";

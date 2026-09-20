@@ -12,6 +12,29 @@
  */
 /** @vitest-environment node */
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
+
+// ── Hermetic environment ─────────────────────────────────────────────────
+// This suite runs the REAL store and the REAL evidence persistence against
+// the LOCAL artifact store, exactly as a dev/test deployment does. A
+// workspace .env may carry production service credentials (B2 artifact
+// storage, MongoDB durable persistence); if present they silently redirect
+// every artifact upload to B2 over the network (metadata.artifactPath is
+// then undefined — B2 uses storageKey — and the local disk index stays
+// empty) and every store write to MongoDB. Clearing them BEFORE any
+// production module (config snapshot) is imported keeps the suite hermetic
+// and independent of ambient env. No production code is changed.
+vi.hoisted(() => {
+  for (const key of [
+    "MONGODB_URI",
+    "B2_KEY_ID",
+    "B2_APPLICATION_KEY",
+    "B2_BUCKET_NAME",
+    "B2_ENDPOINT",
+    "B2_REGION",
+  ]) {
+    delete process.env[key];
+  }
+});
 import { createHash } from "crypto";
 import { mkdtemp, rm, readFile } from "fs/promises";
 import { tmpdir } from "os";
@@ -221,7 +244,9 @@ async function waitForTerminal(id: string, timeoutMs = 15_000): Promise<Investig
     const res = await fetch(`${baseUrl}/api/investigations/${id}`, { headers: auth() });
     last = (await res.json()) as Investigation;
     if (["completed", "failed", "cancelled"].includes(last.status)) return last;
-    await new Promise((r) => setTimeout(r, 25));
+    // 100ms keeps each test's request count far below the per-IP general
+    // rate limit (300/5min) even on slow runs, while staying responsive.
+    await new Promise((r) => setTimeout(r, 100));
   }
   throw new Error(`Investigation did not reach a terminal state; last=${JSON.stringify(last)}`);
 }
@@ -229,7 +254,7 @@ async function waitForTerminal(id: string, timeoutMs = 15_000): Promise<Investig
 // ── The full lifecycle ──────────────────────────────────────────────────────
 
 describe("runInvestigation end-to-end (real runner, real API)", () => {
-  it("runs recon → plan → experiment → hypothesis → verification → report → completed with consistent evidence, findings, and summary", async () => {
+  it("runs recon → plan → experiment → hypothesis → verification → report → completed with consistent evidence, findings, and summary", { timeout: 30_000 }, async () => {
     const id = await createInvestigation();
 
     const startRes = await fetch(`${baseUrl}/api/investigations/${id}/start`, { method: "POST", headers: auth() });
@@ -370,7 +395,7 @@ describe("runInvestigation end-to-end (real runner, real API)", () => {
     expect(summary.incomplete).toBe(true);
   });
 
-  it("evidence survives an in-memory wipe via the on-disk artifact index (restart-like)", async () => {
+  it("evidence survives an in-memory wipe via the on-disk artifact index (restart-like)", { timeout: 30_000 }, async () => {
     const id = await createInvestigation();
     await fetch(`${baseUrl}/api/investigations/${id}/start`, { method: "POST", headers: auth() });
     await waitForTerminal(id);

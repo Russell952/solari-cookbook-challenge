@@ -376,6 +376,14 @@ const FABRICATED_SELECTOR_PATTERNS = [
 ];
 
 /**
+ * Index of the compound-word fabricated pattern within
+ * FABRICATED_SELECTOR_PATTERNS (the /\b(hero|header|…)\s+/ entry). It is
+ * the only pattern whose matches can be legitimate recon naming, so it is
+ * the only one suppressed for recon-anchored compound selectors.
+ */
+const COMPOUND_WORD_PATTERN_INDEX = 2;
+
+/**
  * Patterns for clearly invalid CSS selectors that would cause Playwright errors.
  */
 const INVALID_CSS_PATTERNS = [
@@ -390,16 +398,32 @@ const INVALID_CSS_PATTERNS = [
 /**
  * Validate that a browser target is not an obviously fabricated selector.
  * Returns null if valid, or an error message if rejected.
+ *
+ * `reconAnchored` marks compound CSS selectors whose leading path segment is
+ * a recon selector ("#hero > button" when recon recorded "#hero"). For
+ * those, the compound-word fabricated pattern is suppressed: it matches on
+ * the recon's own naming ("hero", "cta", "card"…) and rejected genuine
+ * recon-anchored selectors (live failure on Image_Search_app). Every other
+ * check — ordinal/label prefixes, prose shapes, malformed CSS, bad start
+ * token — still applies.
  */
-function validateSelectorQuality(target: string, action: string, index: number): string | null {
+function validateSelectorQuality(
+  target: string,
+  action: string,
+  index: number,
+  reconAnchored = false
+): string | null {
   // URLs are always valid targets for navigate actions
   if (/^https?:\/\//.test(target)) return null;
 
   // Non-browser actions don't need selector quality checks
   if (action === "screenshot" || action === "getTitle" || action === "launch") return null;
 
-  // Check for fabricated natural-language patterns
-  for (const pattern of FABRICATED_SELECTOR_PATTERNS) {
+  // Check for fabricated natural-language patterns. The compound-word
+  // pattern (index 2) is recon-name-based, so it is skipped only when the
+  // selector is provably anchored on recon data.
+  for (const [patternIdx, pattern] of FABRICATED_SELECTOR_PATTERNS.entries()) {
+    if (reconAnchored && patternIdx === COMPOUND_WORD_PATTERN_INDEX) continue;
     if (pattern.test(target)) {
       return `plannedAction[${index}].target is a fabricated selector: "${target}". Use a selector from interactableElements instead.`;
     }
@@ -422,13 +446,49 @@ function validateSelectorQuality(target: string, action: string, index: number):
 }
 
 /**
+ * Structural targets that always exist on any DOM. The orchestrator's own
+ * selector-quality gate (looksLikeCssSelector in action-allowlist.ts) accepts
+ * these for the same actions — the plan validator must not be stricter than
+ * the executor, or a plan whose every action would run is still rejected.
+ * Production failure (inv_1789867447390_t8ejoj): a readText on "body" — a
+ * target that ALWAYS exists — killed the plan, so an investigation that only
+ * needed navigation produced 0 experiments and failed at phase "plan".
+ */
+const STRUCTURAL_TARGETS = new Set(["body", "html", "document", "head", "main", "page", "full page"]);
+
+/**
+ * True when a compound CSS selector is anchored on a recon selector: its
+ * first path segment matches a recon selector AND the remainder is CSS
+ * continuation syntax (combinator, descendant token, class/id token, or an
+ * attribute refinement). Only #/. /[-anchored recon selectors may be
+ * extended — bare-tag recon selectors ("a", "button") are excluded so a
+ * natural-language string can never borrow them as a prefix. Only ever
+ * called for targets that will then still pass the shape-quality gate.
+ */
+function isReconAnchoredCompound(target: string, knownSelectors: Set<string>): boolean {
+  for (const base of knownSelectors) {
+    if (!/[#.\[]/.test(base)) continue; // bare-tag bases are not extendable
+    if (!target.startsWith(base)) continue;
+    const rest = target.slice(base.length);
+    if (rest.length === 0) continue; // exact match handled elsewhere
+    if (/^(?:\s+(?:[>~+]\s*)?[a-zA-Z.#][\w-]*|\[[^\]]+\])/.test(rest)) return true;
+  }
+  return false;
+}
+
+/**
  * Validate that browser targets are traceable to recon data.
  * 
  * Rules:
- * 1. If interactableElements are provided, browser targets MUST match one
- *    of their selectors exactly, OR be a well-formed CSS selector that
- *    could plausibly target an element on the page.
- * 2. Fabricated natural-language selectors are always rejected.
+ * 1. If interactableElements are provided, browser interaction targets must
+ *    resolve to recon data OR be a well-formed CSS selector. Order matters:
+ *    provenance is checked BEFORE the fabricated-pattern heuristic, because
+ *    the heuristic is shape-based and matches genuine recon selectors that
+ *    merely contain element words (live failure: "#hero > button" was in
+ *    recon, yet /\b(hero)\s+/ rejected it as "fabricated" before its
+ *    provenance was ever consulted).
+ * 2. Fabricated natural-language selectors that do NOT resolve to recon are
+ *    still rejected.
  * 3. Navigate targets are always URLs — no provenance check needed.
  */
 export function validatePlanSelectors(
@@ -459,34 +519,56 @@ export function validatePlanSelectors(
 
       const target = action.target;
 
-      // First: reject obviously fabricated selectors
-      const qualityError = validateSelectorQuality(target, action.action, idx);
-      if (qualityError) throw new Error(qualityError);
-
-      // Second: check if the target is an exact match from recon
+      // PROVENANCE FIRST. A target that IS recon data can never be a
+      // hallucination. (Live failure on russell952.github.io/Image_Search_app:
+      // "#hero > button" was in recon yet was rejected as "fabricated"
+      // before its provenance was consulted.)
       if (knownSelectors.has(target)) continue;
 
-      // Third: check if it's a CSS selector that targets a known href
+      // Well-formed structural targets that always exist in a DOM ("body",
+      // "main", …) are valid interaction targets — the executor's own gate
+      // (looksLikeCssSelector) accepts them. Requiring recon provenance for
+      // them made planning fail on pages whose recon simply had not
+      // catalogued the element, killing navigation-dependent investigations
+      // before any experiment ran.
+      if (STRUCTURAL_TARGETS.has(target)) continue;
+
+      // Is this a compound CSS selector anchored on a recon selector
+      // ("#hero > button" when recon recorded "#hero")? If so, only the
+      // over-broad compound-word fabricated pattern is suppressed below —
+      // every other quality check still applies.
+      const reconAnchored = isReconAnchoredCompound(target, knownSelectors);
+
+      // Quality checks for targets that are NOT direct recon selectors.
+      const qualityError = validateSelectorQuality(target, action.action, idx, reconAnchored);
+      if (qualityError) throw new Error(qualityError);
+
+      // CSS selector that targets a known href
       const hrefMatch = target.match(/a\[href=["']([^"']+)["']\]/);
       if (hrefMatch && knownHrefs.has(hrefMatch[1])) continue;
 
-      // Fourth: check if it's a simple #id selector that matches a known element
+      // A simple #id selector that matches a known element
       if (target.startsWith("#")) {
         const idFromTarget = target.slice(1);
         if (interactableElements.some(e => e.id === idFromTarget || e.selector === target)) continue;
       }
 
-      // Fifth: for input[type=...], check if there's a matching form element
+      // input[type=...]: check if there's a matching form element
       const inputTypeMatch = target.match(/^input\[type=["']([^"']+)["']\]$/);
       if (inputTypeMatch) {
         if (interactableElements.some(e => e.tag === "input" && e.type === inputTypeMatch[1])) continue;
       }
 
-      // Sixth: for input[name=...], check if there's a matching form element
+      // input[name=...]: check if there's a matching form element
       const inputNameMatch = target.match(/^(?:#\S+\s+)?input\[name=["']([^"']+)["']\]$/);
       if (inputNameMatch) {
         if (interactableElements.some(e => e.name === inputNameMatch[1])) continue;
       }
+
+      // Recon-anchored compound that survived the quality gate: an
+      // interaction with a known element's nested control. Recon records
+      // top-level anchors; real flows target controls inside them.
+      if (reconAnchored) continue;
 
       // Target does not match any recon data and was not caught by quality checks.
       // This is an error — the planner must use selectors from recon data.
@@ -1363,6 +1445,27 @@ export async function chatInternal(systemPrompt: string, userPrompt: string): Pr
 
 // ── Chat + validate retry helper ─────────────────────────────────────────
 
+/**
+ * Deterministic validator rejections are model-output problems, not Probe
+ * defects: the model CAN produce a compliant response on the next attempt,
+ * so they must retry within the bounded budget exactly like JSON/shape
+ * errors. Production failure (inv_1789867447390_t8ejoj): a plan whose target
+ * did not trace to recon threw "Plan selector error: ...", which matched none
+ * of the retryable shapes, so ONE AI call failed the whole investigation at
+ * phase "plan" with zero experiments - the exact "Designing experiments then
+ * failed, 0 experiments" signature.
+ */
+function isRetryablePlanValidationError(message: string | undefined): boolean {
+  if (!message) return false;
+  return (
+    message.startsWith("AI response:") ||
+    message.startsWith("Plan selector error:") ||
+    message.startsWith("plannedAction[") ||
+    message.startsWith("experiment[") ||
+    message.includes("JSON")
+  );
+}
+
 /** Retry chat + parse + validate on transient model failures (malformed JSON, missing fields). */
 async function chatWithValidation<T>(
   systemPrompt: string,
@@ -1377,7 +1480,7 @@ async function chatWithValidation<T>(
       return parse(response);
     } catch (err: any) {
       lastErr = err;
-      const isRetryable = err.message?.startsWith("AI response:") || err.message?.includes("JSON");
+      const isRetryable = isRetryablePlanValidationError(err?.message);
       if (isRetryable && i < retries) {
         console.warn(`Validation failed (attempt ${i + 1}/${retries + 1}), retrying: ${err.message.slice(0, 80)}`);
         profiler.recordRetry("ai-validation", "chatWithValidation", err.message?.slice(0, 200) ?? "parse/validation failure", 1000, i + 1);
@@ -1555,9 +1658,8 @@ RULE 9d: If the recon data includes a mobile menu toggle (id "menu-toggle", aria
   3. clicks the toggle
   4. verifies the mobile menu opened (readText on a nav link, or screenshot)
   5. restores the desktop viewport with a second setViewport action (1440x900)
-  Do NOT skip step 1. A mobile experiment that clicks #menu-toggle at desktop viewport is a planning failure.
-  The recon data for this target includes #menu-toggle (button, aria-label "Open navigation menu") and a[href="https://mexi-medicals.vercel.app"] (Live demo project link).
-  Plan a mobile experiment that tests #menu-toggle at viewport 390x844, and a project-link experiment that tests the external link.
+  Do NOT skip step 1. A mobile experiment that clicks the menu toggle at desktop viewport is a planning failure.
+  TARGET RULE: use ONLY selectors and URLs that appear in THIS investigation's Application Recon (interactableElements). Never plan against selectors or URLs from any other application - plans containing them are rejected by validation and waste retries.
 
 ACTION SCHEMA: The only valid browser actions are: launch, navigate, click, type, readText, screenshot, getTitle, setViewport. Do NOT invent wait/sleep/hover/scroll/drag actions. For settling the page after a click, use navigate to the same URL, screenshot, or getTitle.
 

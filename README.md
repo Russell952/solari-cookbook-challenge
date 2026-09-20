@@ -1,91 +1,330 @@
-# Solari Cookbook
+# Probe
 
-Short, runnable examples for [Solari](https://getsolari.com) — cloud browsers,
-sandboxes, and desktops behind one API key.
+**Evidence-driven software investigation system.**
 
-Every example in this repo is a complete program you can run in under a minute.
-They are deliberately small: one idea each, no framework, no scaffolding to read
-past. Copy one into your project and change the parts you care about.
+Probe gives an AI the ability to investigate software from **code to real-world behavior**, run controlled experiments against a live application, and produce **evidence-backed conclusions**.
 
-## Examples
+Instead of asking an AI to inspect code and guess whether something is broken, Probe lets it investigate the application through a controlled workflow:
 
-### Cloud browser
+    RECON → PLAN → EXECUTE → OBSERVE → ANALYZE
+                             ↓
+                      HYPOTHESIS
+                             ↓
+                      VERIFICATION
+                             ↓
+                  FINDING / INCONCLUSIVE
+                             ↓
+                          REPORT
 
-| Example | Language | What it shows |
-| --- | --- | --- |
-| [browser-quickstart-ts](examples/browser-quickstart-ts) | TypeScript | Launch a browser, open a page, read it |
-| [browser-quickstart-py](examples/browser-quickstart-py) | Python | Launch a browser, open a page, read it |
-| [browser-stealth-proxy-ts](examples/browser-stealth-proxy-ts) | TypeScript | Stealth mode + residential proxy egress |
-| [browser-profiles-ts](examples/browser-profiles-ts) | TypeScript | Log in once, reuse the session forever |
-| [browser-session-recording-py](examples/browser-session-recording-py) | Python | Record a session, download the replay |
+> **AI proposes. Probe enforces. Evidence decides.**
 
-### Sandbox
+---
 
-| Example | Language | What it shows |
-| --- | --- | --- |
-| [sandbox-quickstart-ts](examples/sandbox-quickstart-ts) | TypeScript | Run a command, write and read files |
-| [sandbox-code-interpreter-py](examples/sandbox-code-interpreter-py) | Python | Stateful Python kernel for agent loops |
-| [sandbox-port-preview-ts](examples/sandbox-port-preview-ts) | TypeScript | Expose a server in the VM on a public URL |
+## What Probe Investigates
 
-### Desktop
+An investigation starts with three inputs:
 
-| Example | Language | What it shows |
-| --- | --- | --- |
-| [desktop-computer-use-py](examples/desktop-computer-use-py) | Python | Screenshot, click, and type on a Linux GUI |
+- **Repository** — what the application claims and how it is implemented
+- **Live URL** — what the application actually does
+- **Objective** — what the user wants investigated
 
-## Running an example
+Probe compares three sources of truth:
 
-Each directory is self-contained.
+    Claimed reality   → README, docs, specifications
+    Internal reality  → source code, dependencies, tests, config
+    Observed reality  → real browser interaction
 
-```bash
-git clone https://github.com/solari-sdk/solari-cookbook.git
-cd solari-cookbook/examples/browser-quickstart-ts
+The goal is not to generate plausible bug reports. A potential issue must be supported by evidence and, for serious findings, independent verification.
 
-npm install                          # or: pip install -r requirements.txt
-export SOLARI_API_KEY=slr_live_...   # grab one at console.getsolari.com
-npm start                            # or: python main.py
-```
+---
 
-One `slr_live_` key works across browsers, sandboxes, and desktops, and every
-product bills to the same balance.
+## Architecture
 
-## Which product do I want?
+    ┌─────────────────────┐
+    │   React + Vite      │
+    │      Client         │
+    └──────────┬──────────┘
+               │ HTTP / SSE
+               ▼
+    ┌─────────────────────┐
+    │ Express + TypeScript│
+    │    Orchestrator     │
+    └─────┬──────┬────────┘
+          │      │
+          ▼      ▼
+         AI    Solari
+               Browser
+               Sandbox
+          │      │
+          └──┬───┘
+             ▼
+        Evidence
+             │
+        ┌────┴────┐
+        ▼         ▼
+     MongoDB     B2
+    (structured) (artifacts)
 
-- **Cloud browser** — you need a *web page*: scraping, testing, filling forms,
-  anything Playwright or Puppeteer would do locally. Adds stealth, managed
-  proxies, captcha solving, profiles, and session recording.
-- **Sandbox** — you need to *run code*: an LLM's Python, an untrusted build, a
-  data job. A headless microVM that boots from a snapshot in about a second.
-- **Desktop** — you need a *screen*: computer-use agents, GUI apps, anything
-  that has to be clicked. A sandbox plus X11 and a live VNC stream.
+### Repository
 
-## Gotchas the examples encode
+    probe/
+    ├── client/      # React + Vite frontend
+    ├── server/      # Express + TypeScript backend
+    ├── shared/      # Shared types and contracts
+    └── examples/    # Solari/reference examples
 
-Things that cost you an afternoon if you meet them cold:
+---
 
-- **TypeScript: call `await solari.close()`.** The browser client keeps a
-  loopback proxy open for connection retries. Skip the close and your script
-  prints its output and then hangs forever instead of exiting.
-- **Recording is per session, not per account.** Pass `recording: true` when you
-  create the session; without it the replay endpoint 404s forever. The upload is
-  async after release, so poll for ~30s before giving up.
-- **Sandbox commands are not shell-interpreted.** `run("ls -la")` looks for a
-  binary named `ls -la`. Put argv in `args`, or run `sh -c` explicitly.
-- **`kill()`, not `close()`, ends a VM.** `close()` drops your local control
-  channel; the VM keeps running until its idle timeout.
-- **`timeoutMs` is a rolling idle window**, not a hard deadline — it resets on
-  every use.
+## Investigation Flow
 
-## Links
+### 1. Recon
 
-- Docs — [docs.getsolari.com](https://docs.getsolari.com)
-- Console — [console.getsolari.com](https://console.getsolari.com)
-- Changelog — [changelog.getsolari.com](https://changelog.getsolari.com)
-- Questions — [hello@getsolari.com](mailto:hello@getsolari.com)
+Probe establishes structured context about the target, including relevant links, forms, buttons, inputs, navigation controls, and other interactable elements.
 
-## Contributing
+### 2. Plan
 
-New examples are welcome. Keep them small, make them run end-to-end against the
-real API, and put anything surprising in a comment right where it bites.
+The AI proposes experiments based on the investigation context.
 
-MIT licensed.
+### 3. Validate
+
+AI-generated actions are validated before execution. The AI cannot bypass Probe's state machine, security rules, budgets, or action allowlist.
+
+### 4. Execute
+
+Solari provides real browser and sandbox execution.
+
+### 5. Observe
+
+Probe records application behavior and captures evidence.
+
+### 6. Analyze
+
+The AI interprets the collected observations and may form a hypothesis.
+
+### 7. Verify
+
+Potential findings are tested through targeted experiments rather than being accepted solely from the AI's reasoning.
+
+### 8. Report
+
+The investigation produces a report containing the evidence, hypotheses, findings, and limitations.
+
+---
+
+## Evidence
+
+Evidence is a first-class part of Probe.
+
+Depending on the experiment, evidence can include:
+
+- Screenshots
+- DOM/state observations
+- Browser action results
+- URLs
+- Replay data
+- Repository observations
+- Experiment results
+
+Structured investigation data is persisted in **MongoDB**, while binary evidence artifacts are stored in **Backblaze B2**.
+
+Missing artifacts are handled explicitly rather than being presented as successful downloads or viewers.
+
+---
+
+## AI Boundaries
+
+The AI handles reasoning; deterministic Probe code handles control.
+
+The AI can:
+
+- Propose experiments
+- Interpret observations
+- Generate hypotheses
+- Suggest verification steps
+- Help produce reports
+
+The AI cannot independently:
+
+- Change investigation state
+- Bypass budgets
+- Execute arbitrary tools
+- Navigate outside the approved target scope
+- Run arbitrary host commands
+- Confirm its own findings
+- Override security policies
+
+This separation is central to the design.
+
+---
+
+## Security
+
+Probe accepts arbitrary repository and application targets, so security is part of the core architecture.
+
+Key protections include:
+
+- Authentication and owner-scoped authorization
+- Password hashing with Node's `scrypt`
+- Signed HttpOnly sessions
+- SSRF protection
+- Connection-time network validation
+- Navigation scope enforcement
+- Restricted sandbox commands
+- AI output validation
+- Request body limits
+- Rate limiting
+- Investigation quotas
+- Per-user and global concurrency limits
+- CORS and security headers
+
+Probe also distinguishes application failures from its own failures. A selector problem, AI provider error, Solari timeout, or infrastructure failure should not automatically become a bug in the investigated application.
+
+---
+
+## Resource Controls
+
+Investigations are deliberately bounded to prevent runaway usage.
+
+Current limits include:
+
+| Resource | Limit |
+|---|---:|
+| Objective length | 1,000 characters |
+| Evidence | 50 / investigation |
+| Investigations | 5 / user / hour |
+| Concurrent investigations | 2 / user |
+| Global concurrency | 5 |
+| Browser actions | 40 / investigation |
+| AI calls | 20 / investigation |
+| Runtime | 10 minutes |
+
+These limits provide both cost control and protection against excessive resource usage.
+
+---
+
+## Reliability
+
+Probe handles failures from external systems rather than assuming they always succeed.
+
+It includes bounded handling for:
+
+- AI timeouts and provider failures
+- Malformed AI responses
+- Browser failures and retries
+- Navigation failures
+- Replay availability failures
+- Sandbox failures
+- Database/storage failures
+- SSE disconnections
+- Orphaned investigations
+- Runtime watchdog expiry
+
+The frontend combines SSE with periodic polling so temporary connection failures do not leave an investigation permanently stuck.
+
+---
+
+## Testing
+
+The project includes automated tests covering:
+
+- Investigation lifecycle
+- Orchestration
+- AI validation
+- Browser execution
+- Authentication and authorization
+- SSRF and navigation security
+- Evidence persistence
+- Artifact handling
+- Resource budgets
+- Rate limiting
+- Recovery
+- Frontend progress behavior
+- Shared contracts
+
+The system has also been tested through real Solari investigations and production smoke tests.
+
+---
+
+## Production
+
+Probe is deployed as two services.
+
+**Frontend**
+
+`https://probe-challenge.vercel.app/`
+
+Vercel
+
+**Backend**
+
+`https://api-probe.onrender.com/`
+
+Render
+
+MongoDB provides durable structured persistence and Backblaze B2 stores binary evidence artifacts.
+
+Production secrets and environment configuration are kept outside the repository.
+
+---
+
+## Local Development
+
+### Requirements
+
+- Node.js
+- npm
+- MongoDB
+- Solari configuration for real investigations
+- AI provider configuration
+
+Install dependencies:
+
+    npm install
+
+Run the development applications using the repository's configured scripts.
+
+Environment-specific configuration should be supplied locally and should not be committed to Git.
+
+---
+
+## Current Status
+
+Probe is a working research/engineering project demonstrating:
+
+- AI-assisted investigation planning
+- Real browser interaction
+- Controlled experiments
+- Evidence capture and persistence
+- Hypothesis generation
+- Independent verification
+- Finding confirmation
+- Security and resource controls
+- Production deployment
+
+Known future hardening areas include more precise AI token accounting, artifact-size enforcement, shared quota state for horizontal scaling, stronger test isolation, and broader end-to-end coverage.
+
+---
+
+## Core Idea
+
+Traditional AI bug hunting can look like:
+
+    Code → AI analysis → guessed bug → report
+
+Probe is designed around:
+
+    Code
+      +
+    Live application
+      +
+    Real interaction
+      +
+    Controlled experiments
+      +
+    Evidence
+      +
+    Verification
+      =
+    Evidence-backed investigation
+
+**Probe doesn't just ask an AI what might be wrong. It gives the AI a controlled environment to find out.**
